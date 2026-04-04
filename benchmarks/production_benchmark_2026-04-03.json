@@ -1,0 +1,244 @@
+{
+  "date": "2026-04-03",
+  "repo": "C:\\1BL-PDFimporter",
+  "pdfs": [
+    "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\TX_Alvord_20220525_TM_geo.pdf",
+    "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\Alvord TX \u2014 Garden Plan \u00b7 Final.pdf",
+    "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\New folder\\1019 - Rev 0.pdf",
+    "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\Welding-Symbol-Chart.pdf"
+  ],
+  "rows": [
+    {
+      "pdf": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\TX_Alvord_20220525_TM_geo.pdf",
+      "preset": "fast",
+      "runtime_s": 4.747,
+      "returncode": 0,
+      "pages": 1,
+      "primitives": 8503,
+      "text_items": 0,
+      "images": 0
+    },
+    {
+      "pdf": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\TX_Alvord_20220525_TM_geo.pdf",
+      "preset": "general",
+      "runtime_s": 5.271,
+      "returncode": 0,
+      "pages": 1,
+      "primitives": 10887,
+      "text_items": 4000,
+      "images": 0
+    },
+    {
+      "pdf": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\TX_Alvord_20220525_TM_geo.pdf",
+      "preset": "technical",
+      "runtime_s": 5.523,
+      "returncode": 0,
+      "pages": 1,
+      "primitives": 10887,
+      "text_items": 1500,
+      "images": 0
+    },
+    {
+      "pdf": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\TX_Alvord_20220525_TM_geo.pdf",
+      "preset": "shop",
+      "runtime_s": 5.244,
+      "returncode": 0,
+      "pages": 1,
+      "primitives": 10887,
+      "text_items": 2500,
+      "images": 0
+    },
+    {
+      "pdf": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\TX_Alvord_20220525_TM_geo.pdf",
+      "preset": "max",
+      "runtime_s": 5.233,
+      "returncode": 0,
+      "pages": 1,
+      "primitives": 10887,
+      "text_items": 8570,
+      "images": 0
+    },
+    {
+      "pdf": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\Alvord TX \u2014 Garden Plan \u00b7 Final.pdf",
+      "preset": "fast",
+      "runtime_s": 0.622,
+      "returncode": 0,
+      "pages": 1,
+      "primitives": 1145,
+      "text_items": 0,
+      "images": 0
+    },
+    {
+      "pdf": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\Alvord TX \u2014 Garden Plan \u00b7 Final.pdf",
+      "preset": "general",
+      "runtime_s": 0.724,
+      "returncode": 0,
+      "pages": 1,
+      "primitives": 1145,
+      "text_items": 74,
+      "images": 0
+    },
+    {
+      "pdf": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\Alvord TX \u2014 Garden Plan \u00b7 Final.pdf",
+      "preset": "technical",
+      "runtime_s": 0.734,
+      "returncode": 0,
+      "pages": 1,
+      "primitives": 1145,
+      "text_items": 74,
+      "images": 0
+    },
+    {
+      "pdf": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\Alvord TX \u2014 Garden Plan \u00b7 Final.pdf",
+      "preset": "shop",
+      "runtime_s": 0.718,
+      "returncode": 0,
+      "pages": 1,
+      "primitives": 1145,
+      "text_items": 74,
+      "images": 0
+    },
+    {
+      "pdf": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\Alvord TX \u2014 Garden Plan \u00b7 Final.pdf",
+      "preset": "max",
+      "runtime_s": 0.746,
+      "returncode": 0,
+      "pages": 1,
+      "primitives": 1145,
+      "text_items": 74,
+      "images": 0
+    },
+    {
+      "pdf": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\New folder\\1019 - Rev 0.pdf",
+      "preset": "fast",
+      "runtime_s": 0.222,
+      "returncode": 0,
+      "pages": 1,
+      "primitives": 178,
+      "text_items": 0,
+      "images": 0
+    },
+    {
+      "pdf": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\New folder\\1019 - Rev 0.pdf",
+      "preset": "general",
+      "runtime_s": 0.219,
+      "returncode": 0,
+      "pages": 1,
+      "primitives": 178,
+      "text_items": 87,
+      "images": 0
+    },
+    {
+      "pdf": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\New folder\\1019 - Rev 0.pdf",
+      "preset": "technical",
+      "runtime_s": 0.218,
+      "returncode": 0,
+      "pages": 1,
+      "primitives": 178,
+      "text_items": 87,
+      "images": 0
+    },
+    {
+      "pdf": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\New folder\\1019 - Rev 0.pdf",
+      "preset": "shop",
+      "runtime_s": 0.222,
+      "returncode": 0,
+      "pages": 1,
+      "primitives": 178,
+      "text_items": 87,
+      "images": 0
+    },
+    {
+      "pdf": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\New folder\\1019 - Rev 0.pdf",
+      "preset": "max",
+      "runtime_s": 0.222,
+      "returncode": 0,
+      "pages": 1,
+      "primitives": 178,
+      "text_items": 87,
+      "images": 0
+    },
+    {
+      "pdf": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\Welding-Symbol-Chart.pdf",
+      "preset": "fast",
+      "runtime_s": 0.31,
+      "returncode": 0,
+      "pages": 1,
+      "primitives": 638,
+      "text_items": 0,
+      "images": 0
+    },
+    {
+      "pdf": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\Welding-Symbol-Chart.pdf",
+      "preset": "general",
+      "runtime_s": 0.314,
+      "returncode": 0,
+      "pages": 1,
+      "primitives": 638,
+      "text_items": 367,
+      "images": 0
+    },
+    {
+      "pdf": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\Welding-Symbol-Chart.pdf",
+      "preset": "technical",
+      "runtime_s": 0.323,
+      "returncode": 0,
+      "pages": 1,
+      "primitives": 638,
+      "text_items": 367,
+      "images": 0
+    },
+    {
+      "pdf": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\Welding-Symbol-Chart.pdf",
+      "preset": "shop",
+      "runtime_s": 0.341,
+      "returncode": 0,
+      "pages": 1,
+      "primitives": 638,
+      "text_items": 367,
+      "images": 0
+    },
+    {
+      "pdf": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\Welding-Symbol-Chart.pdf",
+      "preset": "max",
+      "runtime_s": 0.312,
+      "returncode": 0,
+      "pages": 1,
+      "primitives": 638,
+      "text_items": 367,
+      "images": 0
+    }
+  ],
+  "summary_by_preset": {
+    "fast": {
+      "runs": 4,
+      "avg_runtime_s": 1.475,
+      "avg_primitives": 2616,
+      "avg_text_items": 0
+    },
+    "general": {
+      "runs": 4,
+      "avg_runtime_s": 1.632,
+      "avg_primitives": 3212,
+      "avg_text_items": 1132
+    },
+    "technical": {
+      "runs": 4,
+      "avg_runtime_s": 1.7,
+      "avg_primitives": 3212,
+      "avg_text_items": 507
+    },
+    "shop": {
+      "runs": 4,
+      "avg_runtime_s": 1.631,
+      "avg_primitives": 3212,
+      "avg_text_items": 757
+    },
+    "max": {
+      "runs": 4,
+      "avg_runtime_s": 1.628,
+      "avg_primitives": 3212,
+      "avg_text_items": 2274.5
+    }
+  }
+}
