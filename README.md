@@ -64,6 +64,14 @@ python -m ruff check .
 python -m pytest tests/ -v
 ```
 
+## Batch Import
+
+Run batch import summaries across a folder of PDFs:
+
+```bash
+python -m blender_pdf_vector_importer.batch_cli "C:\path\to\pdfs" --recursive --preset technical --pages all --json batch_report.json
+```
+
 ## License
 
 MIT -- Copyright (c) 2024-2026 BlueCollar Systems

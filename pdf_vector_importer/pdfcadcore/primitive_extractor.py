@@ -50,6 +50,45 @@ def _norm_color(col) -> Tuple[float, float, float]:
         return (0.0, 0.0, 0.0)
 
 
+def _parse_dashes(raw) -> list | None:
+    """Parse PyMuPDF dash patterns into a numeric list.
+
+    PyMuPDF returns dashes as strings like ``'[ 6 6 ] 0'`` (array + phase)
+    or as actual lists/tuples.  Returns ``None`` for solid lines.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        s = raw.strip()
+        if not s or s.startswith("[]") or s == "() 0":
+            return None
+        # Extract numbers between brackets: "[ 6 6 ] 0" -> [6.0, 6.0]
+        bracket = s.find("[")
+        bracket_end = s.find("]")
+        if bracket >= 0 and bracket_end > bracket:
+            inner = s[bracket + 1:bracket_end].strip()
+            if not inner:
+                return None
+            try:
+                nums = [float(x) for x in inner.split()]
+                return nums if nums else None
+            except ValueError:
+                return None
+        return None
+    if isinstance(raw, (list, tuple)):
+        if not raw:
+            return None
+        # Could be ([6,6], 0) tuple or flat [6,6]
+        if len(raw) == 2 and isinstance(raw[0], (list, tuple)):
+            return list(raw[0]) if raw[0] else None
+        try:
+            nums = [float(x) for x in raw]
+            return nums if nums else None
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
 def extract_page(page, page_num: int, scale: float = 1.0,
                  flip_y: bool = True) -> PageData:
     """Extract normalized primitives from a PyMuPDF page."""
@@ -68,7 +107,7 @@ def extract_page(page, page_num: int, scale: float = 1.0,
         stroke = _norm_color(path_group.get("color") or path_group.get("stroke"))
         fill = _norm_color(path_group.get("fill"))
         width = path_group.get("width")
-        dashes = path_group.get("dashes")
+        dashes = _parse_dashes(path_group.get("dashes"))
         close_path = path_group.get("closePath", False)
         layer_name = path_group.get("oc") or path_group.get("layer")
 

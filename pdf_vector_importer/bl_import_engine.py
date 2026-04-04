@@ -10,12 +10,16 @@ from __future__ import annotations
 
 import os
 import re
+import time
 from typing import Callable, Dict, List, Optional
 
 import bpy
 
 from .dependency_manager import check_pymupdf, ensure_lib_path
-from .pdfcadcore import ImportConfig, extract_page, recognition, reset_ids
+from .pdfcadcore import (
+    ImportConfig, extract_page, recognition, reset_ids,
+    classify_page_content, tag_hatch_primitives, cleanup_primitives,
+)
 from .bl_geometry_builder import build_page
 from .bl_text_builder import build_all_text
 
@@ -105,6 +109,7 @@ def import_pdf(
     filepath: str,
     config: Optional[dict] = None,
     progress_callback: Optional[Callable[[float, str], None]] = None,
+    context=None,
 ) -> Dict[str, int]:
     """
     Import a PDF file into Blender. Main entry point.
@@ -114,17 +119,12 @@ def import_pdf(
         config: Dict with keys like 'preset', 'pages', 'text_mode',
                 'detect_arcs', 'make_faces', 'group_by_color', 'map_dashes'.
         progress_callback: Optional callable(progress_float, message_str).
+        context: Optional bpy.context for Blender window-manager progress bar.
+                 Pass None for CLI/headless mode.
 
     Returns:
-        Stats dict: {
-            'pages_imported': int,
-            'primitives': int,
-            'text_items': int,
-            'curves': int,
-            'meshes': int,
-            'circles': int,
-            'arcs': int,
-        }
+        Stats dict with keys: pages, primitives, text_items, collections,
+        elapsed, curves, meshes, circles, arcs, pages_imported.
 
     Raises:
         RuntimeError: If PyMuPDF is not available.
@@ -133,109 +133,190 @@ def import_pdf(
     if config is None:
         config = {}
 
+    # Blender window-manager progress bar (safe when context is None)
+    wm = None
+    if context is not None:
+        try:
+            wm = context.window_manager
+            wm.progress_begin(0, 100)
+        except Exception:
+            wm = None
+
+    def _wm_progress(pct: float):
+        """Update Blender's progress bar (0.0-1.0 -> 0-100)."""
+        if wm is not None:
+            try:
+                wm.progress_update(int(pct * 100))
+            except Exception:
+                pass
+
     def _progress(pct: float, msg: str):
         if progress_callback:
             progress_callback(pct, msg)
+        _wm_progress(pct)
 
-    # 1. Verify PyMuPDF is available
-    _progress(0.0, "Checking dependencies...")
-    if not check_pymupdf():
-        raise RuntimeError(
-            "PyMuPDF is not installed. Open addon preferences "
-            "(Edit > Preferences > Add-ons > PDF Vector Importer) "
-            "and click 'Install PyMuPDF'."
-        )
+    t_start = time.perf_counter()
 
-    ensure_lib_path()
-    import fitz  # noqa: E402
+    try:
+        # 1. Verify PyMuPDF is available
+        _progress(0.0, "Checking dependencies...")
+        if not check_pymupdf():
+            raise RuntimeError(
+                "PyMuPDF is not installed. Open addon preferences "
+                "(Edit > Preferences > Add-ons > PDF Vector Importer) "
+                "and click 'Install PyMuPDF'."
+            )
 
-    # 2. Verify file exists
-    if not os.path.isfile(filepath):
-        raise FileNotFoundError(f"PDF file not found: {filepath}")
+        ensure_lib_path()
+        import fitz  # noqa: E402
 
-    # 3. Build ImportConfig from preset + overrides
-    import_cfg = _config_from_preset(config.get("preset", "shop"))
-    import_cfg = _apply_overrides(import_cfg, config)
+        # 2. Verify file exists
+        if not os.path.isfile(filepath):
+            raise FileNotFoundError(f"PDF file not found: {filepath}")
 
-    # 4. Reset pdfcadcore ID counter
-    reset_ids()
+        # 3. Build ImportConfig from preset + overrides
+        import_cfg = _config_from_preset(config.get("preset", "shop"))
+        import_cfg = _apply_overrides(import_cfg, config)
 
-    # 5. Open PDF
-    _progress(0.05, "Opening PDF...")
-    doc = fitz.open(filepath)
-    total_pages = doc.page_count
+        # 4. Reset pdfcadcore ID counter
+        reset_ids()
 
-    # 6. Determine pages to import
-    page_indices = _parse_pages(config.get("pages", "all"), total_pages)
-    if not page_indices:
-        doc.close()
-        return {
+        # 5. Open PDF
+        _progress(0.05, "Opening PDF...")
+        doc = fitz.open(filepath)
+        total_pages = doc.page_count
+
+        # 6. Determine pages to import
+        page_indices = _parse_pages(config.get("pages", "all"), total_pages)
+        if not page_indices:
+            doc.close()
+            elapsed = time.perf_counter() - t_start
+            return {
+                "pages_imported": 0, "pages": 0, "primitives": 0,
+                "text_items": 0, "collections": 0, "elapsed": elapsed,
+                "curves": 0, "meshes": 0, "circles": 0, "arcs": 0,
+            }
+
+        # 7. Create root collection
+        basename = os.path.splitext(os.path.basename(filepath))[0]
+        root_col = bpy.data.collections.new(f"PDF Import - {basename}")
+        bpy.context.scene.collection.children.link(root_col)
+        collections_created = 1  # root collection
+
+        # 8. Build config dict for geometry builder
+        builder_config = {
+            "make_faces": import_cfg.make_faces,
+            "group_by_color": import_cfg.group_by_color,
+        }
+
+        # 9. Process each page
+        total_stats = {
             "pages_imported": 0, "primitives": 0, "text_items": 0,
             "curves": 0, "meshes": 0, "circles": 0, "arcs": 0,
         }
 
-    # 7. Create root collection
-    basename = os.path.splitext(os.path.basename(filepath))[0]
-    root_col = bpy.data.collections.new(f"PDF Import - {basename}")
-    bpy.context.scene.collection.children.link(root_col)
+        for i, page_idx in enumerate(page_indices):
+            # Per-page progress: 10%-85% proportional across pages
+            pct = 0.10 + 0.75 * (i / len(page_indices))
+            page_num = page_idx + 1
+            _progress(pct, f"Extracting page {page_num}...")
 
-    # 8. Build config dict for geometry builder
-    builder_config = {
-        "make_faces": import_cfg.make_faces,
-        "group_by_color": import_cfg.group_by_color,
-    }
+            page = doc.load_page(page_idx)
 
-    # 9. Process each page
-    total_stats = {
-        "pages_imported": 0, "primitives": 0, "text_items": 0,
-        "curves": 0, "meshes": 0, "circles": 0, "arcs": 0,
-    }
+            # 9a. Auto-mode classification (before extraction)
+            if import_cfg.import_mode == "auto":
+                raw_drawings = page.get_drawings()
+                text_blocks = page.get_text("blocks") or []
+                text_words = page.get_text("words") or []
+                classification = classify_page_content(
+                    raw_drawings,
+                    text_blocks_count=len(text_blocks),
+                    text_words_count=len(text_words),
+                )
+                if classification["type"] in ("glyph_flood", "fill_art"):
+                    _progress(pct, f"Auto-mode: {classification['reason']} — "
+                              f"skipping vector import for page {page_num}")
+                    continue
 
-    for i, page_idx in enumerate(page_indices):
-        pct = 0.1 + 0.85 * (i / len(page_indices))
-        page_num = page_idx + 1
-        _progress(pct, f"Extracting page {page_num}...")
-
-        page = doc.load_page(page_idx)
-
-        # 9a. Extract primitives via pdfcadcore
-        page_data = extract_page(
-            page, page_num,
-            scale=import_cfg.user_scale,
-            flip_y=import_cfg.flip_y,
-        )
-
-        # 9b. Optional recognition pass
-        try:
-            recognition.run(page_data, mode="auto")
-        except Exception:
-            # Recognition failure is non-fatal
-            pass
-
-        # 9c. Create page collection
-        page_col = bpy.data.collections.new(f"PDF_Page_{page_num}")
-        root_col.children.link(page_col)
-
-        # 9d. Build geometry
-        _progress(pct + 0.02, f"Building geometry for page {page_num}...")
-        page_stats = build_page(page_data, page_col, builder_config)
-
-        # 9e. Build text objects
-        text_count = 0
-        if import_cfg.import_text and import_cfg.text_mode != "none":
-            text_count = build_all_text(
-                page_data.text_items, page_col, page_num,
+            # 9b. Extract primitives via pdfcadcore
+            page_data = extract_page(
+                page, page_num,
+                scale=import_cfg.user_scale,
+                flip_y=import_cfg.flip_y,
             )
 
-        # 9f. Accumulate stats
-        total_stats["pages_imported"] += 1
-        total_stats["primitives"] += len(page_data.primitives)
-        total_stats["text_items"] += text_count
-        total_stats["curves"] += page_stats.get("curves", 0)
-        total_stats["meshes"] += page_stats.get("meshes", 0)
-        total_stats["circles"] += page_stats.get("circles", 0)
-        total_stats["arcs"] += page_stats.get("arcs", 0)
+            # 9c. Geometry cleanup (remove micro-segments)
+            if import_cfg.cleanup_level != "conservative" or import_cfg.min_seg_len > 0:
+                cleanup_stats = cleanup_primitives(
+                    page_data.primitives,
+                    cleanup_level=import_cfg.cleanup_level,
+                )
+                if import_cfg.verbose and cleanup_stats.get("removed_micro", 0) > 0:
+                    _progress(pct, f"Cleanup: removed "
+                              f"{cleanup_stats['removed_micro']} micro-segments "
+                              f"on page {page_num}")
 
-    doc.close()
-    _progress(1.0, "Import complete.")
-    return total_stats
+            # 9d. Hatch detection (post-extraction, on primitives)
+            if import_cfg.hatch_mode != "import":
+                hatch_ids = tag_hatch_primitives(page_data.primitives)
+                if hatch_ids:
+                    if import_cfg.hatch_mode == "skip":
+                        page_data.primitives = [
+                            p for p in page_data.primitives
+                            if p.id not in hatch_ids
+                        ]
+                    elif import_cfg.hatch_mode == "group":
+                        for p in page_data.primitives:
+                            if p.id in hatch_ids:
+                                p.generic_tags.append("hatch_line")
+
+            # 9e. Optional recognition pass
+            _progress(0.85, f"Recognition pass on page {page_num}...")
+            try:
+                recognition.run(page_data, mode="auto")
+            except Exception:
+                # Recognition failure is non-fatal
+                pass
+
+            # 9f. Create page collection
+            page_col = bpy.data.collections.new(f"PDF_Page_{page_num}")
+            root_col.children.link(page_col)
+            collections_created += 1
+
+            # 9g. Build geometry
+            _progress(0.90, f"Building geometry for page {page_num}...")
+            page_stats = build_page(page_data, page_col, builder_config)
+
+            # 9h. Build text objects
+            text_count = 0
+            if import_cfg.import_text and import_cfg.text_mode != "none":
+                text_count = build_all_text(
+                    page_data.text_items, page_col, page_num,
+                )
+
+            # 9i. Accumulate stats
+            total_stats["pages_imported"] += 1
+            total_stats["primitives"] += len(page_data.primitives)
+            total_stats["text_items"] += text_count
+            total_stats["curves"] += page_stats.get("curves", 0)
+            total_stats["meshes"] += page_stats.get("meshes", 0)
+            total_stats["circles"] += page_stats.get("circles", 0)
+            total_stats["arcs"] += page_stats.get("arcs", 0)
+
+        doc.close()
+
+        elapsed = time.perf_counter() - t_start
+        _progress(1.0, "Import complete.")
+
+        # Merge extended stats into return dict
+        total_stats["pages"] = len(page_indices)
+        total_stats["collections"] = collections_created
+        total_stats["elapsed"] = elapsed
+        return total_stats
+
+    finally:
+        if wm is not None:
+            try:
+                wm.progress_end()
+            except Exception:
+                pass

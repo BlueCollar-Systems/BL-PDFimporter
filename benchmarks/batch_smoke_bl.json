@@ -1,0 +1,296 @@
+{
+  "root": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)",
+  "total": 12,
+  "passed": 12,
+  "failed": 0,
+  "results": [
+    {
+      "pdf": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\1058 - Rev 0.pdf",
+      "status": "PASS",
+      "summary": {
+        "pdf_path": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\1058 - Rev 0.pdf",
+        "pages": 1,
+        "primitives": 2673,
+        "text_items": 501,
+        "images": 0,
+        "profiles": [
+          {
+            "page": 1,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.5,
+              "cad_drawing": 0.55,
+              "architectural": 0.44999999999999996,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          }
+        ]
+      }
+    },
+    {
+      "pdf": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\1071 - Rev 0.pdf",
+      "status": "PASS",
+      "summary": {
+        "pdf_path": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\1071 - Rev 0.pdf",
+        "pages": 1,
+        "primitives": 5930,
+        "text_items": 606,
+        "images": 0,
+        "profiles": [
+          {
+            "page": 1,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.35,
+              "cad_drawing": 0.55,
+              "architectural": 0.44999999999999996,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          }
+        ]
+      }
+    },
+    {
+      "pdf": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\Alvord TX \u2014 Garden Map \u00b7 Final.pdf",
+      "status": "PASS",
+      "summary": {
+        "pdf_path": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\Alvord TX \u2014 Garden Map \u00b7 Final.pdf",
+        "pages": 1,
+        "primitives": 6890,
+        "text_items": 1500,
+        "images": 0,
+        "profiles": [
+          {
+            "page": 1,
+            "primary_type": "vector_art",
+            "scores": {
+              "fabrication": 0.25,
+              "cad_drawing": 0.1,
+              "architectural": 0.1,
+              "vector_art": 0.5,
+              "raster_only": 0.0
+            }
+          }
+        ]
+      }
+    },
+    {
+      "pdf": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\Alvord TX \u2014 Garden Plan \u00b7 Final.pdf",
+      "status": "PASS",
+      "summary": {
+        "pdf_path": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\Alvord TX \u2014 Garden Plan \u00b7 Final.pdf",
+        "pages": 1,
+        "primitives": 1145,
+        "text_items": 74,
+        "images": 0,
+        "profiles": [
+          {
+            "page": 1,
+            "primary_type": "vector_art",
+            "scores": {
+              "fabrication": 0.1,
+              "cad_drawing": 0.1,
+              "architectural": 0.1,
+              "vector_art": 0.5,
+              "raster_only": 0.0
+            }
+          }
+        ]
+      }
+    },
+    {
+      "pdf": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\alvord_garden_map_PRINT.pdf",
+      "status": "PASS",
+      "summary": {
+        "pdf_path": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\alvord_garden_map_PRINT.pdf",
+        "pages": 1,
+        "primitives": 252,
+        "text_items": 375,
+        "images": 0,
+        "profiles": [
+          {
+            "page": 1,
+            "primary_type": "fabrication",
+            "scores": {
+              "fabrication": 0.4,
+              "cad_drawing": 0.25,
+              "architectural": 0.25,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          }
+        ]
+      }
+    },
+    {
+      "pdf": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\alvord_plant_list.pdf",
+      "status": "PASS",
+      "summary": {
+        "pdf_path": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\alvord_plant_list.pdf",
+        "pages": 1,
+        "primitives": 97,
+        "text_items": 161,
+        "images": 0,
+        "profiles": [
+          {
+            "page": 1,
+            "primary_type": "fabrication",
+            "scores": {
+              "fabrication": 0.25,
+              "cad_drawing": 0.25,
+              "architectural": 0.25,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          }
+        ]
+      }
+    },
+    {
+      "pdf": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\Attachment-C-Drawings.pdf",
+      "status": "PASS",
+      "summary": {
+        "pdf_path": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\Attachment-C-Drawings.pdf",
+        "pages": 1,
+        "primitives": 1517,
+        "text_items": 790,
+        "images": 2,
+        "profiles": [
+          {
+            "page": 1,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.45000000000000007,
+              "cad_drawing": 0.5,
+              "architectural": 0.30000000000000004,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          }
+        ]
+      }
+    },
+    {
+      "pdf": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\Cut Ticket Bollards 516.Pdf",
+      "status": "PASS",
+      "summary": {
+        "pdf_path": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\Cut Ticket Bollards 516.Pdf",
+        "pages": 1,
+        "primitives": 25,
+        "text_items": 34,
+        "images": 0,
+        "profiles": [
+          {
+            "page": 1,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.15,
+              "cad_drawing": 0.25,
+              "architectural": 0.25,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          }
+        ]
+      }
+    },
+    {
+      "pdf": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\E5039 - Rev 1.pdf",
+      "status": "PASS",
+      "summary": {
+        "pdf_path": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\E5039 - Rev 1.pdf",
+        "pages": 1,
+        "primitives": 4828,
+        "text_items": 242,
+        "images": 0,
+        "profiles": [
+          {
+            "page": 1,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.35,
+              "cad_drawing": 0.55,
+              "architectural": 0.44999999999999996,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          }
+        ]
+      }
+    },
+    {
+      "pdf": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\TX_Alvord_20220525_TM_geo.pdf",
+      "status": "PASS",
+      "summary": {
+        "pdf_path": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\TX_Alvord_20220525_TM_geo.pdf",
+        "pages": 1,
+        "primitives": 10887,
+        "text_items": 1500,
+        "images": 212,
+        "profiles": [
+          {
+            "page": 1,
+            "primary_type": "vector_art",
+            "scores": {
+              "fabrication": 0.0,
+              "cad_drawing": 0.2,
+              "architectural": 0.30000000000000004,
+              "vector_art": 0.5,
+              "raster_only": 0.0
+            }
+          }
+        ]
+      }
+    },
+    {
+      "pdf": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\Welding-Symbol-Chart OCR.pdf",
+      "status": "PASS",
+      "summary": {
+        "pdf_path": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\Welding-Symbol-Chart OCR.pdf",
+        "pages": 1,
+        "primitives": 632,
+        "text_items": 363,
+        "images": 93,
+        "profiles": [
+          {
+            "page": 1,
+            "primary_type": "architectural",
+            "scores": {
+              "fabrication": 0.15,
+              "cad_drawing": 0.35,
+              "architectural": 0.44999999999999996,
+              "vector_art": 0.0,
+              "raster_only": 0.0
+            }
+          }
+        ]
+      }
+    },
+    {
+      "pdf": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\Welding-Symbol-Chart.pdf",
+      "status": "PASS",
+      "summary": {
+        "pdf_path": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\Welding-Symbol-Chart.pdf",
+        "pages": 1,
+        "primitives": 638,
+        "text_items": 367,
+        "images": 93,
+        "profiles": [
+          {
+            "page": 1,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.25,
+              "cad_drawing": 0.44999999999999996,
+              "architectural": 0.44999999999999996,
+              "vector_art": 0.0,
+              "raster_only": 0.0
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,20 @@
+{
+  "pdf_path": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\1071 - Rev 0.pdf",
+  "pages": 1,
+  "primitives": 0,
+  "text_items": 0,
+  "images": 1,
+  "profiles": [
+    {
+      "page": 1,
+      "primary_type": "raster_only",
+      "scores": {
+        "fabrication": 0.0,
+        "cad_drawing": 0.0,
+        "architectural": 0.0,
+        "vector_art": 0.1,
+        "raster_only": 0.9
+      }
+    }
+  ]
+}

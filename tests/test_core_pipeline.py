@@ -9,6 +9,7 @@ import fitz
 
 from blender_pdf_vector_importer.core.PDFPrimitiveExtractor import _norm_color
 from blender_pdf_vector_importer.core.document import ExtractionOptions, extract_document
+from blender_pdf_vector_importer.importer import apply_uniform_scale, run_import
 
 
 class TestCorePipeline(unittest.TestCase):
@@ -48,6 +49,10 @@ class TestCorePipeline(unittest.TestCase):
         img_bytes = pix.tobytes("png")
         page.insert_image(fitz.Rect(380, 40, 460, 120), stream=img_bytes)
 
+        # Second page to validate default page-selection behavior.
+        page2 = doc.new_page(width=300, height=200)
+        page2.draw_line((20, 20), (200, 20), color=(0, 0, 1), width=1.0)
+
         doc.save(str(out_path))
 
     def test_extract_document_summary(self) -> None:
@@ -71,6 +76,28 @@ class TestCorePipeline(unittest.TestCase):
         page = extraction.pages[0].page_data
         prim_types = {p.type for p in page.primitives}
         self.assertTrue({"arc", "circle", "polyline", "closed_loop"}.intersection(prim_types))
+
+    def test_default_page_selection_imports_all_pages(self) -> None:
+        extraction = extract_document(
+            str(self.pdf_path),
+            ExtractionOptions(import_text=False, import_images=False),
+        )
+        self.assertEqual(len(extraction.pages), 2)
+
+    def test_raster_only_mode_renders_page_image(self) -> None:
+        run = run_import(str(self.pdf_path), preset="raster_only", overrides={"pages": "1"})
+        summary = run.extraction.summary()
+        self.assertEqual(summary["pages"], 1)
+        self.assertEqual(summary["primitives"], 0)
+        self.assertEqual(summary["text_items"], 0)
+        self.assertGreaterEqual(summary["images"], 1)
+
+    def test_reference_scale_transform(self) -> None:
+        run = run_import(str(self.pdf_path), preset="general", overrides={"pages": "1"})
+        page = run.extraction.pages[0].page_data
+        width_before = page.width
+        apply_uniform_scale(run.extraction, 2.0)
+        self.assertAlmostEqual(run.extraction.pages[0].page_data.width, width_before * 2.0, places=6)
 
     def test_cmyk_color_normalization(self) -> None:
         rgb = _norm_color((0.0, 1.0, 1.0, 0.0))
