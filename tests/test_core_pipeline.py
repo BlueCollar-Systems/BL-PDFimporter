@@ -5,7 +5,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
-import fitz
+try:
+    import pymupdf as fitz  # PyMuPDF >= 1.24 preferred name
+except ImportError:
+    import fitz  # Legacy fallback
 
 from blender_pdf_vector_importer.core.PDFPrimitiveExtractor import _norm_color
 from blender_pdf_vector_importer.core.document import ExtractionOptions, extract_document

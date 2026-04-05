@@ -30,8 +30,12 @@ def check_pymupdf() -> bool:
     """Check whether PyMuPDF (fitz) is importable."""
     ensure_lib_path()
     try:
-        import fitz  # noqa: F401
-
+        import pymupdf as fitz  # noqa: F401  — PyMuPDF >= 1.24 preferred name
+        return True
+    except ImportError:
+        pass
+    try:
+        import fitz  # noqa: F401  — Legacy fallback
         return True
     except ImportError:
         return False
@@ -61,11 +65,22 @@ def install_pymupdf() -> bool:
                 "--target",
                 str(lib_dir),
                 "--upgrade",
-                "PyMuPDF",
+                "PyMuPDF>=1.24,<2.0",
             ],
             timeout=300,
         )
-    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+    except subprocess.CalledProcessError as exc:
+        print(f"[PDF Vector Importer] pip install failed (exit code {exc.returncode}).")
+        print(f"[PDF Vector Importer] Command: {exc.cmd}")
+        print("[PDF Vector Importer] Check that Blender's bundled Python has network "
+              "access and pip is available.")
+        return False
+    except FileNotFoundError:
+        print(f"[PDF Vector Importer] Python executable not found: {python_exe}")
+        print("[PDF Vector Importer] Cannot install PyMuPDF without a valid Python binary.")
+        return False
+    except OSError as exc:
+        print(f"[PDF Vector Importer] OS error during pip install: {exc}")
         return False
 
     # Ensure the new path is available immediately
@@ -76,8 +91,10 @@ def install_pymupdf() -> bool:
         import importlib
 
         importlib.invalidate_caches()
-        import fitz  # noqa: F401
-
+        try:
+            import pymupdf as fitz  # noqa: F401
+        except ImportError:
+            import fitz  # noqa: F401
         return True
     except ImportError:
         return False
@@ -87,8 +104,35 @@ def get_pymupdf_version() -> str:
     """Return the installed PyMuPDF version string, or empty string."""
     ensure_lib_path()
     try:
-        import fitz
-
+        try:
+            import pymupdf as fitz
+        except ImportError:
+            import fitz
         return getattr(fitz, "version", ("unknown",))[0]
     except (ImportError, AttributeError, IndexError):
         return ""
+
+
+def print_diagnostics() -> None:
+    """Print first-run diagnostic info: Blender version, Python version, PyMuPDF version."""
+    print("[PDF Vector Importer] --- Dependency Diagnostics ---")
+
+    # Python version
+    print(f"[PDF Vector Importer] Python: {sys.version}")
+
+    # Blender version (may not be available outside Blender)
+    try:
+        import bpy
+        blender_ver = ".".join(str(v) for v in bpy.app.version)
+        print(f"[PDF Vector Importer] Blender: {blender_ver}")
+    except Exception:
+        print("[PDF Vector Importer] Blender: not available (headless/CLI mode)")
+
+    # PyMuPDF version
+    pymupdf_ver = get_pymupdf_version()
+    if pymupdf_ver:
+        print(f"[PDF Vector Importer] PyMuPDF: {pymupdf_ver}")
+    else:
+        print("[PDF Vector Importer] PyMuPDF: NOT INSTALLED")
+
+    print("[PDF Vector Importer] --- End Diagnostics ---")

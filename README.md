@@ -48,11 +48,26 @@ After enabling the addon:
 
 Geometry is grouped into collections by page and (optionally) by source layer or color.
 
+## Compatibility
+
+| Blender Version | Bundled Python | PyMuPDF | Status |
+|----------------|---------------|---------|--------|
+| 3.6 LTS | 3.10 | >=1.24,<2.0 | ⚠️ Expected |
+| 4.0–4.2 | 3.11 | >=1.24,<2.0 | ⚠️ Expected |
+| 4.5 LTS | 3.11 | >=1.24,<2.0 | ⚠️ Expected |
+| 2.83–2.93 | 3.9 | legacy pin | ⚠️ Expected only after legacy branch testing |
+| 2.79 and earlier | | | ❌ Not supported |
+
+Evidence levels:
+- `✅ Verified`: host-run validation evidence captured.
+- `⚠️ Expected`: syntax/runtime compatible but no host-run evidence yet.
+- `❌ Not supported`: outside maintained/tested compatibility scope.
+
 ## Requirements
 
 - Blender 3.0 or newer
 - Python 3.10+
-- PyMuPDF (auto-installed via addon preferences)
+- PyMuPDF >=1.24,<2.0 (auto-installed via addon preferences)
 
 ## Development
 
@@ -71,6 +86,26 @@ Run batch import summaries across a folder of PDFs:
 ```bash
 python -m blender_pdf_vector_importer.batch_cli "C:\path\to\pdfs" --recursive --preset technical --pages all --json batch_report.json
 ```
+
+## Project Structure
+
+| Directory | Purpose |
+|-----------|---------|
+| `pdf_vector_importer/` | Blender addon (install via Edit > Preferences > Add-ons) |
+| `blender_pdf_vector_importer/` | Standalone CLI and library for headless/batch processing |
+
+## Known Limitations
+
+| Limitation | Details |
+|-----------|---------|
+| Encrypted PDFs | Password-protected PDFs must be unlocked before import |
+| Compression filters | Decoding is delegated to PyMuPDF. Malformed or non-standard compressed object streams may fail to parse |
+| Raster-only scans | Pure raster PDFs produce no vector geometry |
+| Clipped/XObject-heavy PDFs | Complex clip stacks and deeply nested form XObjects can produce partial geometry |
+| Very large PDFs | Documents with >10,000 primitives may cause slow import due to per-object dependency graph updates |
+| Embedded subset fonts | Text using embedded subset fonts may not render correctly |
+| PyMuPDF required | PyMuPDF must be installable in Blender's bundled Python (see dependency manager) |
+| Legacy hosts | Blender/Python combinations outside the listed compatibility matrix are expected-only until verified |
 
 ## License
 

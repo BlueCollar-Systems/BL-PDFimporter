@@ -168,7 +168,10 @@ def import_pdf(
             )
 
         ensure_lib_path()
-        import fitz  # noqa: E402
+        try:
+            import pymupdf as fitz  # PyMuPDF >= 1.24 preferred name
+        except ImportError:
+            import fitz  # Legacy fallback
 
         # 2. Verify file exists
         if not os.path.isfile(filepath):
