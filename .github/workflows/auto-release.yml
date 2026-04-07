@@ -3,11 +3,11 @@ name: auto-release
 on:
   push:
     branches: [main, master]
-    paths:
-      - 'pdf_vector_importer/__init__.py'
+  workflow_dispatch:
 
 jobs:
   release:
+    if: "!startsWith(github.event.head_commit.message, 'chore: bump version to')"
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -20,24 +20,83 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Extract version
+      - name: Read and bump version
         id: version
         run: |
-          VERSION=$(python -c "
+          python - <<'PY'
+          import os
+          import pathlib
           import re
-          with open('pdf_vector_importer/__init__.py') as f:
-              m = re.search(r'\"version\":\s*\((\d+),\s*(\d+),\s*(\d+)\)', f.read())
-              if m: print(f'{m.group(1)}.{m.group(2)}.{m.group(3)}')
-          ")
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+          init_file = pathlib.Path("pdf_vector_importer/__init__.py")
+          pyproject = pathlib.Path("pyproject.toml")
+          readme = pathlib.Path("README.md")
+
+          init_text = init_file.read_text(encoding="utf-8")
+          match = re.search(r'("version":\s*\()(\d+),\s*(\d+),\s*(\d+)(\))', init_text)
+          if not match:
+              raise SystemExit('Could not parse version tuple from pdf_vector_importer/__init__.py')
+
+          major, minor, patch = map(int, match.groups()[1:4])
+          old_version = f"{major}.{minor}.{patch}"
+          new_version = f"{major}.{minor}.{patch + 1}"
+
+          init_text = re.sub(
+              r'("version":\s*\()(\d+),\s*(\d+),\s*(\d+)(\))',
+              rf'\g<1>{major}, {minor}, {patch + 1}\5',
+              init_text,
+              count=1,
+          )
+          init_file.write_text(init_text, encoding="utf-8")
+
+          pyproject_text = pyproject.read_text(encoding="utf-8")
+          pyproject_text = re.sub(
+              r'(^version\s*=\s*")(\d+\.\d+\.\d+)(")',
+              rf'\g<1>{new_version}\3',
+              pyproject_text,
+              count=1,
+              flags=re.MULTILINE,
+          )
+          pyproject.write_text(pyproject_text, encoding="utf-8")
+
+          readme_text = readme.read_text(encoding="utf-8")
+          readme_text = re.sub(
+              r"(Version-)(\d+\.\d+\.\d+)(-(green|blue)\.svg)",
+              rf"\g<1>{new_version}\3",
+              readme_text,
+              count=1,
+          )
+          readme.write_text(readme_text, encoding="utf-8")
+
+          out = pathlib.Path(os.environ["GITHUB_OUTPUT"])
+          out.write_text(
+              f"old_version={old_version}\nversion={new_version}\n",
+              encoding="utf-8",
+          )
+          PY
 
       - name: Build release
         run: python build_release.py
 
-      - name: Create release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: v${{ steps.version.outputs.version }}
-          name: PDF Vector Importer for Blender v${{ steps.version.outputs.version }}
-          files: dist/*.zip
-          generate_release_notes: true
+      - name: Commit version bump
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add pdf_vector_importer/__init__.py pyproject.toml README.md
+          git diff --cached --quiet && echo "No version changes to commit" && exit 0
+          git commit -m "chore: bump version to ${{ steps.version.outputs.version }}"
+          git push
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          TAG="v${{ steps.version.outputs.version }}"
+          TITLE="PDF Vector Importer for Blender v${{ steps.version.outputs.version }}"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/*.zip --clobber
+          else
+            gh release create "$TAG" --title "$TITLE" --generate-notes --latest dist/*.zip
+          fi
