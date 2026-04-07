@@ -986,11 +986,11 @@ def import_pdf(
             page_stats = {"curves": 0, "meshes": 0, "circles": 0, "arcs": 0}
             if import_mode != "raster":
                 _progress(_page_progress(i, 0.72), f"Building geometry for page {page_num}...")
-                def _geom_progress(frac):
+                def _geom_progress(frac, _i=i, _pn=page_num):
                     frac = max(0.0, min(1.0, float(frac)))
                     _progress(
-                        _page_progress(i, 0.72 + (0.10 * frac)),
-                        f"Building geometry for page {page_num}... ({int(frac * 100)}%)",
+                        _page_progress(_i, 0.72 + (0.10 * frac)),
+                        f"Building geometry for page {_pn}... ({int(frac * 100)}%)",
                     )
                 page_stats = build_page(
                     page_data,
@@ -1003,11 +1003,11 @@ def import_pdf(
             text_count = 0
             if import_mode != "raster" and import_cfg.import_text and import_cfg.text_mode != "none":
                 _progress(_page_progress(i, 0.82), f"Building text for page {page_num}...")
-                def _text_progress(frac):
+                def _text_progress(frac, _i=i, _pn=page_num):
                     frac = max(0.0, min(1.0, float(frac)))
                     _progress(
-                        _page_progress(i, 0.82 + (0.09 * frac)),
-                        f"Building text for page {page_num}... ({int(frac * 100)}%)",
+                        _page_progress(_i, 0.82 + (0.09 * frac)),
+                        f"Building text for page {_pn}... ({int(frac * 100)}%)",
                     )
                 text_count = build_all_text(
                     page_data.text_items,
