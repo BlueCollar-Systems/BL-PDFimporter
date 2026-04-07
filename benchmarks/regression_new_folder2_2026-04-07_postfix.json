@@ -1,0 +1,1417 @@
+{
+  "root": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)",
+  "total": 28,
+  "passed": 28,
+  "failed": 0,
+  "results": [
+    {
+      "pdf": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\1058 - Rev 0.pdf",
+      "status": "PASS",
+      "summary": {
+        "pdf_path": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\1058 - Rev 0.pdf",
+        "pages": 1,
+        "primitives": 2673,
+        "text_items": 501,
+        "images": 0,
+        "profiles": [
+          {
+            "page": 1,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.5,
+              "cad_drawing": 0.55,
+              "architectural": 0.44999999999999996,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          }
+        ]
+      }
+    },
+    {
+      "pdf": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\1071 - Rev 0.pdf",
+      "status": "PASS",
+      "summary": {
+        "pdf_path": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\1071 - Rev 0.pdf",
+        "pages": 1,
+        "primitives": 5930,
+        "text_items": 606,
+        "images": 0,
+        "profiles": [
+          {
+            "page": 1,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.35,
+              "cad_drawing": 0.55,
+              "architectural": 0.44999999999999996,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          }
+        ]
+      }
+    },
+    {
+      "pdf": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\Alvord TX \u2014 Garden Map \u00b7 Final.pdf",
+      "status": "PASS",
+      "summary": {
+        "pdf_path": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\Alvord TX \u2014 Garden Map \u00b7 Final.pdf",
+        "pages": 1,
+        "primitives": 6890,
+        "text_items": 1500,
+        "images": 0,
+        "profiles": [
+          {
+            "page": 1,
+            "primary_type": "vector_art",
+            "scores": {
+              "fabrication": 0.25,
+              "cad_drawing": 0.1,
+              "architectural": 0.1,
+              "vector_art": 0.5,
+              "raster_only": 0.0
+            }
+          }
+        ]
+      }
+    },
+    {
+      "pdf": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\Alvord TX \u2014 Garden Plan \u00b7 Final.pdf",
+      "status": "PASS",
+      "summary": {
+        "pdf_path": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\Alvord TX \u2014 Garden Plan \u00b7 Final.pdf",
+        "pages": 7,
+        "primitives": 9475,
+        "text_items": 552,
+        "images": 0,
+        "profiles": [
+          {
+            "page": 1,
+            "primary_type": "vector_art",
+            "scores": {
+              "fabrication": 0.1,
+              "cad_drawing": 0.1,
+              "architectural": 0.1,
+              "vector_art": 0.5,
+              "raster_only": 0.0
+            }
+          },
+          {
+            "page": 2,
+            "primary_type": "vector_art",
+            "scores": {
+              "fabrication": 0.1,
+              "cad_drawing": 0.1,
+              "architectural": 0.1,
+              "vector_art": 0.5,
+              "raster_only": 0.0
+            }
+          },
+          {
+            "page": 3,
+            "primary_type": "vector_art",
+            "scores": {
+              "fabrication": 0.1,
+              "cad_drawing": 0.1,
+              "architectural": 0.1,
+              "vector_art": 0.5,
+              "raster_only": 0.0
+            }
+          },
+          {
+            "page": 4,
+            "primary_type": "vector_art",
+            "scores": {
+              "fabrication": 0.1,
+              "cad_drawing": 0.1,
+              "architectural": 0.1,
+              "vector_art": 0.5,
+              "raster_only": 0.0
+            }
+          },
+          {
+            "page": 5,
+            "primary_type": "vector_art",
+            "scores": {
+              "fabrication": 0.1,
+              "cad_drawing": 0.1,
+              "architectural": 0.1,
+              "vector_art": 0.5,
+              "raster_only": 0.0
+            }
+          },
+          {
+            "page": 6,
+            "primary_type": "vector_art",
+            "scores": {
+              "fabrication": 0.1,
+              "cad_drawing": 0.1,
+              "architectural": 0.1,
+              "vector_art": 0.5,
+              "raster_only": 0.0
+            }
+          },
+          {
+            "page": 7,
+            "primary_type": "vector_art",
+            "scores": {
+              "fabrication": 0.1,
+              "cad_drawing": 0.1,
+              "architectural": 0.1,
+              "vector_art": 0.5,
+              "raster_only": 0.0
+            }
+          }
+        ]
+      }
+    },
+    {
+      "pdf": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\alvord_garden_map_PRINT.pdf",
+      "status": "PASS",
+      "summary": {
+        "pdf_path": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\alvord_garden_map_PRINT.pdf",
+        "pages": 4,
+        "primitives": 1181,
+        "text_items": 1860,
+        "images": 0,
+        "profiles": [
+          {
+            "page": 1,
+            "primary_type": "fabrication",
+            "scores": {
+              "fabrication": 0.4,
+              "cad_drawing": 0.25,
+              "architectural": 0.25,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          },
+          {
+            "page": 2,
+            "primary_type": "fabrication",
+            "scores": {
+              "fabrication": 0.25,
+              "cad_drawing": 0.25,
+              "architectural": 0.25,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          },
+          {
+            "page": 3,
+            "primary_type": "fabrication",
+            "scores": {
+              "fabrication": 0.25,
+              "cad_drawing": 0.25,
+              "architectural": 0.25,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          },
+          {
+            "page": 4,
+            "primary_type": "fabrication",
+            "scores": {
+              "fabrication": 0.25,
+              "cad_drawing": 0.25,
+              "architectural": 0.25,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          }
+        ]
+      }
+    },
+    {
+      "pdf": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\alvord_plant_list.pdf",
+      "status": "PASS",
+      "summary": {
+        "pdf_path": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\alvord_plant_list.pdf",
+        "pages": 2,
+        "primitives": 123,
+        "text_items": 210,
+        "images": 0,
+        "profiles": [
+          {
+            "page": 1,
+            "primary_type": "fabrication",
+            "scores": {
+              "fabrication": 0.25,
+              "cad_drawing": 0.25,
+              "architectural": 0.25,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          },
+          {
+            "page": 2,
+            "primary_type": "fabrication",
+            "scores": {
+              "fabrication": 0.25,
+              "cad_drawing": 0.25,
+              "architectural": 0.25,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          }
+        ]
+      }
+    },
+    {
+      "pdf": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\Attachment-C-Drawings.pdf",
+      "status": "PASS",
+      "summary": {
+        "pdf_path": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\Attachment-C-Drawings.pdf",
+        "pages": 44,
+        "primitives": 1279683,
+        "text_items": 15383,
+        "images": 204,
+        "profiles": [
+          {
+            "page": 1,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.45000000000000007,
+              "cad_drawing": 0.5,
+              "architectural": 0.30000000000000004,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          },
+          {
+            "page": 2,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.45000000000000007,
+              "cad_drawing": 0.65,
+              "architectural": 0.44999999999999996,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          },
+          {
+            "page": 3,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.30000000000000004,
+              "cad_drawing": 0.65,
+              "architectural": 0.30000000000000004,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          },
+          {
+            "page": 4,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.30000000000000004,
+              "cad_drawing": 0.65,
+              "architectural": 0.30000000000000004,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          },
+          {
+            "page": 5,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.30000000000000004,
+              "cad_drawing": 0.65,
+              "architectural": 0.30000000000000004,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          },
+          {
+            "page": 6,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.2,
+              "cad_drawing": 0.2,
+              "architectural": 0.1,
+              "vector_art": 0.0,
+              "raster_only": 0.0
+            }
+          },
+          {
+            "page": 7,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.6000000000000001,
+              "cad_drawing": 0.65,
+              "architectural": 0.44999999999999996,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          },
+          {
+            "page": 8,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.45000000000000007,
+              "cad_drawing": 0.65,
+              "architectural": 0.44999999999999996,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          },
+          {
+            "page": 9,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.6000000000000001,
+              "cad_drawing": 0.65,
+              "architectural": 0.44999999999999996,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          },
+          {
+            "page": 10,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.45000000000000007,
+              "cad_drawing": 0.65,
+              "architectural": 0.44999999999999996,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          },
+          {
+            "page": 11,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.45000000000000007,
+              "cad_drawing": 0.65,
+              "architectural": 0.44999999999999996,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          },
+          {
+            "page": 12,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.45000000000000007,
+              "cad_drawing": 0.65,
+              "architectural": 0.44999999999999996,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          },
+          {
+            "page": 13,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.45000000000000007,
+              "cad_drawing": 0.65,
+              "architectural": 0.44999999999999996,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          },
+          {
+            "page": 14,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.6000000000000001,
+              "cad_drawing": 0.65,
+              "architectural": 0.44999999999999996,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          },
+          {
+            "page": 15,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.45000000000000007,
+              "cad_drawing": 0.65,
+              "architectural": 0.44999999999999996,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          },
+          {
+            "page": 16,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.45000000000000007,
+              "cad_drawing": 0.65,
+              "architectural": 0.44999999999999996,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          },
+          {
+            "page": 17,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.45000000000000007,
+              "cad_drawing": 0.65,
+              "architectural": 0.44999999999999996,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          },
+          {
+            "page": 18,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.45000000000000007,
+              "cad_drawing": 0.65,
+              "architectural": 0.44999999999999996,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          },
+          {
+            "page": 19,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.45000000000000007,
+              "cad_drawing": 0.65,
+              "architectural": 0.44999999999999996,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          },
+          {
+            "page": 20,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.45000000000000007,
+              "cad_drawing": 0.65,
+              "architectural": 0.44999999999999996,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          },
+          {
+            "page": 21,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.45000000000000007,
+              "cad_drawing": 0.65,
+              "architectural": 0.44999999999999996,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          },
+          {
+            "page": 22,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.45000000000000007,
+              "cad_drawing": 0.65,
+              "architectural": 0.44999999999999996,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          },
+          {
+            "page": 23,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.45000000000000007,
+              "cad_drawing": 0.65,
+              "architectural": 0.44999999999999996,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          },
+          {
+            "page": 24,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.45000000000000007,
+              "cad_drawing": 0.65,
+              "architectural": 0.44999999999999996,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          },
+          {
+            "page": 25,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.45000000000000007,
+              "cad_drawing": 0.65,
+              "architectural": 0.44999999999999996,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          },
+          {
+            "page": 26,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.6000000000000001,
+              "cad_drawing": 0.65,
+              "architectural": 0.44999999999999996,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          },
+          {
+            "page": 27,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.6000000000000001,
+              "cad_drawing": 0.65,
+              "architectural": 0.44999999999999996,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          },
+          {
+            "page": 28,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.6000000000000001,
+              "cad_drawing": 0.65,
+              "architectural": 0.44999999999999996,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          },
+          {
+            "page": 29,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.45000000000000007,
+              "cad_drawing": 0.65,
+              "architectural": 0.44999999999999996,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          },
+          {
+            "page": 30,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.45000000000000007,
+              "cad_drawing": 0.65,
+              "architectural": 0.44999999999999996,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          },
+          {
+            "page": 31,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.45000000000000007,
+              "cad_drawing": 0.65,
+              "architectural": 0.44999999999999996,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          },
+          {
+            "page": 32,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.1,
+              "cad_drawing": 0.30000000000000004,
+              "architectural": 0.30000000000000004,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          },
+          {
+            "page": 33,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.4,
+              "cad_drawing": 0.44999999999999996,
+              "architectural": 0.44999999999999996,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          },
+          {
+            "page": 34,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.4,
+              "cad_drawing": 0.44999999999999996,
+              "architectural": 0.44999999999999996,
+              "vector_art": 0.0,
+              "raster_only": 0.0
+            }
+          },
+          {
+            "page": 35,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.5,
+              "cad_drawing": 0.55,
+              "architectural": 0.44999999999999996,
+              "vector_art": 0.0,
+              "raster_only": 0.0
+            }
+          },
+          {
+            "page": 36,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.25,
+              "cad_drawing": 0.44999999999999996,
+              "architectural": 0.44999999999999996,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          },
+          {
+            "page": 37,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.1,
+              "cad_drawing": 0.30000000000000004,
+              "architectural": 0.30000000000000004,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          },
+          {
+            "page": 38,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.1,
+              "cad_drawing": 0.30000000000000004,
+              "architectural": 0.30000000000000004,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          },
+          {
+            "page": 39,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.1,
+              "cad_drawing": 0.44999999999999996,
+              "architectural": 0.30000000000000004,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          },
+          {
+            "page": 40,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.1,
+              "cad_drawing": 0.30000000000000004,
+              "architectural": 0.30000000000000004,
+              "vector_art": 0.0,
+              "raster_only": 0.0
+            }
+          },
+          {
+            "page": 41,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.25,
+              "cad_drawing": 0.44999999999999996,
+              "architectural": 0.30000000000000004,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          },
+          {
+            "page": 42,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.1,
+              "cad_drawing": 0.30000000000000004,
+              "architectural": 0.30000000000000004,
+              "vector_art": 0.0,
+              "raster_only": 0.0
+            }
+          },
+          {
+            "page": 43,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.25,
+              "cad_drawing": 0.44999999999999996,
+              "architectural": 0.44999999999999996,
+              "vector_art": 0.0,
+              "raster_only": 0.0
+            }
+          },
+          {
+            "page": 44,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.25,
+              "cad_drawing": 0.44999999999999996,
+              "architectural": 0.30000000000000004,
+              "vector_art": 0.0,
+              "raster_only": 0.0
+            }
+          }
+        ]
+      }
+    },
+    {
+      "pdf": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\Cut Ticket Bollards 516.Pdf",
+      "status": "PASS",
+      "summary": {
+        "pdf_path": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\Cut Ticket Bollards 516.Pdf",
+        "pages": 1,
+        "primitives": 25,
+        "text_items": 34,
+        "images": 0,
+        "profiles": [
+          {
+            "page": 1,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.15,
+              "cad_drawing": 0.25,
+              "architectural": 0.25,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          }
+        ]
+      }
+    },
+    {
+      "pdf": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\E5039 - Rev 1.pdf",
+      "status": "PASS",
+      "summary": {
+        "pdf_path": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\E5039 - Rev 1.pdf",
+        "pages": 1,
+        "primitives": 4828,
+        "text_items": 242,
+        "images": 0,
+        "profiles": [
+          {
+            "page": 1,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.35,
+              "cad_drawing": 0.55,
+              "architectural": 0.44999999999999996,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          }
+        ]
+      }
+    },
+    {
+      "pdf": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\New folder\\1011 (1 OF 2) - Rev 0.pdf",
+      "status": "PASS",
+      "summary": {
+        "pdf_path": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\New folder\\1011 (1 OF 2) - Rev 0.pdf",
+        "pages": 1,
+        "primitives": 5649,
+        "text_items": 836,
+        "images": 0,
+        "profiles": [
+          {
+            "page": 1,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.5,
+              "cad_drawing": 0.55,
+              "architectural": 0.44999999999999996,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          }
+        ]
+      }
+    },
+    {
+      "pdf": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\New folder\\1011 (2 OF 2) - Rev 0.pdf",
+      "status": "PASS",
+      "summary": {
+        "pdf_path": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\New folder\\1011 (2 OF 2) - Rev 0.pdf",
+        "pages": 1,
+        "primitives": 5923,
+        "text_items": 628,
+        "images": 0,
+        "profiles": [
+          {
+            "page": 1,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.5,
+              "cad_drawing": 0.55,
+              "architectural": 0.44999999999999996,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          }
+        ]
+      }
+    },
+    {
+      "pdf": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\New folder\\1012 (1 OF 2) - Rev 0.pdf",
+      "status": "PASS",
+      "summary": {
+        "pdf_path": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\New folder\\1012 (1 OF 2) - Rev 0.pdf",
+        "pages": 1,
+        "primitives": 4993,
+        "text_items": 656,
+        "images": 0,
+        "profiles": [
+          {
+            "page": 1,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.5,
+              "cad_drawing": 0.55,
+              "architectural": 0.44999999999999996,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          }
+        ]
+      }
+    },
+    {
+      "pdf": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\New folder\\1012 (2 OF 2) - Rev 0.pdf",
+      "status": "PASS",
+      "summary": {
+        "pdf_path": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\New folder\\1012 (2 OF 2) - Rev 0.pdf",
+        "pages": 1,
+        "primitives": 2707,
+        "text_items": 324,
+        "images": 0,
+        "profiles": [
+          {
+            "page": 1,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.5,
+              "cad_drawing": 0.55,
+              "architectural": 0.44999999999999996,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          }
+        ]
+      }
+    },
+    {
+      "pdf": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\New folder\\1013 (1 OF 2) - Rev 0.pdf",
+      "status": "PASS",
+      "summary": {
+        "pdf_path": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\New folder\\1013 (1 OF 2) - Rev 0.pdf",
+        "pages": 1,
+        "primitives": 5562,
+        "text_items": 855,
+        "images": 0,
+        "profiles": [
+          {
+            "page": 1,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.5,
+              "cad_drawing": 0.55,
+              "architectural": 0.44999999999999996,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          }
+        ]
+      }
+    },
+    {
+      "pdf": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\New folder\\1013 (2 OF 2) - Rev 0.pdf",
+      "status": "PASS",
+      "summary": {
+        "pdf_path": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\New folder\\1013 (2 OF 2) - Rev 0.pdf",
+        "pages": 1,
+        "primitives": 5938,
+        "text_items": 624,
+        "images": 0,
+        "profiles": [
+          {
+            "page": 1,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.5,
+              "cad_drawing": 0.55,
+              "architectural": 0.44999999999999996,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          }
+        ]
+      }
+    },
+    {
+      "pdf": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\New folder\\1014 (1 OF 2) - Rev 0.pdf",
+      "status": "PASS",
+      "summary": {
+        "pdf_path": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\New folder\\1014 (1 OF 2) - Rev 0.pdf",
+        "pages": 1,
+        "primitives": 5089,
+        "text_items": 659,
+        "images": 0,
+        "profiles": [
+          {
+            "page": 1,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.5,
+              "cad_drawing": 0.55,
+              "architectural": 0.44999999999999996,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          }
+        ]
+      }
+    },
+    {
+      "pdf": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\New folder\\1014 (2 OF 2) - Rev 0.pdf",
+      "status": "PASS",
+      "summary": {
+        "pdf_path": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\New folder\\1014 (2 OF 2) - Rev 0.pdf",
+        "pages": 1,
+        "primitives": 2666,
+        "text_items": 319,
+        "images": 0,
+        "profiles": [
+          {
+            "page": 1,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.5,
+              "cad_drawing": 0.55,
+              "architectural": 0.44999999999999996,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          }
+        ]
+      }
+    },
+    {
+      "pdf": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\New folder\\1015 - Rev 0.pdf",
+      "status": "PASS",
+      "summary": {
+        "pdf_path": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\New folder\\1015 - Rev 0.pdf",
+        "pages": 1,
+        "primitives": 2155,
+        "text_items": 324,
+        "images": 0,
+        "profiles": [
+          {
+            "page": 1,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.5,
+              "cad_drawing": 0.55,
+              "architectural": 0.44999999999999996,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          }
+        ]
+      }
+    },
+    {
+      "pdf": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\New folder\\1016 - Rev 0.pdf",
+      "status": "PASS",
+      "summary": {
+        "pdf_path": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\New folder\\1016 - Rev 0.pdf",
+        "pages": 1,
+        "primitives": 2644,
+        "text_items": 379,
+        "images": 0,
+        "profiles": [
+          {
+            "page": 1,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.5,
+              "cad_drawing": 0.55,
+              "architectural": 0.44999999999999996,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          }
+        ]
+      }
+    },
+    {
+      "pdf": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\New folder\\1017 - Rev 0.pdf",
+      "status": "PASS",
+      "summary": {
+        "pdf_path": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\New folder\\1017 - Rev 0.pdf",
+        "pages": 1,
+        "primitives": 2674,
+        "text_items": 383,
+        "images": 0,
+        "profiles": [
+          {
+            "page": 1,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.5,
+              "cad_drawing": 0.55,
+              "architectural": 0.44999999999999996,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          }
+        ]
+      }
+    },
+    {
+      "pdf": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\New folder\\1018 - Rev 0.pdf",
+      "status": "PASS",
+      "summary": {
+        "pdf_path": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\New folder\\1018 - Rev 0.pdf",
+        "pages": 1,
+        "primitives": 2123,
+        "text_items": 319,
+        "images": 0,
+        "profiles": [
+          {
+            "page": 1,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.5,
+              "cad_drawing": 0.55,
+              "architectural": 0.44999999999999996,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          }
+        ]
+      }
+    },
+    {
+      "pdf": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\New folder\\1019 - Rev 0.pdf",
+      "status": "PASS",
+      "summary": {
+        "pdf_path": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\New folder\\1019 - Rev 0.pdf",
+        "pages": 1,
+        "primitives": 178,
+        "text_items": 87,
+        "images": 0,
+        "profiles": [
+          {
+            "page": 1,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.5,
+              "cad_drawing": 0.55,
+              "architectural": 0.30000000000000004,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          }
+        ]
+      }
+    },
+    {
+      "pdf": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\New folder\\1020 - Rev 0.pdf",
+      "status": "PASS",
+      "summary": {
+        "pdf_path": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\New folder\\1020 - Rev 0.pdf",
+        "pages": 1,
+        "primitives": 178,
+        "text_items": 87,
+        "images": 0,
+        "profiles": [
+          {
+            "page": 1,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.5,
+              "cad_drawing": 0.55,
+              "architectural": 0.30000000000000004,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          }
+        ]
+      }
+    },
+    {
+      "pdf": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\New folder\\1021 - Rev 0.pdf",
+      "status": "PASS",
+      "summary": {
+        "pdf_path": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\New folder\\1021 - Rev 0.pdf",
+        "pages": 1,
+        "primitives": 178,
+        "text_items": 89,
+        "images": 0,
+        "profiles": [
+          {
+            "page": 1,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.5,
+              "cad_drawing": 0.55,
+              "architectural": 0.30000000000000004,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          }
+        ]
+      }
+    },
+    {
+      "pdf": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\New folder\\SCOMBINED.pdf",
+      "status": "PASS",
+      "summary": {
+        "pdf_path": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\New folder\\SCOMBINED.pdf",
+        "pages": 15,
+        "primitives": 48657,
+        "text_items": 6569,
+        "images": 0,
+        "profiles": [
+          {
+            "page": 1,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.5,
+              "cad_drawing": 0.55,
+              "architectural": 0.44999999999999996,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          },
+          {
+            "page": 2,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.5,
+              "cad_drawing": 0.55,
+              "architectural": 0.44999999999999996,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          },
+          {
+            "page": 3,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.5,
+              "cad_drawing": 0.55,
+              "architectural": 0.44999999999999996,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          },
+          {
+            "page": 4,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.5,
+              "cad_drawing": 0.55,
+              "architectural": 0.44999999999999996,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          },
+          {
+            "page": 5,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.5,
+              "cad_drawing": 0.55,
+              "architectural": 0.44999999999999996,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          },
+          {
+            "page": 6,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.5,
+              "cad_drawing": 0.55,
+              "architectural": 0.44999999999999996,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          },
+          {
+            "page": 7,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.5,
+              "cad_drawing": 0.55,
+              "architectural": 0.44999999999999996,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          },
+          {
+            "page": 8,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.5,
+              "cad_drawing": 0.55,
+              "architectural": 0.44999999999999996,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          },
+          {
+            "page": 9,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.5,
+              "cad_drawing": 0.55,
+              "architectural": 0.44999999999999996,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          },
+          {
+            "page": 10,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.5,
+              "cad_drawing": 0.55,
+              "architectural": 0.44999999999999996,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          },
+          {
+            "page": 11,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.5,
+              "cad_drawing": 0.55,
+              "architectural": 0.44999999999999996,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          },
+          {
+            "page": 12,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.5,
+              "cad_drawing": 0.55,
+              "architectural": 0.44999999999999996,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          },
+          {
+            "page": 13,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.5,
+              "cad_drawing": 0.55,
+              "architectural": 0.30000000000000004,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          },
+          {
+            "page": 14,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.5,
+              "cad_drawing": 0.55,
+              "architectural": 0.30000000000000004,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          },
+          {
+            "page": 15,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.5,
+              "cad_drawing": 0.55,
+              "architectural": 0.30000000000000004,
+              "vector_art": 0,
+              "raster_only": 0.0
+            }
+          }
+        ]
+      }
+    },
+    {
+      "pdf": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\TX_Alvord_20220525_TM_geo.pdf",
+      "status": "PASS",
+      "summary": {
+        "pdf_path": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\TX_Alvord_20220525_TM_geo.pdf",
+        "pages": 1,
+        "primitives": 10887,
+        "text_items": 1500,
+        "images": 212,
+        "profiles": [
+          {
+            "page": 1,
+            "primary_type": "vector_art",
+            "scores": {
+              "fabrication": 0.0,
+              "cad_drawing": 0.2,
+              "architectural": 0.30000000000000004,
+              "vector_art": 0.5,
+              "raster_only": 0.0
+            }
+          }
+        ]
+      }
+    },
+    {
+      "pdf": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\Welding-Symbol-Chart OCR.pdf",
+      "status": "PASS",
+      "summary": {
+        "pdf_path": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\Welding-Symbol-Chart OCR.pdf",
+        "pages": 1,
+        "primitives": 632,
+        "text_items": 363,
+        "images": 93,
+        "profiles": [
+          {
+            "page": 1,
+            "primary_type": "architectural",
+            "scores": {
+              "fabrication": 0.15,
+              "cad_drawing": 0.35,
+              "architectural": 0.44999999999999996,
+              "vector_art": 0.0,
+              "raster_only": 0.0
+            }
+          }
+        ]
+      }
+    },
+    {
+      "pdf": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\Welding-Symbol-Chart.pdf",
+      "status": "PASS",
+      "summary": {
+        "pdf_path": "C:\\Users\\Rowdy Payton\\Desktop\\New folder (2)\\Welding-Symbol-Chart.pdf",
+        "pages": 1,
+        "primitives": 638,
+        "text_items": 367,
+        "images": 93,
+        "profiles": [
+          {
+            "page": 1,
+            "primary_type": "cad_drawing",
+            "scores": {
+              "fabrication": 0.25,
+              "cad_drawing": 0.44999999999999996,
+              "architectural": 0.44999999999999996,
+              "vector_art": 0.0,
+              "raster_only": 0.0
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

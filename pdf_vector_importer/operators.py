@@ -8,8 +8,10 @@ Uses ImportHelper mixin for the file browser integration.
 """
 from __future__ import annotations
 
+import os
+
 import bpy
-from bpy.props import BoolProperty, EnumProperty, StringProperty
+from bpy.props import BoolProperty, EnumProperty, FloatProperty, StringProperty
 from bpy_extras.io_utils import ImportHelper
 
 
@@ -33,6 +35,19 @@ _TEXT_MODE_ITEMS = [
     ("labels", "Labels", "Import text as Blender text objects (default)"),
     ("geometry", "Geometry", "Convert text to mesh geometry"),
 ]
+
+_VISUAL_STYLE_ITEMS = [
+    ("source", "Source Accurate", "Preserve source PDF colors"),
+    ("blueprint", "Blueprint Preview", "Crisp cyan linework for readability"),
+    ("high_contrast", "High Contrast", "Bright monochrome linework for dark viewports"),
+]
+
+
+def _addon_prefs(context):
+    addon = context.preferences.addons.get("pdf_vector_importer")
+    if addon is None:
+        return None
+    return addon.preferences
 
 
 class IMPORT_OT_pdf_vector(bpy.types.Operator, ImportHelper):
@@ -76,6 +91,12 @@ class IMPORT_OT_pdf_vector(bpy.types.Operator, ImportHelper):
     make_faces: BoolProperty(  # type: ignore[assignment]
         name="Make Faces",
         description="Create mesh faces from closed loops and rectangles",
+        default=False,
+    )
+
+    ignore_fill_only_shapes: BoolProperty(  # type: ignore[assignment]
+        name="Ignore Fill-Only Shapes",
+        description="Skip fill-only PDF shapes that can hide linework",
         default=True,
     )
 
@@ -91,6 +112,77 @@ class IMPORT_OT_pdf_vector(bpy.types.Operator, ImportHelper):
         default=True,
     )
 
+    visual_style: EnumProperty(  # type: ignore[assignment]
+        name="Visual Style",
+        description="Display style for imported vectors/text",
+        items=_VISUAL_STYLE_ITEMS,
+        default="blueprint",
+    )
+
+    line_z_offset_mm: FloatProperty(  # type: ignore[assignment]
+        name="Line Z Offset (mm)",
+        description="Small Z offset applied to vector curves to reduce z-fighting",
+        default=0.10,
+        min=-5.0,
+        max=5.0,
+    )
+
+    text_z_offset_mm: FloatProperty(  # type: ignore[assignment]
+        name="Text Z Offset (mm)",
+        description="Raise text slightly above linework for readability",
+        default=0.35,
+        min=-5.0,
+        max=5.0,
+    )
+
+    image_z_offset_mm: FloatProperty(  # type: ignore[assignment]
+        name="Image Z Offset (mm)",
+        description="Lower raster images slightly below vectors and text",
+        default=-0.2,
+        min=-5.0,
+        max=5.0,
+    )
+
+    auto_focus_view: BoolProperty(  # type: ignore[assignment]
+        name="Auto Focus Imported Drawing",
+        description="Frame and focus the viewport on imported geometry",
+        default=True,
+        options={"SKIP_SAVE"},
+    )
+
+    keep_selection_after_focus: BoolProperty(  # type: ignore[assignment]
+        name="Keep Selection After Focus",
+        description="Keep imported objects selected after viewport framing",
+        default=False,
+        options={"SKIP_SAVE"},
+    )
+
+    auto_hide_default_cube: BoolProperty(  # type: ignore[assignment]
+        name="Auto Hide Default Cube",
+        description="Hide Blender's default startup cube if present so imported drawings are not occluded",
+        default=True,
+    )
+
+    def invoke(self, context, event):
+        prefs = _addon_prefs(context)
+        if prefs is not None:
+            try:
+                self.visual_style = prefs.default_visual_style
+            except Exception:
+                pass
+            # Keep focus on by default each import run unless user turns it off now.
+            self.auto_focus_view = True
+            self.keep_selection_after_focus = False
+
+            remember = bool(getattr(prefs, "remember_last_directory", True))
+            last_dir = str(getattr(prefs, "last_import_dir", "") or "")
+            if remember and last_dir and os.path.isdir(last_dir):
+                # ImportHelper uses filepath as initial browser path.
+                self.filepath = os.path.join(last_dir, "")
+
+        context.window_manager.fileselect_add(self)
+        return {"RUNNING_MODAL"}
+
     def execute(self, context):
         from . import bl_import_engine
 
@@ -101,23 +193,69 @@ class IMPORT_OT_pdf_vector(bpy.types.Operator, ImportHelper):
             "text_mode": self.text_mode,
             "detect_arcs": self.detect_arcs,
             "make_faces": self.make_faces,
+            "ignore_fill_only_shapes": self.ignore_fill_only_shapes,
             "group_by_color": self.group_by_color,
             "map_dashes": self.map_dashes,
+            "visual_style": self.visual_style,
+            "line_z_offset_mm": self.line_z_offset_mm,
+            "text_z_offset_mm": self.text_z_offset_mm,
+            "image_z_offset_mm": self.image_z_offset_mm,
+            "auto_focus_view": self.auto_focus_view,
+            "keep_selection_after_focus": self.keep_selection_after_focus,
+            "auto_hide_default_cube": self.auto_hide_default_cube,
         }
 
+        def _set_status(text: str | None):
+            try:
+                ws = getattr(context, "workspace", None)
+                if ws is not None and hasattr(ws, "status_text_set"):
+                    ws.status_text_set(text)
+            except Exception:
+                pass
+
+        def _on_progress(pct: float, message: str):
+            try:
+                pct_i = int(max(0, min(100, round(float(pct) * 100.0))))
+            except Exception:
+                pct_i = 0
+            _set_status(f"PDF Import {pct_i}% - {message}")
+
         try:
-            stats = bl_import_engine.import_pdf(self.filepath, config=config)
+            _set_status("PDF Import 0% - Starting import...")
+            stats = bl_import_engine.import_pdf(
+                self.filepath,
+                config=config,
+                progress_callback=_on_progress,
+                context=context,
+            )
         except Exception as exc:
+            _set_status(None)
             self.report({"ERROR"}, f"PDF import failed: {exc}")
             return {"CANCELLED"}
 
+        _set_status(None)
+
         prims = stats.get("primitives", 0)
         texts = stats.get("text_items", 0)
+        images = stats.get("images", 0)
         pages = stats.get("pages_imported", 0)
+        skipped_fill = stats.get("skipped_fill_only", 0)
+        hidden_cube = stats.get("hidden_startup_cube", 0)
         self.report(
             {"INFO"},
-            f"Imported {prims} primitives, {texts} text items from {pages} page(s)",
+            f"Imported {prims} primitives, {texts} text items, {images} images from {pages} page(s); "
+            f"skipped {skipped_fill} fill-only shapes; hid {hidden_cube} default cube(s)",
         )
+
+        prefs = _addon_prefs(context)
+        if prefs is not None and bool(getattr(prefs, "remember_last_directory", True)):
+            try:
+                last_dir = os.path.dirname(self.filepath)
+                if last_dir and os.path.isdir(last_dir):
+                    prefs.last_import_dir = last_dir
+            except Exception:
+                pass
+
         return {"FINISHED"}
 
     def draw(self, context):
@@ -137,8 +275,20 @@ class IMPORT_OT_pdf_vector(bpy.types.Operator, ImportHelper):
         box.prop(self, "text_mode")
         box.prop(self, "detect_arcs")
         box.prop(self, "make_faces")
+        box.prop(self, "ignore_fill_only_shapes")
         box.prop(self, "group_by_color")
         box.prop(self, "map_dashes")
+
+        box = layout.box()
+        box.label(text="View & Readability", icon="SHADING_RENDERED")
+        box.prop(self, "visual_style")
+        box.prop(self, "auto_focus_view")
+        box.prop(self, "keep_selection_after_focus")
+        box.prop(self, "auto_hide_default_cube")
+        col = box.column(align=True)
+        col.prop(self, "line_z_offset_mm")
+        col.prop(self, "text_z_offset_mm")
+        col.prop(self, "image_z_offset_mm")
 
 
 def menu_func_import(self, context):

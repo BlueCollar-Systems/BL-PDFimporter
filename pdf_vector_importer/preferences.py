@@ -9,6 +9,7 @@ Shows PyMuPDF install status and provides an Install button.
 from __future__ import annotations
 
 import bpy
+from bpy.props import BoolProperty, EnumProperty, StringProperty
 
 from .dependency_manager import check_pymupdf, get_pymupdf_version, install_pymupdf
 
@@ -39,6 +40,30 @@ class PDFVectorImporterPreferences(bpy.types.AddonPreferences):
 
     bl_idname = "pdf_vector_importer"
 
+    remember_last_directory: BoolProperty(  # type: ignore[assignment]
+        name="Remember Last Import Folder",
+        description="Preselect the previously used folder when opening the PDF importer",
+        default=True,
+    )
+
+    last_import_dir: StringProperty(  # type: ignore[assignment]
+        name="Last Import Folder",
+        description="Most recently used PDF folder",
+        subtype="DIR_PATH",
+        default="",
+    )
+
+    default_visual_style: EnumProperty(  # type: ignore[assignment]
+        name="Default Visual Style",
+        description="Default look for imported vectors and text",
+        items=[
+            ("source", "Source Accurate", "Preserve source PDF colors"),
+            ("blueprint", "Blueprint Preview", "Crisp cyan linework for better readability"),
+            ("high_contrast", "High Contrast", "Dark monochrome linework for clarity"),
+        ],
+        default="high_contrast",
+    )
+
     @property
     def pymupdf_installed(self) -> bool:
         """True if PyMuPDF is available for import."""
@@ -61,6 +86,18 @@ class PDFVectorImporterPreferences(bpy.types.AddonPreferences):
             row.operator(PDFVEC_OT_install_pymupdf.bl_idname, icon="IMPORT")
             row = box.row()
             row.label(text="PyMuPDF is required for PDF parsing.", icon="INFO")
+
+        layout.separator()
+        box = layout.box()
+        box.label(text="Workflow", icon="FILE_FOLDER")
+        box.prop(self, "remember_last_directory")
+        if self.remember_last_directory:
+            box.prop(self, "last_import_dir")
+
+        layout.separator()
+        box = layout.box()
+        box.label(text="Default Look", icon="SHADING_RENDERED")
+        box.prop(self, "default_visual_style")
 
 
 # Additional class for register/unregister — the install operator needs
