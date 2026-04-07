@@ -10,4 +10,7 @@ build/
 .vscode/
 .idea/
 *.swp
+.pytest_cache/
+.ruff_cache/
+dev_logs/
 pdf_vector_importer/pdfcadcore/lib/
