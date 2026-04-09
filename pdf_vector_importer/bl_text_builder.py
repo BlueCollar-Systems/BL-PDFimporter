@@ -29,13 +29,19 @@ def _normalize_style(style: str) -> str:
     return "source"
 
 
-def _styled_text_color(style: str) -> Tuple[float, float, float]:
+def _styled_text_color(
+    style: str,
+    source_color: Optional[Tuple[float, float, float]] = None,
+) -> Tuple[float, float, float]:
     style_key = _normalize_style(style)
     if style_key == "blueprint":
         # Brighter blueprint ink tone for dark viewport readability.
         return (0.36, 0.74, 0.98)
     if style_key == "high_contrast":
         return (0.95, 0.95, 0.95)
+    # "source" — use the actual PDF text color when available.
+    if source_color is not None:
+        return source_color
     return (0.06, 0.06, 0.06)
 
 
@@ -57,15 +63,25 @@ def _should_center_anchor(
     return False
 
 
-def _get_or_create_text_material(style: str) -> bpy.types.Material:
+def _get_or_create_text_material(
+    style: str,
+    source_color: Optional[Tuple[float, float, float]] = None,
+) -> bpy.types.Material:
     style_key = _normalize_style(style)
-    mat_name = f"PDF_Text_{style_key}"
+    r, g, b = _styled_text_color(style_key, source_color=source_color)
+
+    # For source style with unique colors, create per-color materials.
+    if style_key == "source" and source_color is not None:
+        ri, gi, bi = round(r * 255), round(g * 255), round(b * 255)
+        mat_name = f"PDF_Text_{ri:02X}{gi:02X}{bi:02X}"
+    else:
+        mat_name = f"PDF_Text_{style_key}"
+
     existing = bpy.data.materials.get(mat_name)
     if existing is not None:
         return existing
 
     mat = bpy.data.materials.new(name=mat_name)
-    r, g, b = _styled_text_color(style_key)
     mat.diffuse_color = (r, g, b, 1.0)
     mat.use_nodes = False
     return mat
@@ -207,7 +223,8 @@ def build_text(
         obj.rotation_euler = (0.0, 0.0, math.radians(text_item.rotation))
 
     try:
-        mat = _get_or_create_text_material(visual_style)
+        source_color = getattr(text_item, "color", None)
+        mat = _get_or_create_text_material(visual_style, source_color=source_color)
         if len(font_data.materials) == 0:
             font_data.materials.append(mat)
         else:

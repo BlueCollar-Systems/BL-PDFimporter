@@ -899,6 +899,10 @@ def import_pdf(
             span = 0.75 / total_page_count
             return min(0.95, base + span * stage_clamped)
 
+        # Multi-page stacking: shift each page downward by accumulated heights.
+        _page_stack_offset_m = 0.0
+        _page_stack_multiplier = 1.2  # 20% gap between pages
+
         for i, page_idx in enumerate(page_indices):
             page_num = page_idx + 1
             _progress(_page_progress(i, 0.05), f"Extracting page {page_num}/{len(page_indices)}...")
@@ -1049,7 +1053,18 @@ def import_pdf(
             if import_mode == "raster" and image_count > 0:
                 raster_pages_imported += 1
 
-            # 9j. Accumulate stats
+            # 9j. Multi-page stacking: shift this page's collection downward
+            if len(page_indices) > 1 and _page_stack_offset_m != 0.0:
+                for obj in page_col.all_objects:
+                    try:
+                        obj.location.y += _page_stack_offset_m
+                    except (AttributeError, RuntimeError):
+                        pass
+            # Advance offset for the next page (page_data.height is in mm)
+            page_height_m = page_data.height * _MM_TO_M
+            _page_stack_offset_m -= page_height_m * _page_stack_multiplier
+
+            # 9k. Accumulate stats
             total_stats["pages_imported"] += 1
             total_stats["primitives"] += len(page_data.primitives)
             total_stats["text_items"] += text_count

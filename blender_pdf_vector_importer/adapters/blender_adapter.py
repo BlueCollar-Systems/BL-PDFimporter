@@ -87,6 +87,16 @@ def import_into_blender(pdf_path: str, preset: str = "general",
                 if os.path.isfile(placement.path):
                     _create_image_plane(placement, page_collection)
 
+    # Autofit viewport to imported geometry
+    try:
+        for area in bpy.context.screen.areas:
+            if area.type == "VIEW_3D":
+                with bpy.context.temp_override(area=area):
+                    bpy.ops.view3d.view_all()
+                break
+    except Exception:
+        pass
+
     return extraction
 
 

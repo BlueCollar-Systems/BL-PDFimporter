@@ -51,46 +51,59 @@ def _norm_color(col) -> Optional[Tuple[float, float, float]]:
         return None
 
 
-def _parse_dashes(raw, scale: float = 1.0) -> list | None:
-    """Parse PyMuPDF dash patterns into a numeric list.
+def _parse_dashes(raw, scale: float = 1.0) -> Tuple[Optional[list], float]:
+    """Parse PyMuPDF dash patterns into a ``(dash_array, phase)`` tuple.
 
     PyMuPDF returns dashes as strings like ``'[ 6 6 ] 0'`` (array + phase)
-    or as actual lists/tuples.  Returns ``None`` for solid lines.
+    or as actual lists/tuples.  Returns ``(None, 0.0)`` for solid lines.
+    Dash values are converted from PDF points to mm and scaled.
     """
     if raw is None:
-        return None
+        return None, 0.0
     if isinstance(raw, str):
         s = raw.strip()
         if not s or s.startswith("[]") or s == "() 0":
-            return None
-        # Extract numbers between brackets: "[ 6 6 ] 0" -> [6.0, 6.0]
+            return None, 0.0
         bracket = s.find("[")
         bracket_end = s.find("]")
         if bracket >= 0 and bracket_end > bracket:
             inner = s[bracket + 1:bracket_end].strip()
             if not inner:
-                return None
+                return None, 0.0
             try:
                 nums = [float(x) for x in inner.split()]
                 vals = [n * MM_PER_PT * scale for n in nums if n > 0]
-                return vals if vals else None
             except ValueError:
-                return None
-        return None
+                return None, 0.0
+            if not vals:
+                return None, 0.0
+            phase = 0.0
+            after = s[bracket_end + 1:].strip()
+            if after:
+                try:
+                    phase = float(after) * MM_PER_PT * scale
+                except ValueError:
+                    pass
+            return vals, phase
+        return None, 0.0
     if isinstance(raw, (list, tuple)):
         if not raw:
-            return None
-        # Could be ([6,6], 0) tuple or flat [6,6]
+            return None, 0.0
         if len(raw) == 2 and isinstance(raw[0], (list, tuple)):
             vals = [float(x) * MM_PER_PT * scale for x in raw[0] if float(x) > 0]
-            return vals if vals else None
+            phase = 0.0
+            try:
+                phase = float(raw[1]) * MM_PER_PT * scale
+            except (TypeError, ValueError):
+                pass
+            return (vals if vals else None), phase
         try:
             nums = [float(x) for x in raw]
             vals = [n * MM_PER_PT * scale for n in nums if n > 0]
-            return vals if vals else None
+            return (vals if vals else None), 0.0
         except (TypeError, ValueError):
-            return None
-    return None
+            return None, 0.0
+    return None, 0.0
 
 
 def _expand_compact_fraction_digits(
@@ -257,6 +270,52 @@ def _normalize_numeric_token_ocr_noise(text: str) -> str:
         return fixed
 
     return token_re.sub(_fix_token, text)
+
+
+def _append_linearized_cubic(
+    current_pts: List[Tuple[float, float]],
+    p0: Tuple[float, float],
+    p1: Tuple[float, float],
+    p2: Tuple[float, float],
+    p3: Tuple[float, float],
+    *,
+    max_samples: int = 32,
+) -> None:
+    """Append a cubic Bezier segment as a polyline."""
+    if not current_pts:
+        current_pts.append(p0)
+    samples = max(4, min(max_samples, int(math.ceil(_dist(p0, p3) / 0.5))))
+    for i in range(1, samples + 1):
+        t = i / float(samples)
+        current_pts.append(_bezier_pt(p0, p1, p2, p3, t))
+
+
+def _quad_to_points(
+    quad_obj,
+    page_h: float,
+    flip_y: bool,
+    scale: float,
+) -> List[Tuple[float, float]]:
+    corners = []
+    try:
+        corners = [
+            _xy(getattr(quad_obj, "ul")),
+            _xy(getattr(quad_obj, "ur")),
+            _xy(getattr(quad_obj, "lr")),
+            _xy(getattr(quad_obj, "ll")),
+        ]
+    except AttributeError:
+        try:
+            seq = list(quad_obj)
+            if len(seq) >= 4:
+                corners = [_xy(seq[0]), _xy(seq[1]), _xy(seq[3]), _xy(seq[2])]
+        except (TypeError, ValueError):
+            corners = []
+
+    out = [_to_mm(x, y, page_h, flip_y, scale) for x, y in corners]
+    if len(out) >= 4:
+        out.append(out[0])
+    return out
 
 
 def _normalize_dimension_text(text: str, aggressive: bool = True) -> str:
@@ -457,7 +516,7 @@ def extract_page(
             width = float(width_raw) * MM_PER_PT * scale if width_raw is not None else None
         except (TypeError, ValueError):
             width = None
-        dashes = _parse_dashes(path_group.get("dashes"), scale=scale)
+        dashes, dash_phase = _parse_dashes(path_group.get("dashes"), scale=scale)
         close_path = path_group.get("closePath", False)
         layer_name = path_group.get("oc") or path_group.get("layer")
 
@@ -504,13 +563,7 @@ def extract_page(
                 p3 = _to_mm(pts[3][0] if len(pts) > 3 else pts[2][0],
                             pts[3][1] if len(pts) > 3 else pts[2][1],
                             page_h, flip_y, scale)
-                if not current_pts:
-                    current_pts.append(p0)
-                N = max(4, min(32, int(math.ceil(_dist(p0, p3) / 0.5))))
-                for i in range(1, N + 1):
-                    t = i / float(N)
-                    q = _bezier_pt(p0, p1, p2, p3, t)
-                    current_pts.append(q)
+                _append_linearized_cubic(current_pts, p0, p1, p2, p3)
 
             elif kind == "re":
                 flush(False)
@@ -521,23 +574,37 @@ def extract_page(
                 c4 = _to_mm(x, y + h, page_h, flip_y, scale)
                 sub_paths.append(([c1, c2, c3, c4, c1], True))
 
+            elif kind == "qu":
+                flush(False)
+                quad = data[0] if data else None
+                pts = _quad_to_points(quad, page_h, flip_y, scale) if quad is not None else []
+                if len(pts) >= 5:
+                    sub_paths.append((pts, True))
+
             elif kind == "h":
                 flush(True)
 
             elif kind == "v":
-                if len(data) >= 2:
-                    cx, cy = _xy(data[0])
+                # PDF "v": c1 is current point, then (c2, end).
+                if len(data) >= 2 and current_pts:
+                    c2x, c2y = _xy(data[0])
                     ex, ey = _xy(data[1])
-                    ctrl = _to_mm(cx, cy, page_h, flip_y, scale)
-                    end = _to_mm(ex, ey, page_h, flip_y, scale)
-                    if current_pts:
-                        p0 = current_pts[-1]
-                        cp1 = (p0[0] + 2/3*(ctrl[0]-p0[0]), p0[1] + 2/3*(ctrl[1]-p0[1]))
-                        cp2 = (end[0] + 2/3*(ctrl[0]-end[0]), end[1] + 2/3*(ctrl[1]-end[1]))
-                        N = 8
-                        for i in range(1, N + 1):
-                            t = i / float(N)
-                            current_pts.append(_bezier_pt(p0, cp1, cp2, end, t))
+                    p0 = current_pts[-1]
+                    p1 = p0
+                    p2 = _to_mm(c2x, c2y, page_h, flip_y, scale)
+                    p3 = _to_mm(ex, ey, page_h, flip_y, scale)
+                    _append_linearized_cubic(current_pts, p0, p1, p2, p3)
+
+            elif kind == "y":
+                # PDF "y": (c1, end), c2 equals end.
+                if len(data) >= 2 and current_pts:
+                    c1x, c1y = _xy(data[0])
+                    ex, ey = _xy(data[1])
+                    p0 = current_pts[-1]
+                    p1 = _to_mm(c1x, c1y, page_h, flip_y, scale)
+                    p3 = _to_mm(ex, ey, page_h, flip_y, scale)
+                    p2 = p3
+                    _append_linearized_cubic(current_pts, p0, p1, p2, p3)
 
         flush(close_path)
 
@@ -564,7 +631,8 @@ def extract_page(
             primitives.append(Primitive(
                 id=next_id(), type=ptype, points=cleaned,
                 bbox=bbox, stroke_color=stroke, fill_color=fill,
-                dash_pattern=dashes, line_width=width,
+                dash_pattern=dashes, dash_phase=dash_phase,
+                line_width=width,
                 layer_name=layer_name, closed=is_closed,
                 area=area, page_number=page_num
             ))

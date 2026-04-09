@@ -253,10 +253,13 @@ def _sanitize_dash_pattern(dash_pattern) -> Optional[list]:
     return vals
 
 
-def _dash_polyline(points: list, dash_pattern: list) -> list:
+def _dash_polyline(points: list, dash_pattern: list, dash_phase: float = 0.0) -> list:
     """
     Split a polyline into visible dash runs according to dash_pattern (mm).
     Returns a list of point runs suitable for individual curve objects.
+
+    *dash_phase* offsets the pattern start (in mm) for visual accuracy with
+    PDF dash-phase values.
     """
     if len(points) < 2:
         return []
@@ -282,6 +285,24 @@ def _dash_polyline(points: list, dash_pattern: list) -> list:
     pattern_index = 0
     pattern_pos = 0.0
     draw_on = True
+
+    # Apply dash phase offset: advance through the pattern by dash_phase mm
+    # so the first visible dash starts at the correct offset.
+    if dash_phase and dash_phase > 0.0:
+        phase_remaining = float(dash_phase)
+        cycle_len = sum(pattern)
+        if cycle_len > 0:
+            phase_remaining = phase_remaining % cycle_len
+        while phase_remaining > eps:
+            seg_remain = pattern[pattern_index] - pattern_pos
+            if phase_remaining >= seg_remain:
+                phase_remaining -= seg_remain
+                pattern_pos = 0.0
+                draw_on = not draw_on
+                pattern_index = (pattern_index + 1) % len(pattern)
+            else:
+                pattern_pos += phase_remaining
+                phase_remaining = 0.0
     step_counter = 0
 
     for i in range(len(points) - 1):
@@ -342,6 +363,7 @@ def _draw_stroked_polyline(
     line_width: Optional[float],
     material: bpy.types.Material,
     dash_pattern=None,
+    dash_phase: float = 0.0,
     z_offset_m: float = 0.0,
 ) -> int:
     """
@@ -362,7 +384,7 @@ def _draw_stroked_polyline(
         )
         return 1
 
-    runs = _dash_polyline(points, dash_pattern) if dash_pattern else [points]
+    runs = _dash_polyline(points, dash_pattern, dash_phase=dash_phase) if dash_pattern else [points]
     if not runs:
         return 0
     valid_runs = [r for r in runs if len(r) >= 2]
@@ -615,6 +637,7 @@ def build_page(
                 obj_name, prim.points, False, target_col,
                 prim.line_width, mat,
                 dash_pattern=prim.dash_pattern if map_dashes else None,
+                dash_phase=prim.dash_phase if map_dashes else 0.0,
                 z_offset_m=line_z_offset_m,
             )
             stats["curves"] += created
@@ -624,6 +647,7 @@ def build_page(
                 obj_name, prim.points, False, target_col,
                 prim.line_width, mat,
                 dash_pattern=prim.dash_pattern if map_dashes else None,
+                dash_phase=prim.dash_phase if map_dashes else 0.0,
                 z_offset_m=line_z_offset_m,
             )
             stats["curves"] += created
