@@ -287,6 +287,9 @@ def _extract_text(page, page_h, page_num, flip_y, scale) -> List[NormalizedText]
                 size = max(float(span.get("size", 3)), 1.0) * MM_PER_PT * scale
                 font = str(span.get("font", ""))
 
+                # Extract text color from span
+                text_color = _norm_color(span.get("color"))
+
                 bbox_mm = None
                 sb = span.get("bbox")
                 if sb and len(sb) >= 4:
@@ -307,7 +310,7 @@ def _extract_text(page, page_h, page_num, flip_y, scale) -> List[NormalizedText]
                 items.append(NormalizedText(
                     id=next_id(), text=text, normalized=normalized,
                     insertion=(px, py), bbox=bbox_mm, font_size=size,
-                    rotation=angle, font_name=font,
+                    rotation=angle, font_name=font, color=text_color,
                     page_number=page_num, generic_tags=generic_tags
                 ))
     return items
