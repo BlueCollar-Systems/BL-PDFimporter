@@ -223,7 +223,7 @@ def build_text(
         obj.rotation_euler = (0.0, 0.0, math.radians(text_item.rotation))
 
     try:
-        source_color = getattr(text_item, "color", None)
+        source_color = text_item.color
         mat = _get_or_create_text_material(visual_style, source_color=source_color)
         if len(font_data.materials) == 0:
             font_data.materials.append(mat)
