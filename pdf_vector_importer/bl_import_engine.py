@@ -745,6 +745,32 @@ def _parse_pages(page_str: str, total_pages: int) -> List[int]:
     return sorted(pages) if pages else list(range(total_pages))
 
 
+def _normalize_page_arrangement(raw: str | None) -> str:
+    key = (raw or "spread").strip().lower()
+    if key in {"spread", "compact", "touch", "overlay"}:
+        return key
+    return "spread"
+
+
+def _normalize_page_gap_ratio(raw) -> float:
+    try:
+        ratio = float(raw)
+    except (TypeError, ValueError):
+        ratio = 0.20
+    return max(0.0, min(1.0, ratio))
+
+
+def _page_stack_step(page_height_m: float, arrangement: str, gap_ratio: float) -> float:
+    h = max(0.001, float(page_height_m or 0.0))
+    if arrangement == "overlay":
+        return 0.0
+    if arrangement == "touch":
+        return h
+    if arrangement == "compact":
+        return h * (1.0 + gap_ratio)
+    return h * 1.2
+
+
 # ── Main import entry point ──────────────────────────────────────────
 
 def import_pdf(
@@ -901,7 +927,8 @@ def import_pdf(
 
         # Multi-page stacking: shift each page downward by accumulated heights.
         _page_stack_offset_m = 0.0
-        _page_stack_multiplier = 1.2  # 20% gap between pages
+        _page_arrangement = _normalize_page_arrangement(config.get("page_arrangement"))
+        _page_gap_ratio = _normalize_page_gap_ratio(config.get("page_gap_ratio"))
 
         for i, page_idx in enumerate(page_indices):
             page_num = page_idx + 1
@@ -1062,7 +1089,11 @@ def import_pdf(
                         pass
             # Advance offset for the next page (page_data.height is in mm)
             page_height_m = page_data.height * _MM_TO_M
-            _page_stack_offset_m -= page_height_m * _page_stack_multiplier
+            _page_stack_offset_m -= _page_stack_step(
+                page_height_m,
+                _page_arrangement,
+                _page_gap_ratio,
+            )
 
             # 9k. Accumulate stats
             total_stats["pages_imported"] += 1

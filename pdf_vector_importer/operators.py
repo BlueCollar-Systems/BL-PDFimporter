@@ -42,6 +42,13 @@ _VISUAL_STYLE_ITEMS = [
     ("high_contrast", "High Contrast", "Bright monochrome linework for dark viewports"),
 ]
 
+_PAGE_ARRANGEMENT_ITEMS = [
+    ("spread", "Spread (20% gap)", "Stack pages with a 20% gap"),
+    ("compact", "Compact gap", "Stack pages with configurable compact gap"),
+    ("touch", "Touching pages", "Stack pages edge-to-edge without a gap"),
+    ("overlay", "Overlay pages", "Place all pages at the same origin"),
+]
+
 
 def _addon_prefs(context):
     addon = context.preferences.addons.get("pdf_vector_importer")
@@ -163,6 +170,21 @@ class IMPORT_OT_pdf_vector(bpy.types.Operator, ImportHelper):
         default=True,
     )
 
+    page_arrangement: EnumProperty(  # type: ignore[assignment]
+        name="Page Layout",
+        description="How multi-page imports are arranged in the scene",
+        items=_PAGE_ARRANGEMENT_ITEMS,
+        default="spread",
+    )
+
+    page_gap_ratio: FloatProperty(  # type: ignore[assignment]
+        name="Compact Gap Ratio",
+        description="Gap ratio for compact page layout (0.20 = 20% page break)",
+        default=0.20,
+        min=0.0,
+        max=1.0,
+    )
+
     def invoke(self, context, event):
         prefs = _addon_prefs(context)
         if prefs is not None:
@@ -203,6 +225,8 @@ class IMPORT_OT_pdf_vector(bpy.types.Operator, ImportHelper):
             "auto_focus_view": self.auto_focus_view,
             "keep_selection_after_focus": self.keep_selection_after_focus,
             "auto_hide_default_cube": self.auto_hide_default_cube,
+            "page_arrangement": self.page_arrangement,
+            "page_gap_ratio": self.page_gap_ratio,
         }
 
         def _set_status(text: str | None):
@@ -285,6 +309,8 @@ class IMPORT_OT_pdf_vector(bpy.types.Operator, ImportHelper):
         box.prop(self, "auto_focus_view")
         box.prop(self, "keep_selection_after_focus")
         box.prop(self, "auto_hide_default_cube")
+        box.prop(self, "page_arrangement")
+        box.prop(self, "page_gap_ratio")
         col = box.column(align=True)
         col.prop(self, "line_z_offset_mm")
         col.prop(self, "text_z_offset_mm")
