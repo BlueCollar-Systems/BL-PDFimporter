@@ -15,7 +15,6 @@ from .primitives import (
 )
 
 MM_PER_PT = 25.4 / 72.0
-_VALID_DIM_DENOMS = (64, 32, 16, 8, 4, 2)
 
 
 def _xy(obj) -> Tuple[float, float]:
@@ -26,9 +25,9 @@ def _xy(obj) -> Tuple[float, float]:
     return 0.0, 0.0
 
 
-def _norm_color(col) -> Optional[Tuple[float, float, float]]:
+def _norm_color(col) -> Tuple[float, float, float]:
     if col is None:
-        return None
+        return (0.0, 0.0, 0.0)
     try:
         if isinstance(col, (int, float)):
             g = max(0.0, min(1.0, float(col)))
@@ -48,15 +47,14 @@ def _norm_color(col) -> Optional[Tuple[float, float, float]]:
             vals.append(vals[-1] if vals else 0.0)
         return (vals[0], vals[1], vals[2])
     except (TypeError, ValueError, AttributeError):
-        return None
+        return (0.0, 0.0, 0.0)
 
 
-def _parse_dashes(raw, scale: float = 1.0) -> Tuple[Optional[list], float]:
-    """Parse PyMuPDF dash patterns into a ``(dash_array, phase)`` tuple.
+def _parse_dashes(raw) -> Tuple[Optional[list], float]:
+    """Parse PyMuPDF dash patterns into a (dash_array, phase) tuple.
 
     PyMuPDF returns dashes as strings like ``'[ 6 6 ] 0'`` (array + phase)
     or as actual lists/tuples.  Returns ``(None, 0.0)`` for solid lines.
-    Dash values are converted from PDF points to mm and scaled.
     """
     if raw is None:
         return None, 0.0
@@ -64,6 +62,7 @@ def _parse_dashes(raw, scale: float = 1.0) -> Tuple[Optional[list], float]:
         s = raw.strip()
         if not s or s.startswith("[]") or s == "() 0":
             return None, 0.0
+        # Extract numbers between brackets: "[ 6 6 ] 0" -> [6.0, 6.0]
         bracket = s.find("[")
         bracket_end = s.find("]")
         if bracket >= 0 and bracket_end > bracket:
@@ -72,204 +71,37 @@ def _parse_dashes(raw, scale: float = 1.0) -> Tuple[Optional[list], float]:
                 return None, 0.0
             try:
                 nums = [float(x) for x in inner.split()]
-                vals = [n * MM_PER_PT * scale for n in nums if n > 0]
             except ValueError:
                 return None, 0.0
-            if not vals:
+            if not nums:
                 return None, 0.0
+            # Extract phase after closing bracket: "[ 6 6 ] 3" -> phase=3.0
             phase = 0.0
             after = s[bracket_end + 1:].strip()
             if after:
                 try:
-                    phase = float(after) * MM_PER_PT * scale
+                    phase = float(after)
                 except ValueError:
                     pass
-            return vals, phase
+            return nums, phase
         return None, 0.0
     if isinstance(raw, (list, tuple)):
         if not raw:
             return None, 0.0
+        # Could be ([6,6], 0) tuple or flat [6,6]
         if len(raw) == 2 and isinstance(raw[0], (list, tuple)):
-            vals = [float(x) * MM_PER_PT * scale for x in raw[0] if float(x) > 0]
             phase = 0.0
             try:
-                phase = float(raw[1]) * MM_PER_PT * scale
+                phase = float(raw[1])
             except (TypeError, ValueError):
                 pass
-            return (vals if vals else None), phase
+            return (list(raw[0]) if raw[0] else None), phase
         try:
             nums = [float(x) for x in raw]
-            vals = [n * MM_PER_PT * scale for n in nums if n > 0]
-            return (vals if vals else None), 0.0
+            return (nums if nums else None), 0.0
         except (TypeError, ValueError):
             return None, 0.0
     return None, 0.0
-
-
-def _expand_compact_fraction_digits(
-    digits: str,
-    prefer_inches: bool = True,
-    had_slash: bool = False,
-) -> str | None:
-    """
-    Expand compact fraction tail strings like:
-      12    -> 1/2
-      34    -> 3/4
-      5316  -> 5 3/16
-      1012  -> 10 1/2
-      91516 -> 9 15/16
-      278   -> 2 7/8
-    Returns None when no reliable split is found.
-    """
-    s = re.sub(r"\D", "", (digits or ""))
-    if len(s) < 2:
-        return None
-
-    candidates: list[tuple[int, str]] = []
-    for den in _VALID_DIM_DENOMS:
-        # Without an explicit trailing slash, tiny denominators are too
-        # ambiguous and can produce bad rewrites (e.g., 6112 -> 61 1/2).
-        if not had_slash and den in (2, 4):
-            continue
-        den_s = str(den)
-        if not s.endswith(den_s):
-            continue
-        rem = s[:-len(den_s)]
-        if len(rem) < 1:
-            continue
-
-        # Candidate A: pure fraction (e.g., 1516 -> 15/16).
-        try:
-            frac_num = int(rem)
-        except ValueError:
-            frac_num = -1
-        if 0 < frac_num < den:
-            g = math.gcd(frac_num, den)
-            frac_num_r = frac_num // g
-            den_r = den // g
-            score = 2 if prefer_inches else 8
-            candidates.append((score, f"{frac_num_r}/{den_r}"))
-
-        if len(rem) < 2:
-            continue
-        for num_len in (1, 2):
-            if len(rem) <= num_len:
-                continue
-            inch_s = rem[:-num_len]
-            num_s = rem[-num_len:]
-            if not inch_s:
-                continue
-            try:
-                inches = int(inch_s)
-                numerator = int(num_s)
-            except ValueError:
-                continue
-            if numerator <= 0 or numerator >= den:
-                continue
-
-            g = math.gcd(numerator, den)
-            numerator_r = numerator // g
-            den_r = den // g
-
-            # Prefer practical shop-drawing inches and compact numerator.
-            score = 4 if prefer_inches else 3
-            if 0 <= inches <= 24:
-                score += 6
-            if num_len == 1:
-                score += 2
-            if len(inch_s) >= 2:
-                score += 1
-            # Two-digit remainder with a one-digit split (e.g. 1516) is
-            # inherently ambiguous between "15/16" and "1 5/16".
-            if len(rem) == 2 and num_len == 1:
-                score -= 5
-
-            candidates.append((score, f"{inches} {numerator_r}/{den_r}"))
-
-    if not candidates:
-        return None
-    best_score = max(score for score, _ in candidates)
-    near_best = sorted({txt for score, txt in candidates if score >= (best_score - 1)})
-    if len(near_best) != 1:
-        # Ambiguous parse; keep original text unchanged.
-        return None
-    return near_best[0]
-
-
-def _canonicalize_text_symbols(text: str) -> str:
-    """
-    Normalize common Unicode punctuation variants to ASCII CAD-style symbols.
-    Keeps semantic content intact and is safe for strict-fidelity mode.
-    """
-    t = (text or "")
-    return (
-        t.replace("’", "'")
-        .replace("‘", "'")
-        .replace("`", "'")
-        .replace("´", "'")
-        .replace("“", '"')
-        .replace("”", '"')
-        .replace("″", '"')
-        .replace("‶", '"')
-        .replace("Ų", '"')
-        .replace("\u2044", "/")
-        .replace("\u2212", "-")
-        .replace("\u00A0", " ")
-        .replace("—", "-")
-        .replace("–", "-")
-    )
-
-
-def _normalize_numeric_token_ocr_noise(text: str) -> str:
-    """
-    Clean OCR confusions only inside numeric/dimension-like tokens.
-    This avoids rewriting plain words while stabilizing dimension strings.
-    """
-    if not text:
-        return text
-
-    # OCR often maps trailing size digits in callouts to letters:
-    # PIPEI-I/2 -> PIPE1-1/2. Limit this to hyphen+fraction contexts.
-    text = re.sub(r"(?<=[A-Za-z])[Il](?=\s*-\s*[0-9Il|]+\s*/)", "1", text)
-    text = re.sub(r"(?<=[A-Za-z])[Oo](?=\s*-\s*[0-9Oo0]+\s*/)", "0", text)
-    text = re.sub(r"(?:(?<=\A)|(?<=\s))[Il](?=\s*')", "1", text)
-    text = re.sub(r"(-\s*)[Il](?=\s*/\s*[0-9Il|])", r"\g<1>1", text)
-
-    token_re = re.compile(r"(?<![A-Za-z])[\dIl|Oo/'\".\-\s]+(?![A-Za-z])")
-
-    def _fix_token(match):
-        tok = match.group(0)
-        if not re.search(r"\d", tok):
-            return tok
-        if not re.search(r"[/'\"\-]", tok):
-            return tok
-
-        fixed = (
-            tok.replace("|", "1")
-            .replace("¦", "1")
-            .replace("‖", "1")
-            .replace("Ⅰ", "1")
-            .replace("ⅼ", "1")
-            .replace("Ｉ", "1")
-        )
-        # Leading OCR-I in a numeric run: "I5/16" -> "15/16", "I3'-3" -> "13'-3"
-        fixed = re.sub(r"(?:(?<=\s)|\A)[Il](?=\d)", "1", fixed)
-        # Common OCR confusions around dimension punctuation.
-        fixed = re.sub(r"(?<=[0-9/'\"\-])[Il](?=[0-9/'\"\-])", "1", fixed)
-        # Fraction-local fixes around slash boundaries.
-        fixed = re.sub(r"(?<=\d)\s*[Il](?=\s*/)", "1", fixed)
-        fixed = re.sub(r"(?<=/)\s*[Il](?=\s*\d)", "1", fixed)
-        # O/0 swaps also show up in scanned dimensions.
-        fixed = re.sub(r"(?:(?<=\s)|\A)[Oo](?=\d)", "0", fixed)
-        fixed = re.sub(r"(?<=[0-9/'\"\-])[Oo](?=[0-9/'\"\-])", "0", fixed)
-        fixed = re.sub(r"(?<=[0-9/'\"\-])[Oo](?=\s*\d)", "0", fixed)
-        # Collapse repeated slash artifacts in fractions: 15//16 -> 15/16
-        fixed = re.sub(r"/{2,}", "/", fixed)
-        # Remove space between slash and denominator when split by OCR.
-        fixed = re.sub(r"/\s+(\d)", r"/\1", fixed)
-        return fixed
-
-    return token_re.sub(_fix_token, text)
 
 
 def _append_linearized_cubic(
@@ -318,184 +150,8 @@ def _quad_to_points(
     return out
 
 
-def _normalize_dimension_text(text: str, aggressive: bool = True) -> str:
-    """
-    Normalize common compact/garbled dimension tokens into readable forms.
-    This is intentionally conservative and only rewrites dimension-like patterns.
-    """
-    original = (text or "").strip()
-    if not original:
-        return original
-
-    # Guardrail: only apply dimension OCR cleanup when the token carries
-    # dimension-like signals. This prevents rewriting general prose labels.
-    has_digit = bool(re.search(r"\d", original))
-    has_dim_punct = bool(re.search(r"[/'\"′″\-xX\u2044\u2212]", original))
-    if not (has_digit and has_dim_punct):
-        return original
-
-    t = _canonicalize_text_symbols(original)
-    t = _normalize_numeric_token_ocr_noise(t)
-    if not t:
-        return t
-
-    # Strip OCR-leading dot/bullet artifacts before feet-inch dimensions.
-    t = re.sub(r"^[\s\.\u00B7\u2022\u2024\u22C5]+(?=\d+\s*')", "", t)
-
-    # Rewrite compact feet-inch fractions:
-    #   4'-5316/  -> 4'-5 3/16
-    #   13'-338/  -> 13'-3 3/8
-    # Also handles common no-slash compact forms when unambiguous:
-    #   1'-5116   -> 1'-5 1/16
-    def _feet_repl(m):
-        feet = m.group(1)
-        compact = m.group(2)
-        had_slash = bool(m.group(3))
-        expanded = _expand_compact_fraction_digits(
-            compact,
-            prefer_inches=True,
-            had_slash=had_slash,
-        )
-        return f"{feet}'-{expanded}" if expanded else m.group(0)
-
-    t = re.sub(
-        r"(\d+)\s*'\s*-\s*([0-9]{3,6})(/)?(?=(?:\D|$))",
-        _feet_repl,
-        t,
-    )
-
-    # Normalize split feet-inch compact fractions:
-    #   13'-3 38/ -> 13'-3 3/8
-    #   2'-9 14/  -> 2'-9 1/4
-    #   4'-7 116  -> 4'-7 1/16
-    def _compact_fraction_only(compact: str, had_slash: bool) -> str | None:
-        expanded = _expand_compact_fraction_digits(
-            compact,
-            prefer_inches=False,
-            had_slash=had_slash,
-        )
-        if not expanded:
-            return None
-        if " " in expanded:
-            return expanded.split(" ", 1)[1]
-        return expanded
-
-    def _feet_split_slash_repl(m):
-        feet = m.group(1)
-        inches = m.group(2)
-        compact = m.group(3)
-        frac = _compact_fraction_only(compact, had_slash=True)
-        if not frac:
-            return m.group(0)
-        return f"{feet}'-{inches} {frac}"
-
-    t = re.sub(
-        r"(\d+)\s*'\s*-\s*(\d+)\s+([0-9]{2,4})/(?=(?:\D|$))",
-        _feet_split_slash_repl,
-        t,
-    )
-
-    def _feet_split_no_slash_repl(m):
-        feet = m.group(1)
-        inches = m.group(2)
-        compact = m.group(3)
-        frac = _compact_fraction_only(compact, had_slash=False)
-        if not frac:
-            return m.group(0)
-        return f"{feet}'-{inches} {frac}"
-
-    t = re.sub(
-        r"(\d+)\s*'\s*-\s*(\d+)\s+([0-9]{3,4})(?=(?:\D|$))",
-        _feet_split_no_slash_repl,
-        t,
-    )
-
-    # Clean stray trailing slash after already-valid fractions:
-    #   3/8/ -> 3/8
-    t = re.sub(
-        r"(\d+\s*/\s*\d+)\s*/(?=(?:\D|$))",
-        r"\1",
-        t,
-    )
-
-    # Convert compact slash tokens that appear as standalone words:
-    #   38/ -> 3/8
-    #   1516/ -> 15/16
-    # Keep strict guards to avoid touching dates/IDs.
-    def _compact_slash_token_repl(m):
-        compact = m.group(1)
-        expanded = _expand_compact_fraction_digits(
-            compact,
-            prefer_inches=False,
-            had_slash=True,
-        )
-        return expanded if expanded else m.group(0)
-
-    t = re.sub(
-        r"(?<![\d/])([0-9]{2,4})/(?!\d)",
-        _compact_slash_token_repl,
-        t,
-    )
-
-    # Restore readable spacing around parenthesized notes after normalized dims.
-    # Example: 6'-9 15/16(PIPE...) -> 6'-9 15/16 (PIPE...)
-    t = re.sub(r"((?:\d['\"]|\d+/\d+|\d+\s+\d+/\d+))\(", r"\1 (", t)
-
-    # Rewrite compact mixed-number tails used in nominal sizes/callouts:
-    #   1-12/ -> 1-1/2
-    #   1-1516/ -> 1-15/16
-    # Keep this slash-gated to avoid touching part numbers like A-101.
-    def _mixed_tail_repl(m):
-        whole = m.group(1)
-        compact = m.group(2)
-        expanded = _expand_compact_fraction_digits(
-            compact,
-            prefer_inches=False,
-            had_slash=True,
-        )
-        if not expanded:
-            return m.group(0)
-        if " " in expanded:
-            # compact tail already contains an inches component; strip it to keep
-            # the whole number on the left side of the hyphen authoritative.
-            expanded = expanded.split(" ", 1)[1]
-        return f"{whole}-{expanded}"
-
-    t = re.sub(
-        r"(?<!\d)(\d+)\s*-\s*([0-9]{2,6})/(?!\d)",
-        _mixed_tail_repl,
-        t,
-    )
-
-    if not aggressive:
-        return t.strip()
-
-    t = re.sub(r"\s+", " ", t).strip()
-
-    # Rewrite standalone compact fraction tokens only when the entire string
-    # is that token and a trailing slash is present (avoids corrupting
-    # labels/dates like 10/28/2024 or IDs like 1516).
-    m = re.fullmatch(r"([0-9]{2,6})(/)", t)
-    if m:
-        expanded = _expand_compact_fraction_digits(
-            m.group(1),
-            prefer_inches=False,
-            had_slash=True,
-        )
-        if expanded:
-            t = expanded
-
-    t = re.sub(r"\s{2,}", " ", t).strip()
-    return t
-
-
-def extract_page(
-    page,
-    page_num: int,
-    scale: float = 1.0,
-    flip_y: bool = True,
-    strict_text_fidelity: bool = True,
-) -> PageData:
+def extract_page(page, page_num: int, scale: float = 1.0,
+                 flip_y: bool = True) -> PageData:
     """Extract normalized primitives from a PyMuPDF page."""
     page_h = page.rect.height
     page_w_mm = page.rect.width * MM_PER_PT * scale
@@ -511,12 +167,8 @@ def extract_page(
 
         stroke = _norm_color(path_group.get("color") or path_group.get("stroke"))
         fill = _norm_color(path_group.get("fill"))
-        width_raw = path_group.get("width")
-        try:
-            width = float(width_raw) * MM_PER_PT * scale if width_raw is not None else None
-        except (TypeError, ValueError):
-            width = None
-        dashes, dash_phase = _parse_dashes(path_group.get("dashes"), scale=scale)
+        width = path_group.get("width")
+        dashes, dash_phase = _parse_dashes(path_group.get("dashes"))
         close_path = path_group.get("closePath", False)
         layer_name = path_group.get("oc") or path_group.get("layer")
 
@@ -637,14 +289,7 @@ def extract_page(
                 area=area, page_number=page_num
             ))
 
-    text_items = _extract_text(
-        page,
-        page_h,
-        page_num,
-        flip_y,
-        scale,
-        strict_text_fidelity=strict_text_fidelity,
-    )
+    text_items = _extract_text(page, page_h, page_num, flip_y, scale)
 
     return PageData(
         page_number=page_num,
@@ -654,14 +299,7 @@ def extract_page(
     )
 
 
-def _extract_text(
-    page,
-    page_h,
-    page_num,
-    flip_y,
-    scale,
-    strict_text_fidelity: bool = True,
-) -> List[NormalizedText]:
+def _extract_text(page, page_h, page_num, flip_y, scale) -> List[NormalizedText]:
     items = []
     try:
         tdict = page.get_text("dict")
@@ -675,70 +313,6 @@ def _extract_text(
             spans = line.get("spans", [])
             if not spans:
                 continue
-            raw_text = "".join(s.get("text", "") for s in spans)
-            if not raw_text or not raw_text.strip():
-                continue
-
-            # Preserve intentional leading/trailing spacing from PDF text runs.
-            # Some drawings split one visual sentence into multiple runs on the
-            # same baseline and rely on a leading space in the next run.
-            lead = " " if raw_text[:1].isspace() else ""
-            tail = " " if raw_text[-1:].isspace() else ""
-
-            core_text = raw_text.strip()
-            if strict_text_fidelity:
-                # Preserve source text structure, but still normalize proven
-                # OCR-style compact dimension tokens (e.g. 3'-1012/ -> 3'-10 1/2).
-                core_text = _canonicalize_text_symbols(core_text)
-                core_text = _normalize_numeric_token_ocr_noise(core_text)
-                core_text = _normalize_dimension_text(
-                    core_text,
-                    aggressive=False,
-                )
-            else:
-                core_text = _normalize_dimension_text(
-                    core_text,
-                    aggressive=True,
-                )
-            text = f"{lead}{core_text}{tail}"
-            if not text.strip():
-                continue
-
-            bbox_mm = None
-            try:
-                lb = line.get("bbox", (0.0, 0.0, 0.0, 0.0))
-                if lb and len(lb) >= 4:
-                    bx0, by0, bx1, by1 = float(lb[0]), float(lb[1]), float(lb[2]), float(lb[3])
-                    p0 = _to_mm(bx0, by0, page_h, flip_y, scale)
-                    p1 = _to_mm(bx1, by1, page_h, flip_y, scale)
-                    bbox_mm = (
-                        min(p0[0], p1[0]),
-                        min(p0[1], p1[1]),
-                        max(p0[0], p1[0]),
-                        max(p0[1], p1[1]),
-                    )
-            except (TypeError, ValueError):
-                bbox_mm = None
-
-            # Use the first non-empty span as baseline source to reduce
-            # placement drift from empty/whitespace spans.
-            base_span = next(
-                (s for s in spans if str(s.get("text", "")).strip()),
-                spans[0],
-            )
-
-            origin = base_span.get("origin")
-            if origin:
-                x, y = float(origin[0]), float(origin[1])
-            else:
-                bb = line.get("bbox", (0, 0, 0, 0))
-                # bbox y0 is top; y1 is closer to baseline/descender.
-                x, y = float(bb[0]), float(bb[3])
-
-            px, py = _to_mm(x, y, page_h, flip_y, scale)
-            size = max(float(base_span.get("size", 3)), 1.0) * MM_PER_PT * scale
-            font = str(base_span.get("font", ""))
-
             text_dir = line.get("dir", (1.0, 0.0))
             dx = float(text_dir[0]) if text_dir else 1.0
             dy = float(text_dir[1]) if text_dir else 0.0
@@ -749,104 +323,282 @@ def _extract_text(
                 dy = 0.0
             angle = -math.degrees(math.atan2(dy, dx))
 
-            normalized = text.upper().replace("  ", " ").strip()
-            generic_tags = _classify_generic(text)
+            # Process individual spans to preserve per-glyph positioning.
+            # CAD PDFs often store a visual "line" as multiple positioned
+            # spans; collapsing them into one string at the first-span
+            # origin causes alignment drift and label overlap in viewers.
+            for span in spans:
+                text = str(span.get("text", "")).strip()
+                if not text:
+                    continue
 
-            items.append(NormalizedText(
-                id=next_id(), text=text, normalized=normalized,
-                insertion=(px, py), font_size=size,
-                bbox=bbox_mm,
-                rotation=angle, font_name=font,
-                page_number=page_num, generic_tags=generic_tags
-            ))
-    return _suppress_redundant_slash_items(
-        items,
-        enabled=not strict_text_fidelity,
-    )
+                origin = span.get("origin")
+                if origin and len(origin) >= 2:
+                    x, y = float(origin[0]), float(origin[1])
+                else:
+                    bb = span.get("bbox") or line.get("bbox", (0, 0, 0, 0))
+                    x, y = float(bb[0]), float(bb[3] if len(bb) >= 4 else bb[1])
+
+                px, py = _to_mm(x, y, page_h, flip_y, scale)
+                size = max(float(span.get("size", 3)), 1.0) * MM_PER_PT * scale
+                font = str(span.get("font", ""))
+
+                # Extract text color from span
+                text_color = _norm_color(span.get("color"))
+
+                bbox_mm = None
+                sb = span.get("bbox")
+                if sb and len(sb) >= 4:
+                    x0, y0, x1, y1 = map(float, sb[:4])
+                    if flip_y:
+                        by0 = (page_h - max(y0, y1)) * MM_PER_PT * scale
+                        by1 = (page_h - min(y0, y1)) * MM_PER_PT * scale
+                    else:
+                        by0 = min(y0, y1) * MM_PER_PT * scale
+                        by1 = max(y0, y1) * MM_PER_PT * scale
+                    bx0 = min(x0, x1) * MM_PER_PT * scale
+                    bx1 = max(x0, x1) * MM_PER_PT * scale
+                    bbox_mm = (bx0, by0, bx1, by1)
+
+                normalized = text.upper().replace("  ", " ").strip()
+                generic_tags = _classify_generic(text)
+
+                items.append(NormalizedText(
+                    id=next_id(), text=text, normalized=normalized,
+                    insertion=(px, py), bbox=bbox_mm,
+                    font_size=size, rotation=angle, font_name=font,
+                    color=text_color,
+                    page_number=page_num, generic_tags=generic_tags
+                ))
+    items = _merge_stacked_fractions(items)
+    return items
 
 
-def _rotation_diff_mod_180(a_deg: float, b_deg: float) -> float:
-    """Smallest angular difference treating 180-deg flips as equivalent."""
-    diff = abs((float(a_deg) - float(b_deg)) % 180.0)
-    return min(diff, 180.0 - diff)
+# ── Stacked-fraction merger ──
+# Some CAD PDFs encode fractions like "15/16" as three separate text spans
+# stacked vertically: numerator, slash, denominator.  This post-processor
+# detects unambiguous stacked-fraction groups and merges them into a single
+# NormalizedText so downstream importers see e.g. "15/16" instead of three
+# overlapping items.
+
+_SLASH_RE = re.compile(r'^[/\u2044\u2215]$')   # slash, fraction slash, division slash
+_DIGITS_RE = re.compile(r'^\d{1,4}$')           # 1-4 digit number
+# Concatenated numerator+denominator: e.g. "716" = 7/16, "1116" = 11/16.
+# Valid denominators for imperial fractions.
+_VALID_DENOMS = (2, 4, 8, 16, 32, 64)
+
+# Thresholds (mm).  5 pt ≈ 1.76 mm, 6 pt ≈ 2.12 mm.
+_FRAC_X_OVERLAP_MM = 5.0   # max horizontal gap between items to consider co-located
+_FRAC_Y_SPREAD_MM = 4.5    # max total vertical spread for the whole group
 
 
-def _suppress_redundant_slash_items(
-    items: List[NormalizedText],
-    enabled: bool = True,
-) -> List[NormalizedText]:
+def _split_concatenated_fraction(digits: str):
+    """Try to split a concatenated digit string into (numerator, denominator).
+
+    E.g. "716" -> ("7", "16"), "1116" -> ("11", "16"), "316" -> ("3", "16").
+    Returns None if no valid split is found.
     """
-    Remove slash-only text runs that duplicate an already complete nearby
-    fraction token. This avoids visual artifacts like "15/6" from stacked
-    duplicate slash glyphs while preserving legitimate text.
+    s = digits.strip()
+    if not s.isdigit() or len(s) < 2:
+        return None
+    # Try splitting: denominator is a known fraction denominator at the end
+    for d in sorted(_VALID_DENOMS, reverse=True):
+        ds = str(d)
+        if len(s) > len(ds) and s.endswith(ds):
+            numer = s[:-len(ds)]
+            if numer.isdigit():
+                n = int(numer)
+                # Numerator must be less than denominator for a proper fraction
+                if 0 < n < d:
+                    return (numer, ds)
+    return None
+
+
+def _merge_stacked_fractions(items: List[NormalizedText]) -> List[NormalizedText]:
+    """Merge stacked fraction spans into one.
+
+    Handles two PDF encoding patterns:
+    1. Two items: concatenated digits + "/" (e.g. "716" + "/" -> "7/16")
+       This is the most common pattern in CAD PDFs.
+    2. Three items: separate numerator + "/" + denominator (e.g. "15", "/", "16")
+       Only matched when neither digit item is itself a concatenated fraction.
     """
-    if not items or not enabled:
+    if len(items) < 2:
         return items
 
-    def _is_slash_only(s: str) -> bool:
-        t = (s or "").strip()
-        return bool(t) and all(ch in {"/", "\u2044"} for ch in t)
+    # Group candidates by page
+    by_page: dict[int, list[int]] = {}
+    for idx, it in enumerate(items):
+        by_page.setdefault(it.page_number, []).append(idx)
 
-    def _try_expand_compact_fraction_token(token: str) -> str | None:
-        t = (token or "").strip()
-        if not re.fullmatch(r"\d{2,6}", t):
-            return None
-        return _expand_compact_fraction_digits(
-            t,
-            prefer_inches=False,
-            had_slash=True,
-        )
+    merged_indices: set[int] = set()
+    replacements: dict[int, NormalizedText] = {}  # keyed by slash index
 
-    keep = [True] * len(items)
+    for page_num, indices in by_page.items():
+        # Find slash items on this page
+        slash_idxs = [i for i in indices if _SLASH_RE.match(items[i].text.strip())]
 
-    for i, item in enumerate(items):
-        if not _is_slash_only(item.text):
-            continue
-
-        sx, sy = item.insertion
-        if item.bbox:
-            sx = (item.bbox[0] + item.bbox[2]) * 0.5
-            sy = (item.bbox[1] + item.bbox[3]) * 0.5
-
-        rot_i = float(item.rotation or 0.0)
-        size_i = max(float(item.font_size or 0.0), 0.5)
-
-        for j, other in enumerate(items):
-            if i == j:
+        for si in slash_idxs:
+            if si in merged_indices:
                 continue
-            if _is_slash_only(other.text):
-                continue
-            if _rotation_diff_mod_180(rot_i, float(other.rotation or 0.0)) > 4.0:
-                continue
+            slash = items[si]
+            sx = slash.insertion[0]
+            sy = slash.insertion[1]
 
-            # Convert compact OCR-style fraction tails when a nearby slash token
-            # makes the intent explicit (e.g. "1516" + "/" -> "15/16").
-            expanded = _try_expand_compact_fraction_token(other.text or "")
-            if expanded:
-                other.text = expanded
-                other.normalized = expanded.upper().replace("  ", " ").strip()
-                if "dimension_like" not in (other.generic_tags or []):
-                    other.generic_tags.append("dimension_like")
+            # ----------------------------------------------------------
+            # Pattern A: Concatenated digits + slash (e.g. "716" + "/")
+            # Try this FIRST — it is the most common and unambiguous.
+            # ----------------------------------------------------------
+            concat_candidates = []
+            for ci in indices:
+                if ci == si or ci in merged_indices:
+                    continue
+                cand = items[ci]
+                ct = cand.text.strip()
+                if not ct.isdigit() or len(ct) < 2:
+                    continue
+                cx = cand.insertion[0]
+                cy = cand.insertion[1]
+                if abs(cx - sx) > _FRAC_X_OVERLAP_MM:
+                    continue
+                if abs(cy - sy) > _FRAC_Y_SPREAD_MM:
+                    continue
+                split = _split_concatenated_fraction(ct)
+                if split is not None:
+                    concat_candidates.append((ci, split))
 
-            # Only suppress when a nearby token already contains a slash.
-            if "/" not in (other.text or "") and "\u2044" not in (other.text or ""):
-                continue
+            if len(concat_candidates) == 1:
+                ci, (numer_s, denom_s) = concat_candidates[0]
+                cand = items[ci]
+                sizes = [cand.font_size, slash.font_size]
+                if max(sizes) <= 2.0 * min(sizes):
+                    merged_text = f"{numer_s}/{denom_s}"
+                    avg_size = sum(sizes) / 2.0
+                    merged_item = NormalizedText(
+                        id=next_id(),
+                        text=merged_text,
+                        normalized=merged_text.upper().strip(),
+                        insertion=slash.insertion,
+                        bbox=_merged_bbox(cand.bbox, slash.bbox),
+                        font_size=avg_size,
+                        rotation=slash.rotation,
+                        font_name=slash.font_name or cand.font_name,
+                        color=slash.color or cand.color,
+                        page_number=page_num,
+                        generic_tags=_classify_generic(merged_text),
+                    )
+                    merged_indices.update([ci, si])
+                    replacements[si] = merged_item
+                    continue
 
-            ox, oy = other.insertion
-            if other.bbox:
-                bx0, by0, bx1, by1 = other.bbox
-                pad = max(size_i * 0.65, 0.8)
-                if (bx0 - pad) <= sx <= (bx1 + pad) and (by0 - pad) <= sy <= (by1 + pad):
-                    keep[i] = False
-                    break
-                ox = (bx0 + bx1) * 0.5
-                oy = (by0 + by1) * 0.5
+            # ----------------------------------------------------------
+            # Pattern B: Three separate items (numerator + slash + denom)
+            # Only if Pattern A didn't match. Require that neither digit
+            # is itself a concatenated fraction (to avoid grabbing whole
+            # numbers that sit next to an already-handled concat fraction).
+            # ----------------------------------------------------------
+            digit_candidates = []
+            for ci in indices:
+                if ci == si or ci in merged_indices:
+                    continue
+                cand = items[ci]
+                ct = cand.text.strip()
+                if not _DIGITS_RE.match(ct):
+                    continue
+                # Skip items that are concatenated fractions — those belong
+                # to Pattern A with a different slash.
+                if len(ct) >= 2 and _split_concatenated_fraction(ct) is not None:
+                    continue
+                cx = cand.insertion[0]
+                cy = cand.insertion[1]
+                if abs(cx - sx) > _FRAC_X_OVERLAP_MM:
+                    continue
+                if abs(cy - sy) > _FRAC_Y_SPREAD_MM:
+                    continue
+                digit_candidates.append(ci)
 
-            if math.hypot(sx - ox, sy - oy) <= max(size_i * 1.25, 2.0):
-                keep[i] = False
-                break
+            if len(digit_candidates) >= 2:
+                # Try all pairs to find a valid numerator/denominator.
+                # Sort by closeness to slash Y so we prefer the tightest pair.
+                digit_candidates.sort(key=lambda i: abs(items[i].insertion[1] - sy))
+                best_pair = None
+                best_spread = _FRAC_Y_SPREAD_MM + 1
+                for ai in range(len(digit_candidates)):
+                    for bi in range(ai + 1, len(digit_candidates)):
+                        ca, cb = digit_candidates[ai], digit_candidates[bi]
+                        ya = items[ca].insertion[1]
+                        yb = items[cb].insertion[1]
+                        spread = abs(ya - yb)
+                        if spread > _FRAC_Y_SPREAD_MM or spread < 0.3:
+                            continue
+                        try:
+                            va = int(items[ca].text.strip())
+                            vb = int(items[cb].text.strip())
+                        except ValueError:
+                            continue
+                        if va < vb:
+                            ni, di = ca, cb
+                        elif vb < va:
+                            ni, di = cb, ca
+                        else:
+                            continue
+                        d_val = int(items[di].text.strip())
+                        n_val = int(items[ni].text.strip())
+                        if d_val not in _VALID_DENOMS or n_val >= d_val:
+                            continue
+                        if spread < best_spread:
+                            best_spread = spread
+                            best_pair = (ni, di)
+                if best_pair is None:
+                    continue
+                numer_idx, denom_idx = best_pair
+                numer = items[numer_idx]
+                denom = items[denom_idx]
+                sizes = [numer.font_size, slash.font_size, denom.font_size]
+                if max(sizes) <= 2.0 * min(sizes):
+                    merged_text = f"{numer.text.strip()}/{denom.text.strip()}"
+                    avg_size = sum(sizes) / 3.0
+                    merged_item = NormalizedText(
+                        id=next_id(),
+                        text=merged_text,
+                        normalized=merged_text.upper().strip(),
+                        insertion=slash.insertion,
+                        bbox=_merged_bbox(numer.bbox, slash.bbox, denom.bbox),
+                        font_size=avg_size,
+                        rotation=slash.rotation,
+                        font_name=slash.font_name or numer.font_name,
+                        color=slash.color or numer.color,
+                        page_number=page_num,
+                        generic_tags=_classify_generic(merged_text),
+                    )
+                    merged_indices.update([numer_idx, si, denom_idx])
+                    replacements[si] = merged_item
 
-    return [it for idx, it in enumerate(items) if keep[idx]]
+    if not merged_indices:
+        return items
+
+    # Rebuild list: keep non-merged items, insert merged items at slash position
+    result = []
+    for idx, it in enumerate(items):
+        if idx in merged_indices:
+            if idx in replacements:
+                result.append(replacements[idx])
+            # else: skip (numerator or denominator that was merged)
+        else:
+            result.append(it)
+    return result
+
+
+def _merged_bbox(*boxes):
+    """Return the union bounding box of one or more (x0,y0,x1,y1) or None boxes."""
+    vals = [b for b in boxes if b is not None]
+    if not vals:
+        return None
+    x0 = min(b[0] for b in vals)
+    y0 = min(b[1] for b in vals)
+    x1 = max(b[2] for b in vals)
+    y1 = max(b[3] for b in vals)
+    return (x0, y0, x1, y1)
 
 
 def _classify_generic(text: str) -> list:

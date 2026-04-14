@@ -132,11 +132,56 @@ def _create_curve_object(primitive, collection):
     return obj
 
 
+# Unicode symbols that Blender's built-in font can't render (shows as tofu boxes).
+# Map to ASCII equivalents for readability.
+_UNICODE_SUBSTITUTIONS = {
+    "\u2190": "<-",   # ←
+    "\u2191": "^",    # ↑
+    "\u2192": "->",   # →
+    "\u2193": "v",    # ↓
+    "\u25C0": "<",    # ◀
+    "\u25B6": ">",    # ▶
+    "\u25CF": "*",    # ●
+    "\u2022": "*",    # •
+    "\u00B7": ".",    # ·
+    "\u2013": "-",    # –
+    "\u2014": "--",   # —
+    "\u2015": "--",   # ―
+    "\u2018": "'",    # '
+    "\u2019": "'",    # '
+    "\u201C": '"',    # "
+    "\u201D": '"',    # "
+    "\u2032": "'",    # ′ (prime / feet)
+    "\u2033": '"',    # ″ (double prime / inches)
+    "\u00D8": "DIA",  # Ø (diameter)
+}
+
+
+def _sanitize_text_for_blender(text: str) -> str:
+    """Replace unicode symbols that Blender's default font can't render."""
+    for char, replacement in _UNICODE_SUBSTITUTIONS.items():
+        if char in text:
+            text = text.replace(char, replacement)
+    # Strip any remaining chars outside BMP or in Private Use Area
+    # that would render as tofu boxes
+    cleaned = []
+    for c in text:
+        cp = ord(c)
+        if cp > 0xFFFF:  # Supplementary planes (emoji, etc.)
+            continue
+        if 0xE000 <= cp <= 0xF8FF:  # Private Use Area
+            continue
+        if cp == 0xFFFD:  # Replacement character
+            continue
+        cleaned.append(c)
+    return "".join(cleaned)
+
+
 def _create_text_object(text_item, collection):
     import bpy
 
     curve = bpy.data.curves.new(name=f"Text_{text_item.id}", type="FONT")
-    curve.body = text_item.text
+    curve.body = _sanitize_text_for_blender(text_item.text)
     curve.size = max(text_item.font_size * MM_TO_M, 0.001)
 
     obj = bpy.data.objects.new(f"PDF_Text_{text_item.id}", curve)

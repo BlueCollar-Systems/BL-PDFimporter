@@ -50,6 +50,21 @@ class TestDimensionNormalization(unittest.TestCase):
             "PIPE1-1/2STD",
         )
 
+    def test_compact_hyphen_fractions_without_slash(self) -> None:
+        self.assertEqual(
+            _normalize_dimension_text("8 - 1516 Ø HOLES", aggressive=False),
+            "8 - 15/16 Ø HOLES",
+        )
+        self.assertEqual(
+            _normalize_dimension_text("3-716", aggressive=False),
+            "3-7/16",
+        )
+        # Guardrail: non-numeric left-hand IDs must remain untouched.
+        self.assertEqual(
+            _normalize_dimension_text("DWG A-1516 REV 2", aggressive=False),
+            "DWG A-1516 REV 2",
+        )
+
     def test_preserve_non_dimension_tokens(self) -> None:
         self.assertEqual(
             _normalize_dimension_text("DATE : 03/15/2024", aggressive=False),
