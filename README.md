@@ -7,7 +7,9 @@ Powered by the pdfcadcore shared extraction library and PyMuPDF.
 
 ## Features
 
-- **7 Import Presets** -- Fast Preview, General Vector, Technical Drawing, Shop Drawing, Raster+Vectors, Raster Only, Max Fidelity
+- **4 Import Modes** (BCS-ARCH-001) -- Auto (default, picks strategy per page), Vector, Raster, Hybrid
+- **4 Text Rendering Options** -- Labels, 3D Text, Glyphs, Geometry (orthogonal to mode)
+- **Maximum fidelity by default** -- no quality tiers, no fast-mode compromises
 - **Arc & Circle Detection** -- Reconstruct true arcs and circles from polyline approximations
 - **OCG Layer Support** -- Map PDF Optional Content Groups to Blender sub-collections
 - **Color Grouping** -- Organize geometry into sub-collections by stroke color
