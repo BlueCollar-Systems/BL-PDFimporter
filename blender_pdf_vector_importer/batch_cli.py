@@ -15,6 +15,12 @@ def _collect_pdfs(root: Path, recursive: bool) -> list[Path]:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """Argument parser for BL batch CLI (BCS-ARCH-001 Rule 5 sweep).
+
+    Only mode, pages, recursive, summary-dir, and json are user-facing.
+    Quality-tier flags do not exist on this entry point — consolidated
+    defaults apply universally.
+    """
     p = argparse.ArgumentParser(description="Batch-parse PDF vectors for Blender workflows.")
     p.add_argument("input_dir", help="Directory containing PDF files")
     p.add_argument("--mode", default="auto",
@@ -25,6 +31,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--summary-dir", default=None,
                    help="Optional directory to write per-file summaries")
     p.add_argument("--json", default=None, help="Write aggregate JSON report")
+    p.add_argument("--verbose", action="store_true",
+                   help="Print verbose progress")
     return p
 
 

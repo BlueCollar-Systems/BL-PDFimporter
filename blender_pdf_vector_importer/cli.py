@@ -9,6 +9,15 @@ from .importer import apply_uniform_scale, run_import
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """Argument parser for BL CLI (BCS-ARCH-001 Rule 5 sweep).
+
+    Only mode, text, import-text, pages, scale, json, and verbose are
+    user-facing. Quality-tier flags (--hatch-mode, --arc-mode,
+    --cleanup-level, --lineweight-mode, --raster-dpi,
+    --strict-text-fidelity, --no-arcs, --no-raster-fallback,
+    --grouping-mode) have been removed — their consolidated defaults
+    apply universally.
+    """
     parser = argparse.ArgumentParser(description="Parse PDF vectors for Blender import.")
     parser.add_argument("pdf", help="Path to input PDF")
     parser.add_argument("--mode", default="auto",
@@ -21,43 +30,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--text-mode", default=None,
                         choices=["labels", "3d_text", "glyphs", "geometry"],
                         help="Text handling (orthogonal to --mode)")
-    parser.add_argument("--strict-text-fidelity",
+    parser.add_argument("--import-text",
                         action=argparse.BooleanOptionalAction,
                         default=None,
-                        help="Preserve exact text spans (default from preset)")
-    parser.add_argument("--hatch-mode", default=None,
-                        choices=["import", "group", "skip"],
-                        help="Hatch handling override")
-    parser.add_argument("--arc-mode", default=None,
-                        choices=["auto", "preserve", "rebuild", "polyline"],
-                        help="Arc reconstruction mode")
-    parser.add_argument("--cleanup-level", default=None,
-                        choices=["conservative", "balanced", "aggressive"],
-                        help="Geometry cleanup aggressiveness")
-    parser.add_argument("--lineweight-mode", default=None,
-                        choices=["ignore", "preserve", "group", "map_to_layers"],
-                        help="Lineweight handling mode")
-    parser.add_argument("--grouping-mode", default=None,
-                        choices=[
-                            "single", "per_page", "per_layer", "per_color",
-                            "nested_page_layer", "nested_page_lineweight",
-                        ],
-                        help="Grouping strategy")
-    parser.add_argument("--raster-dpi", type=int, default=None,
-                        help="Raster rendering DPI for raster/hybrid modes")
-    parser.add_argument("--no-raster-fallback", action="store_true",
-                        help="Disable automatic raster fallback when vectors are absent")
+                        help="Import text from the PDF (--no-import-text to skip)")
     parser.add_argument("--reference-detected-mm", type=float, default=None,
                         help="Measured length in imported geometry (mm)")
     parser.add_argument("--reference-real-mm", type=float, default=None,
                         help="Real-world reference length (mm)")
-    parser.add_argument("--no-text", action="store_true",
-                        help="Skip text extraction")
     parser.add_argument("--no-images", action="store_true",
                         help="Skip embedded image extraction")
-    parser.add_argument("--no-arcs", action="store_true",
-                        help="Skip arc reconstruction")
     parser.add_argument("--json", help="Write summary JSON")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Print verbose progress")
     return parser
 
 
@@ -71,28 +56,10 @@ def main() -> int:
     if args.text_mode is not None:
         overrides["text_mode"] = args.text_mode
         overrides["import_text"] = True
-    if args.strict_text_fidelity is not None:
-        overrides["strict_text_fidelity"] = bool(args.strict_text_fidelity)
-    if args.hatch_mode is not None:
-        overrides["hatch_mode"] = args.hatch_mode
-    if args.arc_mode is not None:
-        overrides["arc_mode"] = args.arc_mode
-    if args.cleanup_level is not None:
-        overrides["cleanup_level"] = args.cleanup_level
-    if args.lineweight_mode is not None:
-        overrides["lineweight_mode"] = args.lineweight_mode
-    if args.grouping_mode is not None:
-        overrides["grouping_mode"] = args.grouping_mode
-    if args.raster_dpi is not None:
-        overrides["raster_dpi"] = args.raster_dpi
-    if args.no_raster_fallback:
-        overrides["raster_fallback"] = False
-    if args.no_text:
-        overrides["import_text"] = False
+    if args.import_text is not None:
+        overrides["import_text"] = bool(args.import_text)
     if args.no_images:
         overrides["ignore_images"] = True
-    if args.no_arcs:
-        overrides["detect_arcs"] = False
 
     run = run_import(args.pdf, mode=args.mode, overrides=overrides)
     if args.reference_detected_mm and args.reference_real_mm:

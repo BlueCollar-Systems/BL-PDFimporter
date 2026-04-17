@@ -5,6 +5,12 @@
 """
 Blender import operator for PDF vector drawings.
 Uses ImportHelper mixin for the file browser integration.
+
+BCS-ARCH-001 Rule 5 sweep: every quality-tier dial (detect_arcs,
+make_faces, map_dashes, ignore_fill_only_shapes) has been removed from
+the operator's user-facing properties. Internal defaults from
+pdfcadcore.ImportConfig apply universally — modes differ by strategy
+on input type, never by quality tier.
 """
 from __future__ import annotations
 
@@ -91,33 +97,9 @@ class IMPORT_OT_pdf_vector(bpy.types.Operator, ImportHelper):
         default="labels",
     )
 
-    detect_arcs: BoolProperty(  # type: ignore[assignment]
-        name="Detect Arcs",
-        description="Reconstruct arcs and circles from polyline segments",
-        default=True,
-    )
-
-    make_faces: BoolProperty(  # type: ignore[assignment]
-        name="Make Faces",
-        description="Create mesh faces from closed loops and rectangles",
-        default=False,
-    )
-
-    ignore_fill_only_shapes: BoolProperty(  # type: ignore[assignment]
-        name="Ignore Fill-Only Shapes",
-        description="Skip fill-only PDF shapes that can hide linework",
-        default=True,
-    )
-
     group_by_color: BoolProperty(  # type: ignore[assignment]
         name="Group by Color",
         description="Organize geometry into sub-collections by stroke color",
-        default=True,
-    )
-
-    map_dashes: BoolProperty(  # type: ignore[assignment]
-        name="Map Dash Patterns",
-        description="Preserve PDF dash patterns as Blender line styles",
         default=True,
     )
 
@@ -210,17 +192,16 @@ class IMPORT_OT_pdf_vector(bpy.types.Operator, ImportHelper):
     def execute(self, context):
         from . import bl_import_engine
 
-        # Build config dict from operator properties
+        # Build config dict from operator properties.
+        # BCS-ARCH-001 Rule 5: detect_arcs / make_faces / map_dashes /
+        # ignore_fill_only_shapes are no longer user-adjustable. Their
+        # consolidated defaults come from pdfcadcore.ImportConfig.
         config = {
             "mode": self.mode,
             "pages": self.pages,
             "import_text": self.import_text,
             "text_mode": self.text_mode,
-            "detect_arcs": self.detect_arcs,
-            "make_faces": self.make_faces,
-            "ignore_fill_only_shapes": self.ignore_fill_only_shapes,
             "group_by_color": self.group_by_color,
-            "map_dashes": self.map_dashes,
             "visual_style": self.visual_style,
             "line_z_offset_mm": self.line_z_offset_mm,
             "text_z_offset_mm": self.text_z_offset_mm,
@@ -296,18 +277,15 @@ class IMPORT_OT_pdf_vector(bpy.types.Operator, ImportHelper):
         layout.prop(self, "pages")
         layout.separator()
 
-        # Individual options
+        # Individual options (BCS-ARCH-001 Rule 5 — only Mode, Text, and
+        # Import Text are user-facing. Other quality dials are baked in.)
         box = layout.box()
         box.label(text="Options", icon="PREFERENCES")
         box.prop(self, "import_text")
         sub = box.row()
         sub.enabled = self.import_text
         sub.prop(self, "text_mode")
-        box.prop(self, "detect_arcs")
-        box.prop(self, "make_faces")
-        box.prop(self, "ignore_fill_only_shapes")
         box.prop(self, "group_by_color")
-        box.prop(self, "map_dashes")
 
         box = layout.box()
         box.label(text="View & Readability", icon="SHADING_RENDERED")
