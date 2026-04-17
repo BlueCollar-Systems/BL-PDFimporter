@@ -22,7 +22,7 @@ class BlenderImportOptions:
     group_by_color: bool = True
 
 
-def import_into_blender(pdf_path: str, preset: str = "general",
+def import_into_blender(pdf_path: str, mode: str = "auto",
                         options: Optional[BlenderImportOptions] = None):
     try:
         import bpy
@@ -32,14 +32,14 @@ def import_into_blender(pdf_path: str, preset: str = "general",
     opts = options or BlenderImportOptions()
     overrides = {
         "import_text": opts.import_text,
-        "text_mode": "labels" if opts.import_text else "none",
+        "text_mode": "labels",
         "ignore_images": not opts.import_images,
         "detect_arcs": opts.detect_arcs,
     }
     if opts.pages:
         overrides["pages"] = opts.pages
 
-    run = run_import(pdf_path, preset=preset, overrides=overrides)
+    run = run_import(pdf_path, mode=mode, overrides=overrides)
     extraction = run.extraction
 
     root_name = f"PDF_{Path(pdf_path).stem}"

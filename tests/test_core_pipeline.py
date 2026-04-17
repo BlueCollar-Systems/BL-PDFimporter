@@ -87,8 +87,8 @@ class TestCorePipeline(unittest.TestCase):
         )
         self.assertEqual(len(extraction.pages), 2)
 
-    def test_raster_only_mode_renders_page_image(self) -> None:
-        run = run_import(str(self.pdf_path), preset="raster_only", overrides={"pages": "1"})
+    def test_raster_mode_renders_page_image(self) -> None:
+        run = run_import(str(self.pdf_path), mode="raster", overrides={"pages": "1"})
         summary = run.extraction.summary()
         self.assertEqual(summary["pages"], 1)
         self.assertEqual(summary["primitives"], 0)
@@ -96,7 +96,7 @@ class TestCorePipeline(unittest.TestCase):
         self.assertGreaterEqual(summary["images"], 1)
 
     def test_reference_scale_transform(self) -> None:
-        run = run_import(str(self.pdf_path), preset="general", overrides={"pages": "1"})
+        run = run_import(str(self.pdf_path), mode="auto", overrides={"pages": "1"})
         page = run.extraction.pages[0].page_data
         width_before = page.width
         apply_uniform_scale(run.extraction, 2.0)

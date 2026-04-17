@@ -11,19 +11,16 @@ from .importer import apply_uniform_scale, run_import
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Parse PDF vectors for Blender import.")
     parser.add_argument("pdf", help="Path to input PDF")
-    parser.add_argument("--preset", default="general",
-                        choices=["fast", "general", "technical", "shop", "raster_vector", "raster_only", "max"],
-                        help="Import preset")
+    parser.add_argument("--mode", default="auto",
+                        choices=["auto", "vector", "raster", "hybrid"],
+                        help="Import mode (BCS-ARCH-001)")
     parser.add_argument("--pages", default=None,
                         help="Page spec: 1,3-5,all")
     parser.add_argument("--scale", type=float, default=None,
                         help="Additional scale multiplier")
-    parser.add_argument("--mode", default=None,
-                        choices=["auto", "vectors", "raster", "hybrid"],
-                        help="Force import mode override")
     parser.add_argument("--text-mode", default=None,
-                        choices=["labels", "geometry", "none"],
-                        help="Text handling override")
+                        choices=["labels", "3d_text", "glyphs", "geometry"],
+                        help="Text handling (orthogonal to --mode)")
     parser.add_argument("--strict-text-fidelity",
                         action=argparse.BooleanOptionalAction,
                         default=None,
@@ -71,11 +68,9 @@ def main() -> int:
         overrides["pages"] = args.pages
     if args.scale is not None:
         overrides["user_scale"] = args.scale
-    if args.mode is not None:
-        overrides["import_mode"] = args.mode
     if args.text_mode is not None:
         overrides["text_mode"] = args.text_mode
-        overrides["import_text"] = args.text_mode != "none"
+        overrides["import_text"] = True
     if args.strict_text_fidelity is not None:
         overrides["strict_text_fidelity"] = bool(args.strict_text_fidelity)
     if args.hatch_mode is not None:
@@ -94,13 +89,12 @@ def main() -> int:
         overrides["raster_fallback"] = False
     if args.no_text:
         overrides["import_text"] = False
-        overrides["text_mode"] = "none"
     if args.no_images:
         overrides["ignore_images"] = True
     if args.no_arcs:
         overrides["detect_arcs"] = False
 
-    run = run_import(args.pdf, preset=args.preset, overrides=overrides)
+    run = run_import(args.pdf, mode=args.mode, overrides=overrides)
     if args.reference_detected_mm and args.reference_real_mm:
         if args.reference_detected_mm <= 0:
             raise SystemExit("--reference-detected-mm must be > 0")

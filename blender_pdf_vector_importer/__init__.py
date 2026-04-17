@@ -29,16 +29,15 @@ try:  # pragma: no cover - Blender runtime only
         filename_ext = ".pdf"
         filter_glob: StringProperty(default="*.pdf", options={"HIDDEN"})
 
-        preset: EnumProperty(
-            name="Preset",
+        mode: EnumProperty(
+            name="Mode",
             items=[
-                ("fast", "Fast", "Fast preview import"),
-                ("general", "General", "Balanced general import"),
-                ("technical", "Technical", "Technical drawing optimization"),
-                ("shop", "Shop", "Shop drawing optimization"),
-                ("max", "Max Fidelity", "Highest fidelity import"),
+                ("auto", "Auto", "Analyze and pick Vector/Raster/Hybrid automatically"),
+                ("vector", "Vector", "Extract all vector geometry faithfully"),
+                ("raster", "Raster", "Place as high-DPI image (scanned PDFs)"),
+                ("hybrid", "Hybrid", "Vectors where clean, raster where lossy"),
             ],
-            default="general",
+            default="auto",
         )
 
         pages: StringProperty(
@@ -63,7 +62,7 @@ try:  # pragma: no cover - Blender runtime only
                 group_by_color=self.group_by_color,
             )
 
-            extraction = import_into_blender(self.filepath, preset=self.preset, options=options)
+            extraction = import_into_blender(self.filepath, mode=self.mode, options=options)
             summary = extraction.summary()
             self.report(
                 {"INFO"},
@@ -74,7 +73,7 @@ try:  # pragma: no cover - Blender runtime only
 
         def draw(self, context):
             layout = self.layout
-            layout.prop(self, "preset")
+            layout.prop(self, "mode")
             layout.prop(self, "pages")
             layout.prop(self, "import_text")
             layout.prop(self, "import_images")

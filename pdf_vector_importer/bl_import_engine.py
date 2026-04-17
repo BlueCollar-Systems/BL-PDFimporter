@@ -659,48 +659,44 @@ def _create_image_plane(
     return obj
 
 
-# ── Preset mapping ───────────────────────────────────────────────────
+# ── Mode mapping (BCS-ARCH-001) ───────────────────────────────────────
 
-def _config_from_preset(preset_name: str) -> ImportConfig:
-    """Map a UI preset name to an ImportConfig instance."""
-    key = (preset_name or "shop").strip().lower()
-    if key in ("fast", "fast_preview"):
-        return ImportConfig.fast()
-    if key in ("general", "general_vector"):
-        return ImportConfig.general_vector()
-    if key in ("technical", "technical_drawing"):
-        return ImportConfig.technical_drawing()
-    if key in ("shop", "shop_drawing"):
-        return ImportConfig.shop_drawing()
-    if key in ("raster_vector", "raster+vectors"):
-        cfg = ImportConfig.general_vector()
-        cfg.import_mode = "hybrid"
-        cfg.ignore_images = False
-        cfg.raster_fallback = True
-        return cfg
-    if key in ("raster_only", "raster"):
-        cfg = ImportConfig.fast()
-        cfg.import_mode = "raster"
-        cfg.ignore_images = False
-        cfg.raster_fallback = True
-        cfg.import_text = False
-        return cfg
-    if key in ("max", "max_fidelity"):
-        return ImportConfig.max_fidelity()
-    # Default fallback
-    return ImportConfig.shop_drawing()
+def _config_from_mode(mode_name: str) -> ImportConfig:
+    """Map a BCS-ARCH-001 mode name to an ImportConfig instance.
+
+    Valid modes: auto (default), vector, raster, hybrid.
+    """
+    key = (mode_name or "auto").strip().lower()
+    if key == "auto":
+        return ImportConfig.auto()
+    if key == "vector":
+        return ImportConfig.vector()
+    if key == "raster":
+        return ImportConfig.raster()
+    if key == "hybrid":
+        return ImportConfig.hybrid()
+    raise ValueError(
+        f"Unknown import mode: {mode_name!r}. "
+        "Valid modes: auto, vector, raster, hybrid (BCS-ARCH-001)."
+    )
 
 
 def _apply_overrides(config: ImportConfig, ui_config: dict) -> ImportConfig:
-    """Apply operator UI overrides onto an ImportConfig."""
+    """Apply operator UI overrides onto an ImportConfig.
+
+    BCS-ARCH-001 text rendering is orthogonal to mode. ``text_mode`` is
+    one of ``labels | 3d_text | glyphs | geometry``; the separate
+    ``import_text`` toggle controls whether text is imported at all.
+    """
+    if "import_text" in ui_config:
+        config.import_text = bool(ui_config["import_text"])
     if "text_mode" in ui_config:
-        text_mode = str(ui_config["text_mode"] or "none").strip().lower()
+        text_mode = str(ui_config["text_mode"] or "labels").strip().lower()
         config.text_mode = text_mode
-        config.import_text = text_mode != "none"
         if "strict_text_fidelity" not in ui_config:
-            # Keep strict text fidelity tied to geometry mode unless explicitly
-            # overridden. Labels mode is more robust with relaxed fitting.
-            config.strict_text_fidelity = text_mode == "geometry"
+            # Strict fidelity is always on for BCS-ARCH-001. Host adapter
+            # may relax only if operator explicitly passes the override.
+            config.strict_text_fidelity = True
     if "strict_text_fidelity" in ui_config:
         config.strict_text_fidelity = bool(ui_config["strict_text_fidelity"])
     if "detect_arcs" in ui_config:
@@ -784,8 +780,9 @@ def import_pdf(
 
     Args:
         filepath: Absolute path to the PDF file.
-        config: Dict with keys like 'preset', 'pages', 'text_mode',
-                'detect_arcs', 'make_faces', 'group_by_color', 'map_dashes'.
+        config: Dict with keys like 'mode', 'pages', 'text_mode',
+                'import_text', 'detect_arcs', 'make_faces',
+                'group_by_color', 'map_dashes'.
         progress_callback: Optional callable(progress_float, message_str).
         context: Optional bpy.context for Blender window-manager progress bar.
                  Pass None for CLI/headless mode.
@@ -869,8 +866,8 @@ def import_pdf(
         if auto_hide_default_cube:
             hidden_startup_cube = _auto_hide_default_cube(bpy.context.scene)
 
-        # 3. Build ImportConfig from preset + overrides
-        import_cfg = _config_from_preset(config.get("preset", "shop"))
+        # 3. Build ImportConfig from mode + overrides (BCS-ARCH-001)
+        import_cfg = _config_from_mode(config.get("mode", "auto"))
         import_cfg = _apply_overrides(import_cfg, config)
 
         # 4. Reset pdfcadcore ID counter

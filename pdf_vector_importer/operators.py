@@ -15,25 +15,21 @@ from bpy.props import BoolProperty, EnumProperty, FloatProperty, StringProperty
 from bpy_extras.io_utils import ImportHelper
 
 
-# ── Preset enum items ────────────────────────────────────────────────
-_PRESET_ITEMS = [
-    ("fast", "Fast Preview", "Speed over fidelity — no text, no arcs, no faces"),
-    ("general", "General Vector", "Good for most PDFs — balanced quality"),
-    ("technical", "Technical Drawing", "Engineering drawings — arcs, dashes, faces"),
-    ("shop", "Shop Drawing", "Fabrication drawings — full fidelity (default)"),
-    (
-        "raster_vector",
-        "Raster + Vectors",
-        "Import both raster images and vector geometry",
-    ),
-    ("raster_only", "Raster Only", "Import only raster/image content from the PDF"),
-    ("max", "Max Fidelity", "Highest accuracy — slowest import"),
+# ── Mode enum items (BCS-ARCH-001) ───────────────────────────────────
+_MODE_ITEMS = [
+    ("auto",   "Auto",   "Analyze and pick Vector/Raster/Hybrid automatically"),
+    ("vector", "Vector", "Extract all vector geometry faithfully"),
+    ("raster", "Raster", "Place as high-DPI image (scanned PDFs)"),
+    ("hybrid", "Hybrid", "Vectors where clean, raster where lossy"),
 ]
 
+# Text rendering is orthogonal to mode. A separate ``import_text``
+# boolean toggles whether text is imported at all.
 _TEXT_MODE_ITEMS = [
-    ("none", "None", "Do not import text"),
-    ("labels", "Labels", "Import text as Blender text objects (default)"),
-    ("geometry", "Geometry", "Convert text to mesh geometry"),
+    ("labels",   "Labels",   "Import text as Blender text objects (default)"),
+    ("3d_text",  "3D Text",  "Extruded geometric text"),
+    ("glyphs",   "Glyphs",   "Text rendered as per-character vector glyphs"),
+    ("geometry", "Geometry", "Convert text fully to non-editable geometry"),
 ]
 
 _VISUAL_STYLE_ITEMS = [
@@ -69,11 +65,11 @@ class IMPORT_OT_pdf_vector(bpy.types.Operator, ImportHelper):
     filter_glob: StringProperty(default="*.pdf", options={"HIDDEN"})  # type: ignore[assignment]
 
     # ── Properties ───────────────────────────────────────────────────
-    preset: EnumProperty(  # type: ignore[assignment]
-        name="Preset",
-        description="Import quality preset",
-        items=_PRESET_ITEMS,
-        default="shop",
+    mode: EnumProperty(  # type: ignore[assignment]
+        name="Mode",
+        description="Import mode (BCS-ARCH-001)",
+        items=_MODE_ITEMS,
+        default="auto",
     )
 
     pages: StringProperty(  # type: ignore[assignment]
@@ -82,9 +78,15 @@ class IMPORT_OT_pdf_vector(bpy.types.Operator, ImportHelper):
         default="all",
     )
 
+    import_text: BoolProperty(  # type: ignore[assignment]
+        name="Import Text",
+        description="Import text from the PDF (orthogonal to Mode)",
+        default=True,
+    )
+
     text_mode: EnumProperty(  # type: ignore[assignment]
         name="Text Mode",
-        description="How to handle text in the PDF",
+        description="How imported text is represented in the scene",
         items=_TEXT_MODE_ITEMS,
         default="labels",
     )
@@ -210,8 +212,9 @@ class IMPORT_OT_pdf_vector(bpy.types.Operator, ImportHelper):
 
         # Build config dict from operator properties
         config = {
-            "preset": self.preset,
+            "mode": self.mode,
             "pages": self.pages,
+            "import_text": self.import_text,
             "text_mode": self.text_mode,
             "detect_arcs": self.detect_arcs,
             "make_faces": self.make_faces,
@@ -285,8 +288,8 @@ class IMPORT_OT_pdf_vector(bpy.types.Operator, ImportHelper):
     def draw(self, context):
         layout = self.layout
 
-        # Preset selector
-        layout.prop(self, "preset")
+        # Mode selector (BCS-ARCH-001)
+        layout.prop(self, "mode")
         layout.separator()
 
         # Page selection
@@ -296,7 +299,10 @@ class IMPORT_OT_pdf_vector(bpy.types.Operator, ImportHelper):
         # Individual options
         box = layout.box()
         box.label(text="Options", icon="PREFERENCES")
-        box.prop(self, "text_mode")
+        box.prop(self, "import_text")
+        sub = box.row()
+        sub.enabled = self.import_text
+        sub.prop(self, "text_mode")
         box.prop(self, "detect_arcs")
         box.prop(self, "make_faces")
         box.prop(self, "ignore_fill_only_shapes")

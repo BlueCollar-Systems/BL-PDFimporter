@@ -17,12 +17,10 @@ def _collect_pdfs(root: Path, recursive: bool) -> list[Path]:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Batch-parse PDF vectors for Blender workflows.")
     p.add_argument("input_dir", help="Directory containing PDF files")
-    p.add_argument("--preset", default="technical",
-                   choices=["fast", "general", "technical", "shop", "raster_vector", "raster_only", "max"],
-                   help="Import preset")
+    p.add_argument("--mode", default="auto",
+                   choices=["auto", "vector", "raster", "hybrid"],
+                   help="Import mode (BCS-ARCH-001)")
     p.add_argument("--pages", default="all", help="Page spec (default: all)")
-    p.add_argument("--mode", choices=["auto", "vectors", "raster", "hybrid"], default=None,
-                   help="Optional import mode override")
     p.add_argument("--recursive", action="store_true", help="Include subfolders")
     p.add_argument("--summary-dir", default=None,
                    help="Optional directory to write per-file summaries")
@@ -48,10 +46,8 @@ def main() -> int:
 
     for pdf in pdfs:
         overrides = {"pages": args.pages}
-        if args.mode:
-            overrides["import_mode"] = args.mode
         try:
-            run = run_import(str(pdf), preset=args.preset, overrides=overrides)
+            run = run_import(str(pdf), mode=args.mode, overrides=overrides)
             summary = run.extraction.summary()
             aggregate["passed"] += 1
             entry = {"pdf": str(pdf), "status": "PASS", "summary": summary}

@@ -84,7 +84,7 @@ python -m pytest tests/ -v
 Run batch import summaries across a folder of PDFs:
 
 ```bash
-python -m blender_pdf_vector_importer.batch_cli "C:\path\to\pdfs" --recursive --preset technical --pages all --json batch_report.json
+python -m blender_pdf_vector_importer.batch_cli "C:\path\to\pdfs" --recursive --mode auto --pages all --json batch_report.json
 ```
 
 ## Project Structure
