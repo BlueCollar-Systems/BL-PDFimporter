@@ -16,8 +16,8 @@ MM_TO_M = 0.001
 class BlenderImportOptions:
     pages: Optional[str] = None
     import_text: bool = True
+    text_mode: str = "3d_text"
     import_images: bool = True
-    detect_arcs: bool = True
     group_by_layer: bool = True
     group_by_color: bool = True
 
@@ -32,9 +32,8 @@ def import_into_blender(pdf_path: str, mode: str = "auto",
     opts = options or BlenderImportOptions()
     overrides = {
         "import_text": opts.import_text,
-        "text_mode": "labels",
+        "text_mode": opts.text_mode,
         "ignore_images": not opts.import_images,
-        "detect_arcs": opts.detect_arcs,
     }
     if opts.pages:
         overrides["pages"] = opts.pages

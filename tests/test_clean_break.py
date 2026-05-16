@@ -11,6 +11,9 @@ from pathlib import Path
 TEST_PDF = Path(r"C:\Users\Rowdy Payton\Desktop\PDFTest Files\1015 - Rev 0.pdf")
 REPO_ROOT = Path(__file__).resolve().parents[1]
 OPERATORS_PY = REPO_ROOT / "pdf_vector_importer" / "operators.py"
+LEGACY_ADDON_INIT_PY = REPO_ROOT / "blender_pdf_vector_importer" / "__init__.py"
+ADDON_CONFIG_PY = REPO_ROOT / "pdf_vector_importer" / "pdfcadcore" / "import_config.py"
+CLI_CONFIG_PY = REPO_ROOT / "blender_pdf_vector_importer" / "core" / "PDFImportConfig.py"
 
 
 def _run_cli(*args: str) -> subprocess.CompletedProcess:
@@ -102,6 +105,38 @@ class TestRule5OperatorPropsRemoved(unittest.TestCase):
                 attr, self.source,
                 f"Operator still references {attr!r} after Rule 5 sweep.",
             )
+
+    def test_text_default_is_scale_stable(self) -> None:
+        self.assertIn('default="3d_text"', self.source)
+        self.assertNotIn('default="labels"', self.source)
+        self.assertNotIn("Import text as Blender text objects (default)", self.source)
+
+    def test_no_legacy_preset_labels(self) -> None:
+        for label in (
+            "Fast", "Balanced", "Full", "Max Fidelity", "Raster Image",
+            "Custom...", "Shop Drawing", "Technical Drawing",
+        ):
+            self.assertNotIn(
+                f'"{label}"', self.source,
+                f"Operator still references legacy preset label {label!r}.",
+            )
+
+
+class TestTextDefaults(unittest.TestCase):
+    """Core config defaults must not silently return to Labels."""
+
+    def test_embedded_configs_default_to_3d_text(self) -> None:
+        for path in (ADDON_CONFIG_PY, CLI_CONFIG_PY):
+            source = path.read_text(encoding="utf-8")
+            self.assertIn('text_mode: str = "3d_text"', source)
+            self.assertNotIn('text_mode: str = "labels"', source)
+
+    def test_legacy_addon_entrypoint_has_text_mode_not_arc_dial(self) -> None:
+        source = LEGACY_ADDON_INIT_PY.read_text(encoding="utf-8")
+        self.assertIn('name="Text Mode"', source)
+        self.assertIn('default="3d_text"', source)
+        self.assertNotIn('detect_arcs: BoolProperty', source)
+        self.assertNotIn('layout.prop(self, "detect_arcs")', source)
 
 
 if __name__ == "__main__":

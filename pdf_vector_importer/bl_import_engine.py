@@ -691,7 +691,7 @@ def _apply_overrides(config: ImportConfig, ui_config: dict) -> ImportConfig:
     if "import_text" in ui_config:
         config.import_text = bool(ui_config["import_text"])
     if "text_mode" in ui_config:
-        text_mode = str(ui_config["text_mode"] or "labels").strip().lower()
+        text_mode = str(ui_config["text_mode"] or "3d_text").strip().lower()
         config.text_mode = text_mode
         if "strict_text_fidelity" not in ui_config:
             # Strict fidelity is always on for BCS-ARCH-001. Host adapter

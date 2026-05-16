@@ -46,9 +46,19 @@ try:  # pragma: no cover - Blender runtime only
             description="Page selection: 1, 1,3-5, or all",
         )
 
+        text_mode: EnumProperty(
+            name="Text Mode",
+            items=[
+                ("labels", "Labels", "Import text as Blender text objects"),
+                ("3d_text", "3D Text", "Extruded geometric text"),
+                ("geometry", "Geometry", "Convert text fully to non-editable geometry"),
+                ("glyphs", "Glyphs", "Text rendered as per-character vector glyphs"),
+            ],
+            default="3d_text",
+        )
+
         import_text: BoolProperty(name="Import Text", default=True)
         import_images: BoolProperty(name="Import Images", default=True)
-        detect_arcs: BoolProperty(name="Reconstruct Arcs", default=True)
         group_by_layer: BoolProperty(name="Group By Layer", default=True)
         group_by_color: BoolProperty(name="Tag Color Groups", default=True)
 
@@ -56,8 +66,8 @@ try:  # pragma: no cover - Blender runtime only
             options = BlenderImportOptions(
                 pages=self.pages,
                 import_text=self.import_text,
+                text_mode=self.text_mode,
                 import_images=self.import_images,
-                detect_arcs=self.detect_arcs,
                 group_by_layer=self.group_by_layer,
                 group_by_color=self.group_by_color,
             )
@@ -76,8 +86,8 @@ try:  # pragma: no cover - Blender runtime only
             layout.prop(self, "mode")
             layout.prop(self, "pages")
             layout.prop(self, "import_text")
+            layout.prop(self, "text_mode")
             layout.prop(self, "import_images")
-            layout.prop(self, "detect_arcs")
             layout.prop(self, "group_by_layer")
             layout.prop(self, "group_by_color")
 

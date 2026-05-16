@@ -32,7 +32,7 @@ _MODE_ITEMS = [
 # Text rendering is orthogonal to mode. A separate ``import_text``
 # boolean toggles whether text is imported at all.
 _TEXT_MODE_ITEMS = [
-    ("labels",   "Labels",   "Import text as Blender text objects (default)"),
+    ("labels",   "Labels",   "Import text as Blender text objects"),
     ("3d_text",  "3D Text",  "Extruded geometric text"),
     ("glyphs",   "Glyphs",   "Text rendered as per-character vector glyphs"),
     ("geometry", "Geometry", "Convert text fully to non-editable geometry"),
@@ -94,7 +94,7 @@ class IMPORT_OT_pdf_vector(bpy.types.Operator, ImportHelper):
         name="Text Mode",
         description="How imported text is represented in the scene",
         items=_TEXT_MODE_ITEMS,
-        default="labels",
+        default="3d_text",
     )
 
     group_by_color: BoolProperty(  # type: ignore[assignment]
