@@ -562,7 +562,7 @@ def _render_page_raster(page, page_num: int, import_cfg, image_dir: str) -> Opti
     except ImportError:
         import fitz  # type: ignore
 
-    dpi = int(max(36, getattr(import_cfg, "raster_dpi", 200) or 200))
+    dpi = int(max(36, getattr(import_cfg, "raster_dpi", 300) or 300))
     zoom = dpi / 72.0
     matrix = fitz.Matrix(zoom, zoom)
 

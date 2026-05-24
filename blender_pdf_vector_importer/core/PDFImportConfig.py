@@ -70,7 +70,7 @@ class ImportConfig:
     hatch_mode: str = "import"              # "import" | "skip" | "group"
     ignore_images: bool = False
     raster_fallback: bool = True
-    raster_dpi: int = 200
+    raster_dpi: int = 300
     import_mode: str = "auto"               # "auto" | "vector" | "raster" | "hybrid"
     max_bezier_segments: int = 128
 

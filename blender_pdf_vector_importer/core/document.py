@@ -120,7 +120,7 @@ class ExtractionOptions:
     import_images: bool = True
     import_mode: str = "auto"
     raster_fallback: bool = True
-    raster_dpi: int = 200
+    raster_dpi: int = 300
     detect_arcs: bool = True
     arc_fit_tol_mm: float = 0.20
     min_arc_span_deg: float = 8.0
@@ -558,7 +558,7 @@ def _render_page_raster(page: fitz.Page, page_number: int, options: ExtractionOp
     if image_dir is None:
         return None
 
-    dpi = int(max(36, options.raster_dpi or 200))
+    dpi = int(max(36, options.raster_dpi or 300))
     zoom = dpi / 72.0
     matrix = fitz.Matrix(zoom, zoom)
 
