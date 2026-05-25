@@ -52,6 +52,8 @@ Geometry is grouped into collections by page and (optionally) by source layer or
 
 ## Compatibility
 
+See **[COMPATIBILITY.md](COMPATIBILITY.md)** for the full matrix. Summary:
+
 | Blender Version | Bundled Python | PyMuPDF | Status |
 |----------------|---------------|---------|--------|
 | 3.6 LTS | 3.10 | >=1.24,<2.0 | ⚠️ Expected |
