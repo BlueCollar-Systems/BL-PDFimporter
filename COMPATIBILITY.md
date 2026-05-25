@@ -3,6 +3,8 @@
 Modes are extraction **strategy** (Auto / Vector / Raster / Hybrid), not quality tiers.
 Every mode uses consolidated maximum-fidelity parameters (BCS-ARCH-001).
 
+**GUI:** Single **professional import** flow — **Auto** per page by default. Expand **Advanced Options** to override strategy. CLI/batch retain `--mode` for scripting.
+
 ## Blender
 
 | Blender | Bundled Python | PyMuPDF | Status |

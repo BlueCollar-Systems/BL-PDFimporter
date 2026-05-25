@@ -29,8 +29,15 @@ try:  # pragma: no cover - Blender runtime only
         filename_ext = ".pdf"
         filter_glob: StringProperty(default="*.pdf", options={"HIDDEN"})
 
+        show_advanced: BoolProperty(
+            name="Advanced Options",
+            description="Show import strategy override (Vector / Raster / Hybrid)",
+            default=False,
+            options={"SKIP_SAVE"},
+        )
+
         mode: EnumProperty(
-            name="Mode",
+            name="Import Strategy",
             items=[
                 ("auto", "Auto", "Analyze and pick Vector/Raster/Hybrid automatically"),
                 ("vector", "Vector", "Extract all vector geometry faithfully"),
@@ -72,7 +79,10 @@ try:  # pragma: no cover - Blender runtime only
                 group_by_color=self.group_by_color,
             )
 
-            extraction = import_into_blender(self.filepath, mode=self.mode, options=options)
+            effective_mode = self.mode if self.show_advanced else "auto"
+            extraction = import_into_blender(
+                self.filepath, mode=effective_mode, options=options
+            )
             summary = extraction.summary()
             self.report(
                 {"INFO"},
@@ -83,7 +93,12 @@ try:  # pragma: no cover - Blender runtime only
 
         def draw(self, context):
             layout = self.layout
-            layout.prop(self, "mode")
+            layout.label(
+                text="Professional import — maximum fidelity; Auto per page."
+            )
+            layout.prop(self, "show_advanced")
+            if self.show_advanced:
+                layout.prop(self, "mode")
             layout.prop(self, "pages")
             layout.prop(self, "import_text")
             layout.prop(self, "text_mode")

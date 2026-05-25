@@ -78,6 +78,28 @@ class TestRule5FlagsRemoved(unittest.TestCase):
                 )
 
 
+class TestBlGuiProfessionalImport(unittest.TestCase):
+    """Import operator: professional copy; strategy only in Advanced."""
+
+    def setUp(self) -> None:
+        self.source = OPERATORS_PY.read_text(encoding="utf-8")
+
+    def test_professional_import_tagline(self) -> None:
+        self.assertIn("Professional import", self.source)
+
+    def test_show_advanced_gates_mode(self) -> None:
+        self.assertIn("show_advanced", self.source)
+        self.assertIn("effective_mode = self.mode if self.show_advanced else \"auto\"", self.source)
+
+    def test_draw_hides_mode_unless_advanced(self) -> None:
+        self.assertIn("if self.show_advanced:", self.source)
+        self.assertNotIn('layout.prop(self, "mode")\n        layout.separator()', self.source)
+
+    def test_all_four_text_modes_in_ui(self) -> None:
+        for key in ("labels", "3d_text", "glyphs", "geometry"):
+            self.assertIn(f'("{key}"', self.source)
+
+
 class TestRule5OperatorPropsRemoved(unittest.TestCase):
     """Operator must not expose quality-tier BoolProperties (UI strip)."""
 

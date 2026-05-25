@@ -71,9 +71,19 @@ class IMPORT_OT_pdf_vector(bpy.types.Operator, ImportHelper):
     filter_glob: StringProperty(default="*.pdf", options={"HIDDEN"})  # type: ignore[assignment]
 
     # ── Properties ───────────────────────────────────────────────────
+    show_advanced: BoolProperty(  # type: ignore[assignment]
+        name="Advanced Options",
+        description="Show import strategy override (Vector / Raster / Hybrid)",
+        default=False,
+        options={"SKIP_SAVE"},
+    )
+
     mode: EnumProperty(  # type: ignore[assignment]
-        name="Mode",
-        description="Import mode (BCS-ARCH-001)",
+        name="Import Strategy",
+        description=(
+            "Override Auto with a fixed strategy for all pages (Advanced only). "
+            "Every strategy targets maximum fidelity (BCS-ARCH-001)."
+        ),
         items=_MODE_ITEMS,
         default="auto",
     )
@@ -196,8 +206,9 @@ class IMPORT_OT_pdf_vector(bpy.types.Operator, ImportHelper):
         # BCS-ARCH-001 Rule 5: detect_arcs / make_faces / map_dashes /
         # ignore_fill_only_shapes are no longer user-adjustable. Their
         # consolidated defaults come from pdfcadcore.ImportConfig.
+        effective_mode = self.mode if self.show_advanced else "auto"
         config = {
-            "mode": self.mode,
+            "mode": effective_mode,
             "pages": self.pages,
             "import_text": self.import_text,
             "text_mode": self.text_mode,
@@ -269,16 +280,24 @@ class IMPORT_OT_pdf_vector(bpy.types.Operator, ImportHelper):
     def draw(self, context):
         layout = self.layout
 
-        # Mode selector (BCS-ARCH-001)
-        layout.prop(self, "mode")
+        layout.label(
+            text="Professional import — maximum fidelity; Auto picks "
+            "vector, raster, or hybrid per page.",
+            icon="INFO",
+        )
         layout.separator()
 
         # Page selection
         layout.prop(self, "pages")
         layout.separator()
 
-        # Individual options (BCS-ARCH-001 Rule 5 — only Mode, Text, and
-        # Import Text are user-facing. Other quality dials are baked in.)
+        adv = layout.box()
+        adv.prop(self, "show_advanced", icon="MODIFIER")
+        if self.show_advanced:
+            adv.prop(self, "mode")
+
+        # Individual options (BCS-ARCH-001 Rule 5 — Text + Import Text;
+        # strategy override is Advanced-only. Other quality dials are baked in.)
         box = layout.box()
         box.label(text="Options", icon="PREFERENCES")
         box.prop(self, "import_text")
