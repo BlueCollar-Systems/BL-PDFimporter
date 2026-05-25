@@ -27,15 +27,12 @@ def ensure_lib_path() -> None:
 
 
 def check_pymupdf() -> bool:
-    """Check whether PyMuPDF (fitz) is importable."""
+    """Check whether PyMuPDF (fitz) is importable and exposes ``open``."""
     ensure_lib_path()
     try:
-        import pymupdf as fitz  # noqa: F401  — PyMuPDF >= 1.24 preferred name
-        return True
-    except ImportError:
-        pass
-    try:
-        import fitz  # noqa: F401  — Legacy fallback
+        from pdfcadcore.fitz_loader import import_fitz
+
+        import_fitz(prefer_lib_dir=str(get_lib_dir()))
         return True
     except ImportError:
         return False
