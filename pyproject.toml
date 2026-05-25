@@ -18,7 +18,17 @@ dependencies = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["pdf_vector_importer*"]
+include = ["pdf_vector_importer*", "blender_pdf_vector_importer*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+norecursedirs = [
+  "dist",
+  "build",
+  ".git",
+  "__pycache__",
+]
 
 [tool.ruff]
 target-version = "py310"

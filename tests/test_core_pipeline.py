@@ -10,12 +10,12 @@ try:
 except ImportError:
     import fitz  # Legacy fallback
 
-from blender_pdf_vector_importer.core.PDFPrimitiveExtractor import (
+from pdf_vector_importer.pdfcadcore.primitive_extractor import (
     _merge_stacked_fractions,
     _norm_color,
     extract_page,
 )
-from blender_pdf_vector_importer.core.PDFPrimitives import NormalizedText
+from pdf_vector_importer.pdfcadcore.primitives import NormalizedText
 from blender_pdf_vector_importer.core.document import ExtractionOptions, extract_document
 from blender_pdf_vector_importer.importer import apply_uniform_scale, run_import
 
