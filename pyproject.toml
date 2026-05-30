@@ -37,6 +37,7 @@ exclude = [
   "build",
   "__pycache__",
   ".ruff_cache",
+  "pdf_vector_importer/lib",
 ]
 
 [tool.ruff.lint]
