@@ -122,7 +122,7 @@ def write_import_report(
     output_path: Optional[str] = None,
 ) -> str:
     """Emit bcs.import_report/1.1 JSON for one import run."""
-    from .pdfcadcore.import_report import build_import_report
+    from .pdfcadcore.import_report import build_actual_text_entity_types, build_import_report
 
     path = (
         output_path
@@ -145,6 +145,21 @@ def write_import_report(
     text_source_spans = int(stats.get("text_source_spans", stats.get("text_items", 0)) or 0)
     text_glyph_estimate = int(stats.get("text_glyph_estimate", 0) or 0)
 
+    text_mode = str(config.get("text_mode") or "3d_text")
+    extra = {
+        "curves": int(stats.get("curves", 0) or 0),
+        "meshes": int(stats.get("meshes", 0) or 0),
+        "images": int(stats.get("images", 0) or 0),
+        "resolved_scale": stats.get("resolved_scale"),
+        "scale_hints": stats.get("scale_hints"),
+    }
+    if bool(config.get("import_text", True)) and text_mode != "none":
+        extra["actual_text_entity_types"] = build_actual_text_entity_types(
+            host_app="blender",
+            text_mode=text_mode,
+            count=int(stats.get("text_items", 0) or 0),
+        )
+
     report = build_import_report(
         host_app="blender",
         host_version=_blender_host_version(),
@@ -166,16 +181,10 @@ def write_import_report(
         fallback_reason=fallback_reason,
         pdf_engine_version=_pymupdf_version(),
         import_text=bool(config.get("import_text", True)),
-        text_mode=str(config.get("text_mode") or "3d_text"),
+        text_mode=text_mode,
         text_source_spans=text_source_spans,
         text_glyph_estimate=text_glyph_estimate,
-        extra={
-            "curves": int(stats.get("curves", 0) or 0),
-            "meshes": int(stats.get("meshes", 0) or 0),
-            "images": int(stats.get("images", 0) or 0),
-            "resolved_scale": stats.get("resolved_scale"),
-            "scale_hints": stats.get("scale_hints"),
-        },
+        extra=extra,
     )
     report.write_json(path)
     return path

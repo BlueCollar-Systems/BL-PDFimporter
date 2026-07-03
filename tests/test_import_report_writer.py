@@ -99,6 +99,8 @@ class TestImportReportWriter(unittest.TestCase):
             self.assertEqual(data["extra"]["text_mode"], "glyphs")
             self.assertEqual(data["extra"]["text_source_spans"], 4)
             self.assertEqual(data["extra"]["text_glyph_estimate"], 22)
+            self.assertEqual(data["extra"]["actual_text_entity_types"]["entity_type"], "glyphs")
+            self.assertEqual(data["extra"]["actual_text_entity_types"]["outline_curve_or_mesh"], 3)
             diagnostics = data["extra"]["diagnostics"]
             self.assertEqual(diagnostics["quality_level"], "low")
             self.assertIn("text_mode_glyphs", diagnostics["signals"])
