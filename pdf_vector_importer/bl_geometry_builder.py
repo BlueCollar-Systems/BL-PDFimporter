@@ -529,6 +529,72 @@ def _create_face_mesh(
     return obj
 
 
+def _polygon_area(points: list) -> float:
+    if len(points) < 3:
+        return 0.0
+    area = 0.0
+    for i, (x0, y0) in enumerate(points):
+        x1, y1 = points[(i + 1) % len(points)]
+        area += (x0 * y1) - (x1 * y0)
+    return abs(area) * 0.5
+
+
+def _dedupe_closed_points(points: list) -> list:
+    pts = list(points or [])
+    if len(pts) >= 2:
+        first = pts[0]
+        last = pts[-1]
+        try:
+            if abs(first[0] - last[0]) <= 1e-9 and abs(first[1] - last[1]) <= 1e-9:
+                pts = pts[:-1]
+        except Exception:
+            pass
+    return pts
+
+
+def _create_extruded_mesh(
+    name: str,
+    points: list,
+    collection: bpy.types.Collection,
+    material: bpy.types.Material,
+    depth_m: float,
+    z_offset_m: float = 0.0,
+) -> Optional[bpy.types.Object]:
+    """Create a simple prism mesh from a closed 2D polygon."""
+    pts = _dedupe_closed_points(points)
+    if len(pts) < 3 or depth_m <= 0.0:
+        return None
+
+    mesh = bpy.data.meshes.new(name=name)
+    obj = bpy.data.objects.new(name, mesh)
+    collection.objects.link(obj)
+
+    bm = bmesh.new()
+    bottom = [bm.verts.new((x * MM_TO_M, y * MM_TO_M, z_offset_m)) for x, y in pts]
+    top = [bm.verts.new((x * MM_TO_M, y * MM_TO_M, z_offset_m + depth_m)) for x, y in pts]
+    bm.verts.ensure_lookup_table()
+
+    try:
+        bm.faces.new(bottom)
+    except ValueError:
+        pass
+    try:
+        bm.faces.new(list(reversed(top)))
+    except ValueError:
+        pass
+    for i in range(len(pts)):
+        j = (i + 1) % len(pts)
+        try:
+            bm.faces.new((bottom[i], bottom[j], top[j], top[i]))
+        except ValueError:
+            pass
+
+    bm.to_mesh(mesh)
+    bm.free()
+    mesh.materials.append(material)
+    return obj
+
+
 def _primitive_area_ratio(prim: Primitive, page_area: float) -> float:
     """Best-effort area ratio of a primitive relative to the page area."""
     if page_area <= 1e-9:
@@ -552,6 +618,55 @@ def _primitive_area_ratio(prim: Primitive, page_area: float) -> float:
         except Exception:
             pass
     return 0.0
+
+
+def _model3d_mode(config: dict) -> str:
+    mode = str(config.get("model3d_mode", "off") or "off").strip().lower()
+    if mode in {"yes", "true", "on", "auto_if_evidence"}:
+        return "auto"
+    if mode in {"closed", "closed_shapes", "extrude_closed_shapes", "force"}:
+        return "extrude"
+    return mode if mode in {"off", "auto", "extrude"} else "off"
+
+
+def _model3d_primitive_area(prim: Primitive, points: Optional[list] = None) -> float:
+    try:
+        if prim.area is not None and abs(float(prim.area)) > 0.0:
+            return abs(float(prim.area))
+    except Exception:
+        pass
+    if prim.type == "circle" and prim.radius:
+        try:
+            return math.pi * float(prim.radius) * float(prim.radius)
+        except Exception:
+            return 0.0
+    return _polygon_area(points or prim.points or [])
+
+
+def _model3d_should_extrude(
+    prim: Primitive,
+    page_area: float,
+    has_fill: bool,
+    config: dict,
+    points: Optional[list] = None,
+) -> bool:
+    mode = _model3d_mode(config)
+    if mode == "off":
+        return False
+    try:
+        depth_m = float(config.get("model3d_depth_m", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        depth_m = 0.0
+    if depth_m <= 0.0:
+        return False
+    area = _model3d_primitive_area(prim, points)
+    if area <= 1e-6:
+        return False
+    if page_area > 1e-9 and area / page_area >= 0.80:
+        return False
+    if mode == "auto":
+        return bool(config.get("model3d_intent_feasible")) and has_fill
+    return True
 
 
 def _is_background_fill_primitive(prim: Primitive, page_area: float) -> bool:
@@ -620,6 +735,7 @@ def build_page(
         "batched_curve_primitives": 0,
         "batched_curve_runs": 0,
         "batched_curve_objects": 0,
+        "model3d_solids": 0,
     }
     page_area = max(float(page_data.width or 0.0) * float(page_data.height or 0.0), 1e-9)
     prims = page_data.primitives or []
@@ -776,6 +892,7 @@ def build_page(
             fill_face_z = line_z_offset_m - max(0.0005, (_MIN_BEVEL_DEPTH * 1.5))
 
             if prim.center and prim.radius:
+                circle_points = _circle_polygon_points(prim.center, prim.radius)
                 if make_faces and has_fill:
                     fill_mat = _get_or_create_material(
                         prim.fill_color or prim.stroke_color,
@@ -784,12 +901,28 @@ def build_page(
                     )
                     _create_face_mesh(
                         obj_name + "_face",
-                        _circle_polygon_points(prim.center, prim.radius),
+                        circle_points,
                         target_col,
                         fill_mat,
                         z_offset_m=fill_face_z,
                     )
                     stats["meshes"] += 1
+                if _model3d_should_extrude(prim, page_area, has_fill, config, circle_points):
+                    solid_mat = _get_or_create_material(
+                        prim.fill_color or prim.stroke_color,
+                        material_cache,
+                        style=visual_style,
+                    )
+                    if _create_extruded_mesh(
+                        obj_name + "_solid",
+                        circle_points,
+                        target_col,
+                        solid_mat,
+                        float(config.get("model3d_depth_m", 0.0) or 0.0),
+                        z_offset_m=fill_face_z,
+                    ):
+                        stats["meshes"] += 1
+                        stats["model3d_solids"] += 1
 
                 if has_stroke or not has_fill:
                     _create_nurbs_circle(
@@ -817,6 +950,22 @@ def build_page(
                         z_offset_m=fill_face_z,
                     )
                     stats["meshes"] += 1
+                if _model3d_should_extrude(prim, page_area, has_fill, config, prim.points):
+                    solid_mat = _get_or_create_material(
+                        prim.fill_color or prim.stroke_color,
+                        material_cache,
+                        style=visual_style,
+                    )
+                    if _create_extruded_mesh(
+                        obj_name + "_solid",
+                        prim.points,
+                        target_col,
+                        solid_mat,
+                        float(config.get("model3d_depth_m", 0.0) or 0.0),
+                        z_offset_m=fill_face_z,
+                    ):
+                        stats["meshes"] += 1
+                        stats["model3d_solids"] += 1
                 if has_stroke or not has_fill:
                     # Closed polyline fallback
                     _create_poly_curve(
@@ -861,6 +1010,17 @@ def build_page(
                 if create_outline:
                     stats["curves"] += 1
                 stats["meshes"] += 1
+                if _model3d_should_extrude(prim, page_area, has_fill, config, prim.points):
+                    if _create_extruded_mesh(
+                        obj_name + "_solid",
+                        prim.points,
+                        target_col,
+                        face_mat,
+                        float(config.get("model3d_depth_m", 0.0) or 0.0),
+                        z_offset_m=face_z,
+                    ):
+                        stats["meshes"] += 1
+                        stats["model3d_solids"] += 1
             elif create_outline:
                 _create_poly_curve(
                     obj_name, prim.points, True, target_col,
@@ -868,6 +1028,17 @@ def build_page(
                     z_offset_m=line_z_offset_m,
                 )
                 stats["curves"] += 1
+                if _model3d_should_extrude(prim, page_area, has_fill, config, prim.points):
+                    if _create_extruded_mesh(
+                        obj_name + "_solid",
+                        prim.points,
+                        target_col,
+                        mat,
+                        float(config.get("model3d_depth_m", 0.0) or 0.0),
+                        z_offset_m=face_z,
+                    ):
+                        stats["meshes"] += 1
+                        stats["model3d_solids"] += 1
 
         else:
             # Unknown type — best effort as polyline

@@ -213,6 +213,8 @@ def write_import_report(
         "curves": int(stats.get("curves", 0) or 0),
         "meshes": int(stats.get("meshes", 0) or 0),
         "images": int(stats.get("images", 0) or 0),
+        "model_3d_intent": stats.get("model_3d_intent"),
+        "model_3d": stats.get("model_3d"),
         "resolved_scale": stats.get("resolved_scale"),
         "scale_hints": stats.get("scale_hints"),
     }
@@ -970,6 +972,14 @@ def _apply_overrides(config: ImportConfig, ui_config: dict) -> ImportConfig:
         config.group_by_color = ui_config["group_by_color"]
     if "map_dashes" in ui_config:
         config.map_dashes = ui_config["map_dashes"]
+    if "model3d_mode" in ui_config:
+        mode = str(ui_config["model3d_mode"] or "off").strip().lower()
+        config.model3d_mode = mode if mode in {"off", "auto", "extrude"} else "off"
+    if "model3d_depth_mm" in ui_config:
+        try:
+            config.model3d_depth_mm = max(0.01, float(ui_config["model3d_depth_mm"]))
+        except (TypeError, ValueError):
+            config.model3d_depth_mm = 3.175
     return config
 
 
@@ -1178,6 +1188,8 @@ def import_pdf(
             "map_dashes": import_cfg.map_dashes,
             "visual_style": visual_style,
             "line_z_offset_m": line_z_offset_m,
+            "model3d_mode": getattr(import_cfg, "model3d_mode", "off"),
+            "model3d_depth_m": float(getattr(import_cfg, "model3d_depth_mm", 3.175) or 3.175) * _MM_TO_M,
         }
 
         # 9. Process each page
@@ -1189,9 +1201,11 @@ def import_pdf(
             "hidden_startup_cube": hidden_startup_cube,
             "text_source_spans": 0,
             "text_glyph_estimate": 0,
+            "model3d_solids": 0,
         }
         raster_pages_imported = 0
         total_page_count = max(1, len(page_indices))
+        model3d_all_text = []
 
         def _page_progress(page_offset: int, stage: float) -> float:
             stage_clamped = max(0.0, min(1.0, float(stage)))
@@ -1293,6 +1307,7 @@ def import_pdf(
                 len(str(getattr(item, "text", "") or ""))
                 for item in (page_data.text_items or [])
             )
+            model3d_all_text.extend(page_data.text_items or [])
 
             # 9c. Geometry cleanup (remove micro-segments)
             if import_cfg.cleanup_level != "conservative" or import_cfg.min_seg_len > 0:
@@ -1359,6 +1374,14 @@ def import_pdf(
             # 9g. Build geometry
             page_stats = {"curves": 0, "meshes": 0, "circles": 0, "arcs": 0}
             if import_mode != "raster":
+                page_builder_config = dict(builder_config)
+                try:
+                    from .pdfcadcore.model3d_intent import analyze_model3d_intent
+
+                    page_intent = analyze_model3d_intent(page_data.text_items or [], host_supports_3d=True)
+                    page_builder_config["model3d_intent_feasible"] = bool(page_intent.feasible)
+                except (ImportError, RuntimeError, TypeError, ValueError, AttributeError):
+                    page_builder_config["model3d_intent_feasible"] = False
                 _progress(_page_progress(i, 0.72), f"Building geometry for page {page_num}...")
                 t_phase = time.perf_counter()
                 def _geom_progress(frac, _i=i, _pn=page_num):
@@ -1370,7 +1393,7 @@ def import_pdf(
                 page_stats = build_page(
                     page_data,
                     page_col,
-                    builder_config,
+                    page_builder_config,
                     progress_callback=_geom_progress,
                 )
                 _add_phase_ms("geometry_ms", t_phase)
@@ -1456,6 +1479,7 @@ def import_pdf(
             total_stats["arcs"] += page_stats.get("arcs", 0)
             total_stats["images"] += image_count
             total_stats["skipped_fill_only"] += page_stats.get("skipped_fill_only", 0)
+            total_stats["model3d_solids"] += page_stats.get("model3d_solids", 0)
             _progress(
                 _page_progress(i, 1.0),
                 f"Finished page {page_num}/{len(page_indices)} "
@@ -1468,6 +1492,36 @@ def import_pdf(
 
         elapsed = time.perf_counter() - t_start
         _progress(1.0, "Import complete.")
+        try:
+            from .pdfcadcore.model3d_intent import analyze_model3d_intent
+
+            model3d_intent = analyze_model3d_intent(model3d_all_text, host_supports_3d=True).to_dict()
+        except (ImportError, RuntimeError, TypeError, ValueError, AttributeError):
+            model3d_intent = {
+                "feasible": False,
+                "plates": [],
+                "members": [],
+                "skipped_reason": "3D intent analysis unavailable",
+            }
+        model3d_mode = str(getattr(import_cfg, "model3d_mode", "off") or "off").strip().lower()
+        model3d_enabled = model3d_mode != "off"
+        model3d_solids = int(total_stats.get("model3d_solids", 0) or 0)
+        model3d_payload = {
+            "supported": True,
+            "enabled": model3d_enabled,
+            "mode": model3d_mode if model3d_mode in {"off", "auto", "extrude"} else "off",
+            "depth_mm": round(float(getattr(import_cfg, "model3d_depth_mm", 3.175) or 3.175), 4),
+            "solids_created": model3d_solids,
+        }
+        if not model3d_enabled:
+            model3d_payload["skipped_reason"] = "option_off"
+        elif model3d_mode == "auto" and not bool(model3d_intent.get("feasible")):
+            model3d_payload["skipped_reason"] = model3d_intent.get("skipped_reason") or "no_3d_intent_evidence"
+        elif model3d_solids == 0:
+            model3d_payload["skipped_reason"] = "no_extrudable_closed_regions"
+        total_stats["model_3d_intent"] = model3d_intent
+        total_stats["model_3d"] = model3d_payload
+
         try:
             bpy.context.view_layer.update()
         except Exception:

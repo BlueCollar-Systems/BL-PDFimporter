@@ -51,6 +51,20 @@ _PAGE_ARRANGEMENT_ITEMS = [
     ("overlay", "Overlay pages", "Place all pages at the same origin"),
 ]
 
+_MODEL3D_ITEMS = [
+    ("off", "Off", "Keep the imported PDF flat"),
+    (
+        "auto",
+        "Auto (if drawing has 3D evidence)",
+        "Extrude filled closed regions only when text evidence makes a 3D result honest",
+    ),
+    (
+        "extrude",
+        "Extrude closed shapes",
+        "Explicitly extrude eligible closed PDF regions while skipping page-background fills",
+    ),
+]
+
 
 def _addon_prefs(context):
     addon = context.preferences.addons.get("pdf_vector_importer")
@@ -179,6 +193,21 @@ class IMPORT_OT_pdf_vector(bpy.types.Operator, ImportHelper):
         max=1.0,
     )
 
+    model3d_mode: EnumProperty(  # type: ignore[assignment]
+        name="3D Model",
+        description="Optional 3D model generation from closed PDF geometry",
+        items=_MODEL3D_ITEMS,
+        default="off",
+    )
+
+    model3d_depth_mm: FloatProperty(  # type: ignore[assignment]
+        name="3D Depth (mm)",
+        description="Extrusion depth for generated 3D solids",
+        default=3.175,
+        min=0.01,
+        max=100000.0,
+    )
+
     def invoke(self, context, event):
         prefs = _addon_prefs(context)
         if prefs is not None:
@@ -222,6 +251,8 @@ class IMPORT_OT_pdf_vector(bpy.types.Operator, ImportHelper):
             "auto_hide_default_cube": self.auto_hide_default_cube,
             "page_arrangement": self.page_arrangement,
             "page_gap_ratio": self.page_gap_ratio,
+            "model3d_mode": self.model3d_mode,
+            "model3d_depth_mm": self.model3d_depth_mm,
         }
 
         def _set_status(text: str | None):
@@ -323,6 +354,13 @@ class IMPORT_OT_pdf_vector(bpy.types.Operator, ImportHelper):
         col.prop(self, "line_z_offset_mm")
         col.prop(self, "text_z_offset_mm")
         col.prop(self, "image_z_offset_mm")
+
+        box = layout.box()
+        box.label(text="3D Model", icon="MESH_CUBE")
+        box.prop(self, "model3d_mode")
+        row = box.row()
+        row.enabled = self.model3d_mode != "off"
+        row.prop(self, "model3d_depth_mm")
 
 
 def menu_func_import(self, context):

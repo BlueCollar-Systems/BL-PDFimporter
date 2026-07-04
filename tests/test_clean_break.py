@@ -193,6 +193,32 @@ class TestTextDefaults(unittest.TestCase):
         self.assertNotIn('layout.prop(self, "detect_arcs")', source)
 
 
+class TestModel3DGeneration(unittest.TestCase):
+    """Optional 3D generation is explicit, additive, and reportable."""
+
+    GEOMETRY_BUILDER_PY = REPO_ROOT / "pdf_vector_importer" / "bl_geometry_builder.py"
+
+    def test_operator_exposes_model3d_controls(self) -> None:
+        source = OPERATORS_PY.read_text(encoding="utf-8")
+        self.assertIn("model3d_mode", source)
+        self.assertIn("model3d_depth_mm", source)
+        self.assertIn("Auto (if drawing has 3D evidence)", source)
+        self.assertIn("Extrude closed shapes", source)
+
+    def test_engine_threads_model3d_to_builder_and_report(self) -> None:
+        source = IMPORT_ENGINE_PY.read_text(encoding="utf-8")
+        self.assertIn('"model3d_mode": getattr(import_cfg, "model3d_mode", "off")', source)
+        self.assertIn('"model3d_depth_m"', source)
+        self.assertIn('"model_3d_intent"', source)
+        self.assertIn('"model_3d"', source)
+
+    def test_geometry_builder_creates_extruded_meshes(self) -> None:
+        source = self.GEOMETRY_BUILDER_PY.read_text(encoding="utf-8")
+        self.assertIn("def _create_extruded_mesh", source)
+        self.assertIn('"model3d_solids"', source)
+        self.assertIn('obj_name + "_solid"', source)
+
+
 class TestBlenderVersionFloor(unittest.TestCase):
     """bl_info minimum Blender version must match COMPATIBILITY.md (3.0+)."""
 
