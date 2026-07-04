@@ -611,7 +611,16 @@ def build_page(
 
     material_cache: Dict[str, bpy.types.Material] = {}
     collection_cache: Dict[Tuple[int, str], bpy.types.Collection] = {}
-    stats = {"curves": 0, "meshes": 0, "circles": 0, "arcs": 0, "skipped_fill_only": 0}
+    stats = {
+        "curves": 0,
+        "meshes": 0,
+        "circles": 0,
+        "arcs": 0,
+        "skipped_fill_only": 0,
+        "batched_curve_primitives": 0,
+        "batched_curve_runs": 0,
+        "batched_curve_objects": 0,
+    }
     page_area = max(float(page_data.width or 0.0) * float(page_data.height or 0.0), 1e-9)
     prims = page_data.primitives or []
     total_prims = max(1, len(prims))
@@ -722,7 +731,7 @@ def build_page(
 
         if prim.type == "line":
             created = _queue_open_curve(
-                obj_name, prim.points, False, target_col,
+                obj_name, prim.points, target_col,
                 prim.line_width, mat,
                 dash_pattern=prim.dash_pattern if map_dashes else None,
                 dash_phase=prim.dash_phase if map_dashes else 0.0,
@@ -731,7 +740,7 @@ def build_page(
 
         elif prim.type == "polyline":
             created = _queue_open_curve(
-                obj_name, prim.points, False, target_col,
+                obj_name, prim.points, target_col,
                 prim.line_width, mat,
                 dash_pattern=prim.dash_pattern if map_dashes else None,
                 dash_phase=prim.dash_phase if map_dashes else 0.0,
@@ -745,16 +754,17 @@ def build_page(
                     prim.start_angle, prim.end_angle,
                     _ARC_SAMPLE_COUNT,
                 )
-                _queue_open_curve(
-                    obj_name, arc_pts, False, target_col,
+                created = _queue_open_curve(
+                    obj_name, arc_pts, target_col,
                     prim.line_width, mat,
                     dash_pattern=prim.dash_pattern if map_dashes else None,
                 )
+                stats["curves"] += created
                 stats["arcs"] += 1
             elif prim.points and len(prim.points) >= 2:
                 # Fallback: use polyline points
                 created = _queue_open_curve(
-                    obj_name, prim.points, False, target_col,
+                    obj_name, prim.points, target_col,
                     prim.line_width, mat,
                     dash_pattern=prim.dash_pattern if map_dashes else None,
                 )
@@ -871,7 +881,7 @@ def build_page(
                     )
                 else:
                     created = _queue_open_curve(
-                        obj_name, prim.points, False, target_col,
+                        obj_name, prim.points, target_col,
                         prim.line_width, mat,
                         dash_pattern=prim.dash_pattern if map_dashes else None,
                         dash_phase=prim.dash_phase if map_dashes else 0.0,
