@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import math
 import os
-from typing import Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import bpy
 
@@ -162,6 +162,51 @@ def _fit_text_to_bbox(obj: bpy.types.Object, text_item: NormalizedText) -> None:
     obj.scale.y *= s
 
 
+def _text_span_dict(text_item: NormalizedText) -> Dict[str, Any]:
+    bbox = getattr(text_item, "bbox", None)
+    insertion = getattr(text_item, "insertion", (0.0, 0.0)) or (0.0, 0.0)
+    return {
+        "text": str(getattr(text_item, "text", "") or ""),
+        "bbox": list(bbox) if bbox else None,
+        "origin": [float(insertion[0]), float(insertion[1])],
+        "size": float(getattr(text_item, "font_size", 0.0) or 0.0),
+    }
+
+
+def _provenance_entity_type(text_mode: str) -> str:
+    mode = _normalize_text_mode(text_mode)
+    if mode in {"glyphs", "geometry"}:
+        return "outline_curve_or_mesh"
+    return "native_3d_text"
+
+
+def _record_text_provenance(
+    provenance_opts: Any,
+    *,
+    page_number: int,
+    text_item: NormalizedText,
+    text_mode: str,
+    parent_handle: str = "",
+) -> None:
+    if provenance_opts is None:
+        return
+    try:
+        from .pdfcadcore.source_provenance import record_text_span_provenance
+
+        record_text_span_provenance(
+            provenance_opts,
+            page=int(page_number),
+            span=_text_span_dict(text_item),
+            text=str(text_item.text or ""),
+            created_entity_type=_provenance_entity_type(text_mode),
+            parent_handle=str(parent_handle or ""),
+            import_mode=str(getattr(provenance_opts, "import_mode", "") or ""),
+            text_mode=str(text_mode or ""),
+        )
+    except (ImportError, TypeError, ValueError):
+        pass
+
+
 def build_text(
     text_item: NormalizedText,
     collection: bpy.types.Collection,
@@ -170,6 +215,7 @@ def build_text(
     z_offset_m: float = 0.0,
     strict_text_fidelity: bool = True,
     text_mode: str = "3d_text",
+    provenance_opts: Any = None,
 ) -> Optional[bpy.types.Object]:
     """
     Create a Blender Text curve object from a NormalizedText item.
@@ -261,6 +307,13 @@ def build_text(
     collection.objects.link(obj)
     if mode in {"glyphs", "geometry"}:
         obj = _meshify_text_object(obj, collection, mode)
+    _record_text_provenance(
+        provenance_opts,
+        page_number=page_number,
+        text_item=text_item,
+        text_mode=mode,
+        parent_handle=str(getattr(obj, "name", "") or ""),
+    )
     return obj
 
 
@@ -305,6 +358,7 @@ def build_all_text(
     strict_text_fidelity: bool = True,
     text_mode: str = "3d_text",
     progress_callback=None,
+    provenance_opts: Any = None,
 ) -> int:
     """
     Build Blender text objects for all NormalizedText items.
@@ -338,6 +392,7 @@ def build_all_text(
             z_offset_m=z_offset_m,
             strict_text_fidelity=strict_text_fidelity,
             text_mode=text_mode,
+            provenance_opts=provenance_opts,
         )
         if obj is not None:
             count += 1

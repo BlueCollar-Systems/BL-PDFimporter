@@ -42,6 +42,7 @@ def import_into_blender(pdf_path: str, mode: str = "auto",
 
     run = run_import(pdf_path, mode=mode, overrides=overrides)
     extraction = run.extraction
+    provenance_opts = run.config
 
     root_name = f"PDF_{Path(pdf_path).stem}"
     root_collection = _ensure_root_collection(root_name)
@@ -86,6 +87,7 @@ def import_into_blender(pdf_path: str, mode: str = "auto",
                     page_collection,
                     opts.text_mode,
                     page.page_data.page_number,
+                    provenance_opts=provenance_opts,
                 )
 
         if opts.import_images:
@@ -189,7 +191,7 @@ def _text_extrusion_depth(font_size: float) -> float:
     return max(font_size * 0.12, 0.00025)
 
 
-def _create_text_object(text_item, collection, text_mode="3d_text", page_number=0):
+def _create_text_object(text_item, collection, text_mode="3d_text", page_number=0, provenance_opts=None):
     import bpy
 
     mode = _normalize_text_mode(text_mode)
@@ -233,6 +235,30 @@ def _create_text_object(text_item, collection, text_mode="3d_text", page_number=
     collection.objects.link(obj)
     if mode in {"glyphs", "geometry"}:
         obj = _meshify_text_object(obj, collection, mode)
+    if provenance_opts is not None:
+        try:
+            from pdf_vector_importer.pdfcadcore.source_provenance import record_text_span_provenance
+
+            bbox = getattr(text_item, "bbox", None)
+            insertion = getattr(text_item, "insertion", (0.0, 0.0)) or (0.0, 0.0)
+            entity_type = "outline_curve_or_mesh" if mode in {"glyphs", "geometry"} else "native_3d_text"
+            record_text_span_provenance(
+                provenance_opts,
+                page=int(page_number),
+                span={
+                    "text": body,
+                    "bbox": list(bbox) if bbox else None,
+                    "origin": [float(insertion[0]), float(insertion[1])],
+                    "size": float(getattr(text_item, "font_size", 0.0) or 0.0),
+                },
+                text=body,
+                created_entity_type=entity_type,
+                parent_handle=str(getattr(obj, "name", "") or ""),
+                import_mode=str(getattr(provenance_opts, "import_mode", "") or ""),
+                text_mode=mode,
+            )
+        except (ImportError, TypeError, ValueError):
+            pass
     return obj
 
 

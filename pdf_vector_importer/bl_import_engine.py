@@ -13,7 +13,8 @@ import re
 import sys
 import tempfile
 import time
-from typing import Callable, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional
 
 import bpy
 
@@ -181,6 +182,7 @@ def write_import_report(
     import_mode: str = "auto",
     raster_pages: int = 0,
     output_path: Optional[str] = None,
+    provenance_opts: Any = None,
 ) -> str:
     """Emit bcs.import_report/1.1 JSON for one import run."""
     from .pdfcadcore.import_report import build_actual_text_entity_types, build_import_report
@@ -249,6 +251,35 @@ def write_import_report(
         text_glyph_estimate=text_glyph_estimate,
         extra=extra,
     )
+
+    provenance_objects = list(getattr(provenance_opts, "_source_provenance_objects", []) or [])
+    if provenance_objects:
+        from .pdfcadcore.source_provenance import (
+            SCHEMA,
+            ensure_import_session_id,
+            write_source_provenance_sidecar,
+        )
+
+        session_id = ensure_import_session_id(provenance_opts)
+        sidecar_path = str(Path(path).with_name("source_provenance.json"))
+        build_stamp = str((report.report_meta or {}).get("build_stamp") or "")
+        write_source_provenance_sidecar(
+            output_path=sidecar_path,
+            import_session_id=session_id,
+            pdf_path=filepath,
+            objects=provenance_objects,
+            host_app="blender",
+            importer_version=_importer_version(),
+            build_stamp=build_stamp,
+            page_count=int(stats.get("pages_imported", stats.get("pages", 0)) or 0) or None,
+        )
+        report.extra["source_provenance_path"] = Path(sidecar_path).name
+        report.extra["source_provenance"] = {
+            "schema": SCHEMA,
+            "import_session_id": session_id,
+            "object_count": len(provenance_objects),
+        }
+
     report.write_json(path)
     return path
 
@@ -1098,6 +1129,13 @@ def import_pdf(
         # 3. Build ImportConfig from mode + overrides (BCS-ARCH-001)
         import_cfg = _config_from_mode(config.get("mode", "auto"))
         import_cfg = _apply_overrides(import_cfg, config)
+        if import_cfg.import_text and str(import_cfg.text_mode or "3d_text") != "none":
+            try:
+                from .pdfcadcore.source_provenance import ensure_import_session_id
+
+                ensure_import_session_id(import_cfg)
+            except ImportError:
+                pass
 
         # 4. Reset pdfcadcore ID counter
         reset_ids()
@@ -1357,6 +1395,7 @@ def import_pdf(
                     strict_text_fidelity=import_cfg.strict_text_fidelity,
                     text_mode=import_cfg.text_mode,
                     progress_callback=_text_progress,
+                    provenance_opts=import_cfg,
                 )
                 _add_phase_ms("text_ms", t_phase)
 
@@ -1463,6 +1502,7 @@ def import_pdf(
                 total_stats,
                 import_mode=(import_cfg.import_mode or "auto").strip().lower(),
                 raster_pages=raster_pages_imported,
+                provenance_opts=import_cfg,
             )
             total_stats["import_report_path"] = report_path
         except (OSError, RuntimeError, TypeError, ValueError, ImportError) as exc:
