@@ -1057,20 +1057,10 @@ def import_pdf(
             except Exception:
                 pass
 
-    _last_redraw_t = [0.0]
-
     def _progress(pct: float, msg: str):
         if progress_callback:
             progress_callback(pct, msg)
         _wm_progress(pct)
-        # Keep the UI responsive during long geometry/text loops.
-        try:
-            now = time.perf_counter()
-            if (now - _last_redraw_t[0]) >= 0.12:
-                bpy.ops.wm.redraw_timer(type="DRAW_WIN_SWAP", iterations=1)
-                _last_redraw_t[0] = now
-        except Exception:
-            pass
 
     t_start = time.perf_counter()
     phase_timings_ms: Dict[str, float] = {}
@@ -1439,6 +1429,10 @@ def import_pdf(
 
         elapsed = time.perf_counter() - t_start
         _progress(1.0, "Import complete.")
+        try:
+            bpy.context.view_layer.update()
+        except Exception:
+            pass
 
         # Merge extended stats into return dict
         total_stats["pages"] = len(page_indices)

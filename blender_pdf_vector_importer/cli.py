@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import time
 from pathlib import Path
 
@@ -50,6 +51,24 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
+    pdf_path = Path(args.pdf).expanduser().resolve()
+    if not pdf_path.is_file():
+        from pdfcadcore.cli_error_copy import cli_error
+
+        print(cli_error("file_not_found", path=str(pdf_path)), file=sys.stderr)
+        return 1
+
+    from pdfcadcore.fitz_loader import PdfOpenError, safe_open
+
+    try:
+        doc = safe_open(str(pdf_path))
+        doc.close()
+    except PdfOpenError as exc:
+        from pdfcadcore.cli_error_copy import cli_error
+
+        print(cli_error("not_a_pdf", message=str(exc)), file=sys.stderr)
+        return 1
+
     overrides = {}
     if args.pages is not None:
         overrides["pages"] = args.pages
@@ -68,7 +87,10 @@ def main() -> int:
     run_import_ms = (time.perf_counter() - t0) * 1000.0
     if args.reference_detected_mm and args.reference_real_mm:
         if args.reference_detected_mm <= 0:
-            raise SystemExit("--reference-detected-mm must be > 0")
+            from pdfcadcore.cli_error_copy import cli_error
+
+            print(cli_error("reference_detected_invalid"), file=sys.stderr)
+            return 1
         scale_factor = args.reference_real_mm / args.reference_detected_mm
         apply_uniform_scale(run.extraction, scale_factor)
     elapsed_ms = (time.perf_counter() - t0) * 1000.0

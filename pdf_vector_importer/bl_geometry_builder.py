@@ -427,6 +427,16 @@ def _draw_stroked_polyline(
     return 1 if created is not None else 0
 
 
+def _batch_width_key(line_width: Optional[float]):
+    """Stable grouping key for paper-space line widths."""
+    if line_width is None:
+        return None
+    try:
+        return round(float(line_width), 6)
+    except (TypeError, ValueError):
+        return None
+
+
 def _sample_arc_points(
     center: Tuple[float, float],
     radius: float,
@@ -606,16 +616,83 @@ def build_page(
     prims = page_data.primitives or []
     total_prims = max(1, len(prims))
     heartbeat_every = max(25, int(config.get("geometry_heartbeat_every", 80) or 80))
+    batch_open_curves = bool(config.get("batch_open_curves", True))
+    open_curve_batches: Dict[Tuple[int, int, object, float], dict] = {}
+
+    def _queue_open_curve(
+        name: str,
+        points: list,
+        target_col: bpy.types.Collection,
+        line_width: Optional[float],
+        material: bpy.types.Material,
+        dash_pattern=None,
+        dash_phase: float = 0.0,
+    ) -> int:
+        """Queue compatible open strokes into fewer Blender curve objects."""
+        if not points or len(points) < 2:
+            return 0
+        if not batch_open_curves:
+            return _draw_stroked_polyline(
+                name,
+                points,
+                False,
+                target_col,
+                line_width,
+                material,
+                dash_pattern=dash_pattern,
+                dash_phase=dash_phase,
+                z_offset_m=line_z_offset_m,
+            )
+
+        runs = _dash_polyline(points, dash_pattern, dash_phase=dash_phase) if dash_pattern else [points]
+        valid_runs = [run for run in runs if len(run) >= 2]
+        if not valid_runs:
+            return 0
+
+        key = (
+            id(target_col),
+            id(material),
+            _batch_width_key(line_width),
+            round(line_z_offset_m, 9),
+        )
+        batch = open_curve_batches.get(key)
+        if batch is None:
+            batch = {
+                "name": name,
+                "runs": [],
+                "collection": target_col,
+                "line_width": line_width,
+                "material": material,
+            }
+            open_curve_batches[key] = batch
+        batch["runs"].extend(valid_runs)
+        stats["batched_curve_primitives"] += 1
+        stats["batched_curve_runs"] += len(valid_runs)
+        return 0
+
+    def _flush_open_curve_batches() -> int:
+        created = 0
+        for index, batch in enumerate(open_curve_batches.values(), start=1):
+            obj_name = f"P{page_data.page_number}_batch_{index:03d}"
+            obj = _create_multi_poly_curve(
+                obj_name,
+                batch["runs"],
+                batch["collection"],
+                batch["line_width"],
+                batch["material"],
+                z_offset_m=line_z_offset_m,
+            )
+            if obj is not None:
+                created += 1
+        stats["batched_curve_objects"] = created
+        stats["curves"] += created
+        open_curve_batches.clear()
+        return created
 
     for idx, prim in enumerate(prims):
         if progress_callback and (idx % heartbeat_every == 0):
             try:
                 progress_callback((idx + 1) / float(total_prims))
-            except Exception:
-                pass
-            # Keep Blender UI responsive during long geometry loops.
-            try:
-                bpy.ops.wm.redraw_timer(type="DRAW_WIN_SWAP", iterations=1)
             except Exception:
                 pass
         has_fill_any = prim.fill_color is not None
@@ -644,22 +721,20 @@ def build_page(
         obj_name = f"P{page_data.page_number}_{prim.type}_{prim.id}"
 
         if prim.type == "line":
-            created = _draw_stroked_polyline(
+            created = _queue_open_curve(
                 obj_name, prim.points, False, target_col,
                 prim.line_width, mat,
                 dash_pattern=prim.dash_pattern if map_dashes else None,
                 dash_phase=prim.dash_phase if map_dashes else 0.0,
-                z_offset_m=line_z_offset_m,
             )
             stats["curves"] += created
 
         elif prim.type == "polyline":
-            created = _draw_stroked_polyline(
+            created = _queue_open_curve(
                 obj_name, prim.points, False, target_col,
                 prim.line_width, mat,
                 dash_pattern=prim.dash_pattern if map_dashes else None,
                 dash_phase=prim.dash_phase if map_dashes else 0.0,
-                z_offset_m=line_z_offset_m,
             )
             stats["curves"] += created
 
@@ -670,20 +745,18 @@ def build_page(
                     prim.start_angle, prim.end_angle,
                     _ARC_SAMPLE_COUNT,
                 )
-                _draw_stroked_polyline(
+                _queue_open_curve(
                     obj_name, arc_pts, False, target_col,
                     prim.line_width, mat,
                     dash_pattern=prim.dash_pattern if map_dashes else None,
-                    z_offset_m=line_z_offset_m,
                 )
                 stats["arcs"] += 1
             elif prim.points and len(prim.points) >= 2:
                 # Fallback: use polyline points
-                created = _draw_stroked_polyline(
+                created = _queue_open_curve(
                     obj_name, prim.points, False, target_col,
                     prim.line_width, mat,
                     dash_pattern=prim.dash_pattern if map_dashes else None,
-                    z_offset_m=line_z_offset_m,
                 )
                 stats["curves"] += created
 
@@ -789,13 +862,23 @@ def build_page(
         else:
             # Unknown type — best effort as polyline
             if prim.points and len(prim.points) >= 2:
-                created = _draw_stroked_polyline(
-                    obj_name, prim.points, prim.closed, target_col,
-                    prim.line_width, mat,
-                    dash_pattern=prim.dash_pattern if map_dashes else None,
-                    z_offset_m=line_z_offset_m,
-                )
+                if prim.closed:
+                    created = _draw_stroked_polyline(
+                        obj_name, prim.points, prim.closed, target_col,
+                        prim.line_width, mat,
+                        dash_pattern=prim.dash_pattern if map_dashes else None,
+                        z_offset_m=line_z_offset_m,
+                    )
+                else:
+                    created = _queue_open_curve(
+                        obj_name, prim.points, False, target_col,
+                        prim.line_width, mat,
+                        dash_pattern=prim.dash_pattern if map_dashes else None,
+                        dash_phase=prim.dash_phase if map_dashes else 0.0,
+                    )
                 stats["curves"] += created
+
+    _flush_open_curve_batches()
 
     if progress_callback:
         try:
