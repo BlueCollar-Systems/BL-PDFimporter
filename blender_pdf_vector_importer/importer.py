@@ -157,8 +157,9 @@ def apply_uniform_scale(extraction: DocumentExtraction, factor: float) -> None:
             if primitive.bbox:
                 x0, y0, x1, y1 = primitive.bbox
                 primitive.bbox = (x0 * factor, y0 * factor, x1 * factor, y1 * factor)
-            if primitive.line_width is not None:
-                primitive.line_width *= factor
+            # NOTE: line_width is intentionally NOT scaled.
+            # It is a paper-space stroke weight (mm); scaling it by the
+            # geometry factor produces "sausage" strokes on scaled drawings.
             if primitive.area is not None:
                 primitive.area *= factor * factor
 
