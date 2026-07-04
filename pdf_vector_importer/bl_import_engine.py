@@ -27,6 +27,67 @@ from .bl_text_builder import build_all_text
 
 _MM_PER_PT = 25.4 / 72.0
 _MM_TO_M = 0.001
+_AUTO_RECOGNITION_PRIMITIVE_LIMIT = 20_000
+_AUTO_RECOGNITION_TEXT_LIMIT = 3_000
+_AUTO_RECOGNITION_PAGE_AREA_MM2_LIMIT = 12_000_000.0
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw not in {"0", "false", "off", "no"}
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    try:
+        return int(raw) if raw else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    try:
+        return float(raw) if raw else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _skip_semantic_recognition_for_speed(page_data) -> Optional[str]:
+    """Return a reason when generic recognition should be skipped for a heavy page."""
+    if _env_bool("BC_BL_FORCE_AUTO_RECOGNITION", False):
+        return None
+
+    primitive_limit = max(1, _env_int(
+        "BC_BL_AUTO_RECOGNITION_MAX_PRIMITIVES",
+        _AUTO_RECOGNITION_PRIMITIVE_LIMIT,
+    ))
+    text_limit = max(1, _env_int(
+        "BC_BL_AUTO_RECOGNITION_MAX_TEXT",
+        _AUTO_RECOGNITION_TEXT_LIMIT,
+    ))
+    area_limit = max(1.0, _env_float(
+        "BC_BL_AUTO_RECOGNITION_MAX_AREA_MM2",
+        _AUTO_RECOGNITION_PAGE_AREA_MM2_LIMIT,
+    ))
+
+    primitive_count = len(getattr(page_data, "primitives", []) or [])
+    text_count = len(getattr(page_data, "text_items", []) or [])
+    try:
+        page_area = float(getattr(page_data, "width", 0.0) or 0.0) * float(getattr(page_data, "height", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        page_area = 0.0
+
+    if primitive_count > primitive_limit:
+        return f"{primitive_count} primitives > {primitive_limit}"
+    if text_count > text_limit:
+        return f"{text_count} text spans > {text_limit}"
+    if page_area > area_limit and (primitive_count + text_count) > (primitive_limit // 2):
+        return f"{page_area:.0f} mm^2 page with {primitive_count + text_count} entities"
+    return None
+
 
 def _default_import_report_path(filepath: str) -> str:
     base = os.path.splitext(os.path.basename(filepath))[0]
@@ -153,6 +214,8 @@ def write_import_report(
         "resolved_scale": stats.get("resolved_scale"),
         "scale_hints": stats.get("scale_hints"),
     }
+    if int(stats.get("recognition_skipped_pages", 0) or 0) > 0:
+        extra["recognition_skipped_pages"] = int(stats.get("recognition_skipped_pages", 0) or 0)
     if bool(config.get("import_text", True)) and text_mode != "none":
         extra["actual_text_entity_types"] = build_actual_text_entity_types(
             host_app="blender",
@@ -1094,6 +1157,7 @@ def import_pdf(
             "pages_imported": 0, "primitives": 0, "text_items": 0,
             "curves": 0, "meshes": 0, "circles": 0, "arcs": 0, "images": 0,
             "skipped_fill_only": 0,
+            "recognition_skipped_pages": 0,
             "hidden_startup_cube": hidden_startup_cube,
             "text_source_spans": 0,
             "text_glyph_estimate": 0,
@@ -1242,14 +1306,22 @@ def import_pdf(
                                 p.generic_tags.append("hatch_line")
 
             # 9e. Optional recognition pass
-            _progress(_page_progress(i, 0.55), f"Recognition pass on page {page_num}...")
-            t_phase = time.perf_counter()
-            try:
-                recognition.run(page_data, mode="auto")
-            except Exception:
-                # Recognition failure is non-fatal
-                pass
-            _add_phase_ms("recognition_ms", t_phase)
+            recognition_skip_reason = _skip_semantic_recognition_for_speed(page_data)
+            if recognition_skip_reason:
+                total_stats["recognition_skipped_pages"] += 1
+                _progress(
+                    _page_progress(i, 0.55),
+                    f"Skipping semantic recognition on page {page_num}: {recognition_skip_reason}",
+                )
+            else:
+                _progress(_page_progress(i, 0.55), f"Recognition pass on page {page_num}...")
+                t_phase = time.perf_counter()
+                try:
+                    recognition.run(page_data, mode="auto")
+                except Exception:
+                    # Recognition failure is non-fatal
+                    pass
+                _add_phase_ms("recognition_ms", t_phase)
 
             # 9f. Create page collection
             page_col = bpy.data.collections.new(f"PDF_Page_{page_num}")

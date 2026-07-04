@@ -28,7 +28,8 @@ MM_TO_M = 0.001
 # bevel_depth is a *radius*, so 1 mm line width -> 0.5 mm radius -> correct
 # 1 mm displayed width.  Using MM_TO_M directly doubled every lineweight.
 _LINEWIDTH_SCALE = MM_TO_M * 0.5
-_MIN_BEVEL_DEPTH = 0.0001  # 0.1 mm radius -> ~0.2 mm hairline visibility
+_MIN_BEVEL_DEPTH = 0.0000125  # 0.0125 mm radius -> ~0.025 mm visible hairline
+_DEFAULT_HAIRLINE_BEVEL_DEPTH = 0.000025  # PDF zero-width strokes render as ~0.05 mm
 
 # Number of sample points for arc approximation
 _ARC_SAMPLE_COUNT = 32
@@ -36,6 +37,16 @@ _MIN_DASH_MM = 0.05
 _MIN_PATTERN_CYCLE_MM = 0.25
 _MAX_DASH_STEPS = 20000
 _BACKGROUND_FILL_AREA_RATIO = 0.92
+
+
+def _line_bevel_depth(line_width: Optional[float]) -> float:
+    """Map PDF line width in mm to Blender curve bevel radius in meters."""
+    try:
+        if line_width is not None and float(line_width) > 0.0:
+            return max(float(line_width) * _LINEWIDTH_SCALE, _MIN_BEVEL_DEPTH)
+    except (TypeError, ValueError):
+        pass
+    return _DEFAULT_HAIRLINE_BEVEL_DEPTH
 
 
 # ── Material cache ───────────────────────────────────────────────────
@@ -182,11 +193,7 @@ def _create_poly_curve(
     curve_data.dimensions = "3D"
     curve_data.resolution_u = 12
 
-    # Line width as bevel depth
-    if line_width is not None and line_width > 0:
-        curve_data.bevel_depth = max(line_width * _LINEWIDTH_SCALE, _MIN_BEVEL_DEPTH)
-    else:
-        curve_data.bevel_depth = _MIN_BEVEL_DEPTH
+    curve_data.bevel_depth = _line_bevel_depth(line_width)
 
     spline = curve_data.splines.new("POLY")
     spline.points.add(len(points_m) - 1)  # one point already exists
@@ -222,10 +229,7 @@ def _create_multi_poly_curve(
     curve_data.dimensions = "3D"
     curve_data.resolution_u = 12
 
-    if line_width is not None and line_width > 0:
-        curve_data.bevel_depth = max(line_width * _LINEWIDTH_SCALE, _MIN_BEVEL_DEPTH)
-    else:
-        curve_data.bevel_depth = _MIN_BEVEL_DEPTH
+    curve_data.bevel_depth = _line_bevel_depth(line_width)
 
     for run in valid_runs:
         pts_m = [(x * MM_TO_M, y * MM_TO_M) for x, y in run]
@@ -460,10 +464,7 @@ def _create_nurbs_circle(
     curve_data = bpy.data.curves.new(name=name, type="CURVE")
     curve_data.dimensions = "3D"
 
-    if line_width is not None and line_width > 0:
-        curve_data.bevel_depth = max(line_width * _LINEWIDTH_SCALE, _MIN_BEVEL_DEPTH)
-    else:
-        curve_data.bevel_depth = _MIN_BEVEL_DEPTH
+    curve_data.bevel_depth = _line_bevel_depth(line_width)
 
     # Blender NURBS circle: 8-point circle approximation
     spline = curve_data.splines.new("NURBS")

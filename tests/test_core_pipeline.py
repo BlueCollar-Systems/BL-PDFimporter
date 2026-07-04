@@ -153,6 +153,12 @@ class TestCorePipeline(unittest.TestCase):
         self.assertAlmostEqual(rgb[1], 0.0, places=3)
         self.assertAlmostEqual(rgb[2], 0.0, places=3)
 
+    def test_packed_integer_color_normalization(self) -> None:
+        rgb = _norm_color(0x66AA33)
+        self.assertAlmostEqual(rgb[0], 0x66 / 255.0, places=4)
+        self.assertAlmostEqual(rgb[1], 0xAA / 255.0, places=4)
+        self.assertAlmostEqual(rgb[2], 0x33 / 255.0, places=4)
+
     def test_stacked_fraction_text_is_merged(self) -> None:
         def text_item(idx: int, text: str, y: float) -> NormalizedText:
             return NormalizedText(
