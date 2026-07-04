@@ -24,9 +24,11 @@ from .pdfcadcore.primitives import PageData, Primitive
 # mm -> m conversion (Blender world units are meters by default)
 MM_TO_M = 0.001
 
-# PDF/normalized line width (mm) -> Blender bevel depth (m)
-_LINEWIDTH_SCALE = MM_TO_M
-_MIN_BEVEL_DEPTH = 0.00035  # 0.35 mm baseline visibility in viewport
+# PDF/normalized line width (mm) -> Blender bevel depth (m).
+# bevel_depth is a *radius*, so 1 mm line width -> 0.5 mm radius -> correct
+# 1 mm displayed width.  Using MM_TO_M directly doubled every lineweight.
+_LINEWIDTH_SCALE = MM_TO_M * 0.5
+_MIN_BEVEL_DEPTH = 0.0001  # 0.1 mm radius -> ~0.2 mm hairline visibility
 
 # Number of sample points for arc approximation
 _ARC_SAMPLE_COUNT = 32
@@ -97,7 +99,15 @@ def _get_or_create_material(
     name = f"PDF_{style_key}_{r:.2f}_{g:.2f}_{b:.2f}"
     mat = bpy.data.materials.new(name=name)
     mat.diffuse_color = (r, g, b, 1.0)
-    mat.use_nodes = False
+    mat.use_nodes = True
+    nodes = mat.node_tree.nodes
+    links = mat.node_tree.links
+    nodes.clear()
+    emission = nodes.new(type="ShaderNodeEmission")
+    emission.inputs["Color"].default_value = (r, g, b, 1.0)
+    emission.inputs["Strength"].default_value = 1.0
+    out = nodes.new(type="ShaderNodeOutputMaterial")
+    links.new(emission.outputs["Emission"], out.inputs["Surface"])
     cache[key] = mat
     return mat
 

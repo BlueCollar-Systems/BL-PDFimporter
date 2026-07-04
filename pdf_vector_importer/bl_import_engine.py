@@ -660,7 +660,14 @@ def _extract_image_placements(doc, page, page_num: int, import_cfg, image_dir: s
     except ImportError:
         import fitz  # type: ignore
 
-    page_height = float(page.rect.height)
+    # Use rotation-corrected height for Y-flip — same logic as primitive_extractor.
+    _rot = int(getattr(page, "rotation", 0) or 0) % 360
+    try:
+        _mb = page.mediabox
+        _mb_w, _mb_h = float(_mb.width), float(_mb.height)
+    except AttributeError:
+        _mb_w, _mb_h = float(page.rect.width), float(page.rect.height)
+    page_height = _mb_w if _rot in (90, 270) else _mb_h
     seen_xrefs: set[int] = set()
 
     for img_info in page.get_images(full=True):
@@ -1123,7 +1130,10 @@ def import_pdf(
                 detect_arcs=import_cfg.detect_arcs,
                 arc_fit_tol_mm=import_cfg.arc_fit_tol_mm,
                 min_arc_angle_deg=import_cfg.min_arc_angle_deg,
+                arc_min_pts=getattr(import_cfg, "arc_sampling_pts", 5),
             )
+            # arc_min_pts is consumed by extract_page / iter_pages via pdfcadcore;
+            # arc_sampling_pts in ImportConfig maps to that gate parameter.
             if use_streaming:
                 def _on_stream_progress(prog):
                     nonlocal stream_cancelled
