@@ -17,3 +17,5 @@ benchmarks/
 llm_context_*.md
 blender_pdf_vector_importer/_archived/
 pdf_vector_importer/pdfcadcore/lib/
+
+_LLM_CONTROL_PACK/
