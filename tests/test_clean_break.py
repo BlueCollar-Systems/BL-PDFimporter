@@ -200,6 +200,7 @@ class TestModel3DGeneration(unittest.TestCase):
 
     def test_operator_exposes_model3d_controls(self) -> None:
         source = OPERATORS_PY.read_text(encoding="utf-8")
+        self.assertIn("SHAPE_EXTRUSION_UI_ENABLED", source)
         self.assertIn("model3d_mode", source)
         self.assertIn("model3d_depth_mm", source)
         self.assertIn("Auto (if drawing has 3D evidence)", source)

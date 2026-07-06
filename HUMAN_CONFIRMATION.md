@@ -1,27 +1,34 @@
-# Human Confirmation — PDF Vector Importer (Blender)
+# Human Verification — PDF Vector Importer (Blender)
 
-**Coordination:** see Desktop Q&A COORDINATION-HUB or `_LLM_CONTROL_PACK/QA/QA-2026-06-24_COORDINATION-HUB.md`
+Use **your own shop PDFs** for sign-off. There is no fixed public test matrix.
 
-**Prep:** 2026-06-24 · See `Desktop/PDFTest Files/Q&A/QA-2026-06-24_human-confirmation-script.md`
+## Before you start
 
-## Setup
+1. Install the latest add-on release ZIP from GitHub Releases.
+2. Enable **PDF Vector Importer** under **Edit → Preferences → Add-ons**.
 
-1. Add-on **v1.0.42+**.
-2. `$env:BCS_CORPUS_ROOT = 'C:\1pdf-test-corpus'`
-3. `python C:\1pdf-test-corpus\tools\list_tier1.py --host BL --resolved`
+## Checklist
 
-## Tier-1
+For each representative shop drawing you import:
 
-| PDF | Curves | Text (Labels) | Collections/layers |
-|-----|--------|---------------|-------------------|
-| 1017 - Rev 0 | ☐ | ☐ | ☐ |
-| webCapture | ☐ | ☐ | Hybrid raster |
-| hello_world_rotated | ☐ | ☐ | Rotation |
+| Check | Pass |
+|-------|------|
+| Curves and fills import cleanly | ☐ |
+| **Labels** text readable in the viewport | ☐ |
+| Collections/layers organized sensibly | ☐ |
+| Hybrid raster pages handled without crash | ☐ |
+| Scale plausible vs the source drawing | ☐ |
 
-## Automated
+## After each import
 
-```powershell
-python -m pytest tests/ -q -k "import_report"
-```
+- Save `import_report.json` when the importer writes one
+- If something looks wrong: use [Report Doctor](https://bluecollarsystems.com/report-doctor) or **Send Feedback** with screenshots and your report JSON
+
+## Sign-off
+
+| Role | Name | Date | Result |
+|------|------|------|--------|
+| Shop tester | | | |
+| Engineering | | | |
 
 BUILT. NOT BOUGHT.

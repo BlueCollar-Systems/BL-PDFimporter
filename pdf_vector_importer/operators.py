@@ -20,6 +20,9 @@ import bpy
 from bpy.props import BoolProperty, EnumProperty, FloatProperty, StringProperty
 from bpy_extras.io_utils import ImportHelper
 
+# Shelved 2026-07-06: closed-region shape extrusion deferred; code retained.
+SHAPE_EXTRUSION_UI_ENABLED = False
+
 
 # ── Mode enum items (BCS-ARCH-001) ───────────────────────────────────
 _MODE_ITEMS = [
@@ -251,8 +254,8 @@ class IMPORT_OT_pdf_vector(bpy.types.Operator, ImportHelper):
             "auto_hide_default_cube": self.auto_hide_default_cube,
             "page_arrangement": self.page_arrangement,
             "page_gap_ratio": self.page_gap_ratio,
-            "model3d_mode": self.model3d_mode,
-            "model3d_depth_mm": self.model3d_depth_mm,
+            "model3d_mode": self.model3d_mode if SHAPE_EXTRUSION_UI_ENABLED else "off",
+            "model3d_depth_mm": self.model3d_depth_mm if SHAPE_EXTRUSION_UI_ENABLED else 3.175,
         }
 
         def _set_status(text: str | None):
@@ -356,11 +359,12 @@ class IMPORT_OT_pdf_vector(bpy.types.Operator, ImportHelper):
         col.prop(self, "image_z_offset_mm")
 
         box = layout.box()
-        box.label(text="3D Model", icon="MESH_CUBE")
-        box.prop(self, "model3d_mode")
-        row = box.row()
-        row.enabled = self.model3d_mode != "off"
-        row.prop(self, "model3d_depth_mm")
+        if SHAPE_EXTRUSION_UI_ENABLED:
+            box.label(text="3D Model", icon="MESH_CUBE")
+            box.prop(self, "model3d_mode")
+            row = box.row()
+            row.enabled = self.model3d_mode != "off"
+            row.prop(self, "model3d_depth_mm")
 
 
 def menu_func_import(self, context):
