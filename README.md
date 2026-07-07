@@ -1,6 +1,6 @@
 # PDF Vector Importer for Blender
 
-[![Version](https://img.shields.io/badge/Version-1.0.59-blue.svg)]()
+[![Version](https://img.shields.io/badge/Version-1.0.60-blue.svg)]()
 
 **BUILT. NOT BOUGHT.** -- BlueCollar Systems
 
@@ -42,7 +42,7 @@ repairing a manually modified add-on folder.
 
 ## Upgrading / skipping versions
 
-Install the latest release ZIP via Preferences → Add-ons (disable old version first if Blender keeps both). Skipping versions is supported — run `--preflight` or import one Tier-1 PDF after a major jump.
+Install the latest release ZIP via Preferences → Add-ons (disable old version first if Blender keeps both). Skipping versions is supported — run `--preflight` or import one of your own representative PDFs after a major jump.
 
 ### Manual Install
 
