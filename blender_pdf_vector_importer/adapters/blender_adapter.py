@@ -9,6 +9,7 @@ from typing import Dict, Optional
 
 from ..importer import run_import
 from ..view_focus import focus_view_on_collection
+from pdf_vector_importer.pdfcadcore.text_scale import calibrate_text_size_to_bbox
 
 MM_TO_M = 0.001
 _TEXT_MODES = {"labels", "3d_text", "glyphs", "geometry"}
@@ -191,6 +192,16 @@ def _text_extrusion_depth(font_size: float) -> float:
     return max(font_size * 0.12, 0.00025)
 
 
+def _calibrated_text_size_mm(text_item) -> float:
+    return calibrate_text_size_to_bbox(
+        str(getattr(text_item, "text", "") or ""),
+        float(getattr(text_item, "font_size", 0.0) or 0.0),
+        getattr(text_item, "bbox", None),
+        float(getattr(text_item, "rotation", 0.0) or 0.0),
+        min_size=0.1,
+    )
+
+
 def _create_text_object(text_item, collection, text_mode="3d_text", page_number=0, provenance_opts=None):
     import bpy
 
@@ -202,7 +213,8 @@ def _create_text_object(text_item, collection, text_mode="3d_text", page_number=
     text_id = int(getattr(text_item, "id", 0) or 0)
     curve = bpy.data.curves.new(name=f"P{page_number}_text_{mode}_{text_id}", type="FONT")
     curve.body = body
-    curve.size = max(float(getattr(text_item, "font_size", 1.0) or 1.0) * MM_TO_M, 0.001)
+    calibrated_size_mm = _calibrated_text_size_mm(text_item)
+    curve.size = max(calibrated_size_mm * MM_TO_M, 0.001)
     curve.align_x = "LEFT"
     try:
         curve.align_y = "BOTTOM_BASELINE"
@@ -232,6 +244,7 @@ def _create_text_object(text_item, collection, text_mode="3d_text", page_number=
     )
     obj["pdf_text_id"] = text_id
     obj["pdf_text_mode"] = mode
+    obj["pdf_text_size_mm"] = float(calibrated_size_mm)
     collection.objects.link(obj)
     if mode in {"glyphs", "geometry"}:
         obj = _meshify_text_object(obj, collection, mode)

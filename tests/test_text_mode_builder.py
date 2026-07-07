@@ -21,7 +21,12 @@ if "bpy" not in sys.modules:
         )
     )
 
-from pdf_vector_importer.bl_text_builder import _normalize_text_mode, _text_extrusion_depth
+from pdf_vector_importer.bl_text_builder import (
+    _calibrated_text_size_mm,
+    _normalize_text_mode,
+    _text_extrusion_depth,
+)
+from pdf_vector_importer.pdfcadcore.primitives import NormalizedText
 
 
 def test_normalize_text_mode_defaults_unknown_to_3d_text():
@@ -41,3 +46,31 @@ def test_normalize_text_mode_accepts_all_four(mode: str):
 def test_extrusion_depth_positive_for_3d_text():
     depth = _text_extrusion_depth(0.01)
     assert depth > 0.0
+
+
+def test_calibrated_text_size_shrinks_unknown_font_run_to_bbox():
+    item = NormalizedText(
+        id=1,
+        text="LONG CALLOUT TEXT",
+        normalized="LONG CALLOUT TEXT",
+        insertion=(0.0, 0.0),
+        bbox=(0.0, 0.0, 10.0, 3.0),
+        font_size=12.0,
+        rotation=0.0,
+    )
+
+    assert _calibrated_text_size_mm(item) < item.font_size
+
+
+def test_calibrated_text_size_uses_vertical_bbox_axes():
+    item = NormalizedText(
+        id=2,
+        text="3 3/8",
+        normalized="3 3/8",
+        insertion=(0.0, 0.0),
+        bbox=(0.0, 0.0, 2.0, 24.0),
+        font_size=10.0,
+        rotation=90.0,
+    )
+
+    assert _calibrated_text_size_mm(item) <= 2.24

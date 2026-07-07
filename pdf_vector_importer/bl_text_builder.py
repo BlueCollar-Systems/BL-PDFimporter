@@ -14,6 +14,7 @@ from typing import Any, Dict, Optional, Tuple
 import bpy
 
 from .pdfcadcore.primitives import NormalizedText
+from .pdfcadcore.text_scale import calibrate_text_size_to_bbox, normalize_text_angle_deg
 
 # PDF font sizes are in mm from the extractor. Blender text size is in
 # Blender units (meters by default), so convert mm -> m.
@@ -39,6 +40,16 @@ def _normalize_text_mode(text_mode: str) -> str:
 
 def _text_extrusion_depth(font_size: float) -> float:
     return max(font_size * 0.12, 0.00025)
+
+
+def _calibrated_text_size_mm(text_item: NormalizedText) -> float:
+    return calibrate_text_size_to_bbox(
+        str(getattr(text_item, "text", "") or ""),
+        float(getattr(text_item, "font_size", 0.0) or 0.0),
+        getattr(text_item, "bbox", None),
+        float(getattr(text_item, "rotation", 0.0) or 0.0),
+        min_size=0.1,
+    )
 
 
 def _styled_text_color(
@@ -137,16 +148,24 @@ def _fit_text_to_bbox(obj: bpy.types.Object, text_item: NormalizedText) -> None:
     if text_item.bbox is None:
         return
 
-    # Axis-aligned bbox fitting distorts vertical/diagonal labels.
-    rot = abs(float(text_item.rotation or 0.0))
-    if rot > 1.0 and abs(rot - 180.0) > 1.0:
+    bx0, by0, bx1, by1 = text_item.bbox
+    axis_w = max((bx1 - bx0) * MM_TO_M, 0.0)
+    axis_h = max((by1 - by0) * MM_TO_M, 0.0)
+    if axis_w <= 1e-9 or axis_h <= 1e-9:
         return
 
-    bx0, by0, bx1, by1 = text_item.bbox
-    target_w = max((bx1 - bx0) * MM_TO_M, 0.0)
-    target_h = max((by1 - by0) * MM_TO_M, 0.0)
-    if target_w <= 1e-9 or target_h <= 1e-9:
-        return
+    norm = abs(normalize_text_angle_deg(float(text_item.rotation or 0.0)))
+    if norm >= 45.0:
+        target_w = max(axis_w, axis_h)
+        target_h = min(axis_w, axis_h)
+    else:
+        target_w = axis_w
+        target_h = axis_h
+
+    try:
+        bpy.context.view_layer.update()
+    except Exception:
+        pass
 
     current_w = max(float(obj.dimensions.x), 1e-9)
     current_h = max(float(obj.dimensions.y), 1e-9)
@@ -156,7 +175,7 @@ def _fit_text_to_bbox(obj: bpy.types.Object, text_item: NormalizedText) -> None:
         return
 
     # Use uniform scale to avoid glyph deformation (e.g. "15/16" -> "15/6").
-    s = min(scale_h, scale_w * 1.15)
+    s = min(scale_h * 1.05, scale_w * 1.08)
     s = max(0.10, min(10.0, s))
     obj.scale.x *= s
     obj.scale.y *= s
@@ -237,7 +256,8 @@ def build_text(
     # Create font curve data
     font_data = bpy.data.curves.new(name=obj_name, type="FONT")
     font_data.body = text_item.text
-    font_data.size = max(text_item.font_size * _FONT_SIZE_SCALE * MM_TO_M, 0.0005)
+    calibrated_size_mm = _calibrated_text_size_mm(text_item)
+    font_data.size = max(calibrated_size_mm * _FONT_SIZE_SCALE * MM_TO_M, 0.0005)
     preferred_font = _get_preferred_font()
     if preferred_font is not None:
         try:
@@ -276,6 +296,7 @@ def build_text(
     obj = bpy.data.objects.new(obj_name, font_data)
     try:
         obj["pdf_text_mode"] = mode
+        obj["pdf_text_size_mm"] = float(calibrated_size_mm)
     except Exception:
         pass
 
@@ -286,13 +307,6 @@ def build_text(
     else:
         x, y = text_item.insertion
     obj.location = (x * MM_TO_M, y * MM_TO_M, z_offset_m)
-    if not strict_text_fidelity:
-        _fit_text_to_bbox(obj, text_item)
-
-    # Apply rotation (text_item.rotation is in degrees)
-    if text_item.rotation != 0.0:
-        obj.rotation_euler = (0.0, 0.0, math.radians(text_item.rotation))
-
     try:
         source_color = text_item.color
         mat = _get_or_create_text_material(visual_style, source_color=source_color)
@@ -305,6 +319,13 @@ def build_text(
         pass
 
     collection.objects.link(obj)
+    if mode == "3d_text" or not strict_text_fidelity:
+        _fit_text_to_bbox(obj, text_item)
+
+    # Apply rotation (text_item.rotation is in degrees)
+    if text_item.rotation != 0.0:
+        obj.rotation_euler = (0.0, 0.0, math.radians(text_item.rotation))
+
     if mode in {"glyphs", "geometry"}:
         obj = _meshify_text_object(obj, collection, mode)
     _record_text_provenance(
