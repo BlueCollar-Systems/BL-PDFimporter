@@ -48,7 +48,7 @@ def test_extrusion_depth_positive_for_3d_text():
     assert depth > 0.0
 
 
-def test_calibrated_text_size_shrinks_unknown_font_run_to_bbox():
+def test_calibrated_text_size_preserves_nominal():
     item = NormalizedText(
         id=1,
         text="LONG CALLOUT TEXT",
@@ -59,10 +59,10 @@ def test_calibrated_text_size_shrinks_unknown_font_run_to_bbox():
         rotation=0.0,
     )
 
-    assert _calibrated_text_size_mm(item) < item.font_size
+    assert _calibrated_text_size_mm(item) == item.font_size
 
 
-def test_calibrated_text_size_uses_vertical_bbox_axes():
+def test_calibrated_text_size_preserves_vertical_nominal():
     item = NormalizedText(
         id=2,
         text="3 3/8",
@@ -73,4 +73,4 @@ def test_calibrated_text_size_uses_vertical_bbox_axes():
         rotation=90.0,
     )
 
-    assert _calibrated_text_size_mm(item) <= 2.24
+    assert _calibrated_text_size_mm(item) == item.font_size
