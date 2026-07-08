@@ -8,14 +8,14 @@ for p in (REPO, os.path.join(REPO, "pdf_vector_importer")):
     if p not in sys.path:
         sys.path.insert(0, p)
 
-from corpus_paths import resolve_corpus_pdf
-
-PDF = os.environ.get("TEST_PDF") or str(
-    resolve_corpus_pdf("TX_Alvord_20220525_TM_geo.pdf") or ""
-)
+PDF = os.environ.get("TEST_PDF") or os.environ.get("BCS_PUBLIC_QA_PDF") or ""
 
 
 def main():
+    if not os.path.isfile(PDF):
+        print("SKIP: set TEST_PDF or BCS_PUBLIC_QA_PDF to run headless import smoke test")
+        return 0
+
     import bpy
     import importlib
 
@@ -27,10 +27,6 @@ def main():
     bl_import_engine = importlib.import_module("pdf_vector_importer.bl_import_engine")
 
     print("pdf_vector_importer from:", bl_import_engine.__file__)
-
-    if not os.path.isfile(PDF):
-        print("SKIP: no test pdf at", PDF)
-        return 0
 
     stats = bl_import_engine.import_pdf(
         PDF,
