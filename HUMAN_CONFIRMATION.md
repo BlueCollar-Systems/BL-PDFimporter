@@ -14,7 +14,9 @@ For each representative shop drawing you import:
 | Check | Pass |
 |-------|------|
 | Curves and fills import cleanly | ☐ |
-| **Labels** text readable in the viewport | ☐ |
+| **3D Text default** — notes, dimensions, rotation, and scale visually match the PDF at the same zoom | ☐ |
+| **Labels** text remains readable when selected for editability | ☐ |
+| **Glyphs/Geometry** outlines remain faithful when selected for exact visual geometry | ☐ |
 | Collections/layers organized sensibly | ☐ |
 | Hybrid raster pages handled without crash | ☐ |
 | Scale plausible vs the source drawing | ☐ |

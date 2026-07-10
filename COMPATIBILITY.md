@@ -39,7 +39,8 @@ No system Python or pip required when release ZIP vendored wheel loads.
 
 ## Legacy hardware notes
 
-- **Glyphs/Geometry** text → high curve/mesh counts; use **Labels** on **&lt; 8 GB RAM** PCs.
+- Use **3D Text** first for Adobe-like visual review. **Glyphs/Geometry** text can create high curve/mesh counts; avoid those modes on **&lt; 8 GB RAM** PCs unless exact outline geometry is required.
+- Use **Labels** only when editable Blender text matters more than model-space PDF appearance.
 - Headless import validated; interactive UI still needs human confirmation (T-01).
 - T-06 resolved: Blender Glyphs mode produces non-editable outline meshes from extracted text runs.
 
@@ -81,8 +82,8 @@ blender --background --python-expr "import addon_utils; addon_utils.enable('pdf_
 
 | Option | Blender result |
 |--------|----------------|
-| **Labels** | Font curve objects |
-| **3D Text** | Extruded text where supported |
+| **3D Text** | Default visual-parity text; extruded text where supported |
+| **Labels** | Editable font curve objects |
 | **Glyphs** | Text-run outline meshes; they do **not** create one separate object per character |
 | **Geometry** | Mesh/curve outlines |
 

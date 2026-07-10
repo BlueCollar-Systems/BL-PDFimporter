@@ -10,7 +10,7 @@ Powered by the pdfcadcore shared extraction library and PyMuPDF.
 ## Features
 
 - **4 Import Modes** (BCS-ARCH-001) -- Auto (default, picks strategy per page), Vector, Raster, Hybrid
-- **4 Text Rendering Options** -- Labels, 3D Text, Glyphs, Geometry (orthogonal to mode)
+- **4 Text Rendering Options** -- 3D Text (default visual-parity path), Labels, Glyphs, Geometry (orthogonal to mode)
 - **Maximum fidelity by default** -- no quality tiers, no fast-mode compromises
 - **Arc & Circle Detection** -- Reconstruct true arcs and circles from polyline approximations
 - **OCG Layer Support** -- Map PDF Optional Content Groups to Blender sub-collections
@@ -61,6 +61,11 @@ After enabling the addon:
 4. Click **Import PDF Vector**
 
 Geometry is grouped into collections by page and (optionally) by source layer or color.
+
+For Adobe-like visual sign-off, start with **3D Text** at the same zoom/scale as
+the source PDF. Use **Labels** when editable Blender text matters more than
+model-space PDF appearance, and use **Glyphs/Geometry** when exact outline
+geometry is preferred over editability.
 
 ## Compatibility
 
