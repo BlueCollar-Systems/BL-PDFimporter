@@ -74,6 +74,14 @@ jobs:
               got = pyproject_match.group(1) if pyproject_match else "missing"
               raise SystemExit(f"Version mismatch: core={version} pyproject={got}")
 
+          # RB-22: README badge is a quick-card §4.2 bump site — gate it too
+          # (same pattern as FreeCAD/SketchUp auto-release).
+          readme_text = pathlib.Path("README.md").read_text(encoding="utf-8")
+          badge_match = re.search(r"Version-(\d+\.\d+\.\d+)-(?:green|blue)\.svg", readme_text)
+          if not badge_match or badge_match.group(1) != version:
+              got = badge_match.group(1) if badge_match else "missing"
+              raise SystemExit(f"Version mismatch: core={version} README badge={got}")
+
           legacy_init = pathlib.Path("blender_pdf_vector_importer/__init__.py")
           if legacy_init.exists():
               legacy_text = legacy_init.read_text(encoding="utf-8")
