@@ -67,6 +67,47 @@ the source PDF. Use **Labels** when editable Blender text matters more than
 model-space PDF appearance, and use **Glyphs/Geometry** when exact outline
 geometry is preferred over editability.
 
+### Text-mode fallback ladder (TEXTMODE-1)
+
+**The requested text mode is the delivered text mode.** Alignment, rotation,
+or scaling defects are fixed *inside* the requested mode — never by
+substituting a different mode. Substitution is permitted only when the
+requested mode is genuinely impossible for this importer + option + PDF, must
+walk the documented ladder below (most closely related rung first), must
+always terminate in *some* delivered representation, and is always recorded
+in `import_report.json` (`fallback.text` = requested / delivered / reason /
+count, plus a `text_mode_fallback` diagnostics signal) — never silent.
+(Owner directive 2026-07-13.)
+
+FINAL Blender ladder (left rung first):
+
+| Requested | Ladder |
+|-----------|--------|
+| **3D Text** | Labels (flat font curve) → Glyphs/Geometry (meshified) → raster plane |
+| **Glyphs / Geometry** | peer family → 3D Text/Labels font curves → raster plane |
+| **Labels** | 3D Text → Glyphs/Geometry → raster plane |
+| **Raster** | terminal — always achievable |
+
+Notes:
+- **Glyphs and Geometry are one peer family** (identical meshify pipeline),
+  so a fallback between them is a no-op and the ladders treat them as a
+  single rung.
+- Font-curve creation is core Blender API — its failure is unobserved, which
+  is why the flat font curve (same object minus extrude) is the nearest
+  rung for 3D Text and the landing rung for a failed meshify.
+- A meshify failure for Glyphs/Geometry delivers the editable font curve
+  honestly: the object is retagged (`pdf_text_mode='labels'`, requested mode
+  and `reason: meshify_failed` preserved on the object), provenance records
+  the delivered entity type, and the report emits `fallback.text`.
+- Unknown `text_mode` strings deliver the 3D Text default loudly: a one-time
+  warning, a `fallback.text` entry (`reason: unknown_text_mode_normalized`),
+  and `extra.text_mode_normalized_from` in the report.
+- Labels-family rungs sit before the page raster plane per the audit's
+  interim ruling (no host has per-span raster patches today); every use is
+  loudly reported.
+- The invariant "requested == delivered OR reported fallback — never
+  neither" is locked by `tests/test_textmode1_invariant_blender.py`.
+
 ## Compatibility
 
 See **[COMPATIBILITY.md](COMPATIBILITY.md)** for the full matrix. Summary:
