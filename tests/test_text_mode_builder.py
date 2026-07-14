@@ -2,6 +2,7 @@
 """Headless checks for Blender text_mode routing helpers."""
 from __future__ import annotations
 
+import logging
 import sys
 import types
 from pathlib import Path
@@ -24,14 +25,39 @@ if "bpy" not in sys.modules:
 from pdf_vector_importer.bl_text_builder import (
     _calibrated_text_size_mm,
     _normalize_text_mode,
+    _resolve_text_mode,
     _text_extrusion_depth,
+    _warn_unknown_text_mode_once,
 )
 from pdf_vector_importer.pdfcadcore.primitives import NormalizedText
 
 
-def test_normalize_text_mode_defaults_unknown_to_3d_text():
-    assert _normalize_text_mode("") == "3d_text"
+def test_unknown_text_mode_is_normalized_loudly_not_silently():
+    """TEXTMODE-1 item 12: unknown input still delivers the 3d_text default,
+    but the normalization is flagged so build_text can warn and report it —
+    never a silent coercion."""
+    # Empty input is the documented default, NOT a normalization event.
+    assert _resolve_text_mode("") == ("3d_text", "3d_text", False)
+    # Unknown strings are flagged with the original requested value preserved.
+    assert _resolve_text_mode("bogus") == ("3d_text", "bogus", True)
+    # Legacy helper keeps returning the delivered mode for compat callers.
     assert _normalize_text_mode("bogus") == "3d_text"
+
+
+def test_unknown_text_mode_warns_once_per_import(caplog):
+    opts = types.SimpleNamespace()
+    logger_name = "pdf_vector_importer.bl_text_builder"
+    with caplog.at_level(logging.WARNING, logger=logger_name):
+        _warn_unknown_text_mode_once(opts, "bogus")
+        _warn_unknown_text_mode_once(opts, "bogus")
+    warnings = [
+        record
+        for record in caplog.records
+        if "Unknown Blender text mode" in record.getMessage()
+    ]
+    assert len(warnings) == 1
+    # The seen-set feeds the report's extra.text_mode_normalized_from note.
+    assert opts._text_mode_normalization_warnings == {"bogus"}
 
 
 @pytest.mark.parametrize(

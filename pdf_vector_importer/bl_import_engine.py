@@ -267,6 +267,18 @@ def write_import_report(
     }
     if int(stats.get("recognition_skipped_pages", 0) or 0) > 0:
         extra["recognition_skipped_pages"] = int(stats.get("recognition_skipped_pages", 0) or 0)
+    # TEXTMODE-1 item 12: unknown text_mode strings are normalized to the
+    # 3d_text default loudly — the report notes what the input actually was.
+    try:
+        normalized_from = getattr(
+            provenance_opts, "_text_mode_normalization_warnings", None
+        )
+    except AttributeError:
+        normalized_from = None
+    if normalized_from:
+        extra["text_mode_normalized_from"] = sorted(
+            str(value) for value in normalized_from
+        )
     if bool(config.get("import_text", True)) and text_mode != "none":
         extra["actual_text_entity_types"] = build_actual_text_entity_types(
             host_app="blender",

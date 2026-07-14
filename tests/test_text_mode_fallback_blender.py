@@ -227,6 +227,7 @@ def test_unknown_text_mode_warns_and_reports_normalization(monkeypatch, tmp_path
         "reason": "unknown_text_mode_normalized",
         "count": 1,
     }
+    assert report["extra"]["text_mode_normalized_from"] == ["typo_mode"]
     assert report["extra"]["actual_text_entity_types"]["font_rendered"] is True
     _assert_requested_mode_delivered_or_loudly_reported(report)
 
