@@ -175,6 +175,35 @@ def _merge_scale_into_stats(stats: Dict, page_data) -> None:
         hints["title_block_detected"] = True
 
 
+def _text_fallback_from_provenance(provenance_opts: Any) -> Optional[Dict[str, Any]]:
+    """Return the first normalized builder fallback for the shared report."""
+    if provenance_opts is None:
+        return None
+    try:
+        records = list(getattr(provenance_opts, "_text_mode_fallbacks", []) or [])
+    except (AttributeError, TypeError):
+        return None
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        requested = str(record.get("requested") or "").strip().lower()
+        delivered = str(record.get("delivered") or "").strip().lower()
+        reason = str(record.get("reason") or "").strip()
+        if not requested or not delivered or requested == delivered:
+            continue
+        try:
+            count = max(0, int(record.get("count", 0) or 0))
+        except (TypeError, ValueError):
+            count = 0
+        return {
+            "requested": requested,
+            "delivered": delivered,
+            "reason": reason or "unspecified",
+            "count": count,
+        }
+    return None
+
+
 def write_import_report(
     filepath: str,
     config: Dict,
@@ -209,6 +238,22 @@ def write_import_report(
     text_source_spans = int(stats.get("text_source_spans", stats.get("text_items", 0)) or 0)
     text_glyph_estimate = int(stats.get("text_glyph_estimate", 0) or 0)
     bootstrap_text_items = list(stats.get("parts_bootstrap_text_items") or [])
+    text_fallback = _text_fallback_from_provenance(provenance_opts)
+    try:
+        delivered_text_counts = getattr(provenance_opts, "_text_delivered_entity_counts", None)
+    except AttributeError:
+        delivered_text_counts = None
+    if not isinstance(delivered_text_counts, dict):
+        delivered_text_counts = None
+    font_rendered = None
+    if delivered_text_counts:
+        try:
+            font_rendered = any(
+                int(delivered_text_counts.get(bucket, 0) or 0) > 0
+                for bucket in ("native_label", "native_3d_text")
+            )
+        except (TypeError, ValueError):
+            font_rendered = None
 
     text_mode = str(config.get("text_mode") or "3d_text")
     extra = {
@@ -227,6 +272,8 @@ def write_import_report(
             host_app="blender",
             text_mode=text_mode,
             count=int(stats.get("text_items", 0) or 0),
+            font_rendered=font_rendered,
+            delivered_counts=delivered_text_counts,
         )
 
     report = build_import_report(
@@ -253,6 +300,7 @@ def write_import_report(
         text_mode=text_mode,
         text_source_spans=text_source_spans,
         text_glyph_estimate=text_glyph_estimate,
+        text_fallback=text_fallback,
         extra=extra,
     )
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 import os
+import logging
 from typing import Any, Dict, Optional, Tuple
 
 import bpy
@@ -22,6 +23,7 @@ MM_TO_M = 0.001
 _FONT_SIZE_SCALE = 1.0
 _FONT_CACHE: Optional[bpy.types.VectorFont] = None
 _TEXT_MODES = {"labels", "3d_text", "glyphs", "geometry"}
+LOGGER = logging.getLogger(__name__)
 
 
 def _normalize_style(style: str) -> str:
@@ -31,11 +33,18 @@ def _normalize_style(style: str) -> str:
     return "source"
 
 
+def _resolve_text_mode(text_mode: str) -> Tuple[str, str, bool]:
+    """Return delivered mode, requested mode, and normalization status."""
+    requested = str(text_mode or "").strip().lower()
+    if not requested:
+        return "3d_text", "3d_text", False
+    if requested in _TEXT_MODES:
+        return requested, requested, False
+    return "3d_text", requested, True
+
+
 def _normalize_text_mode(text_mode: str) -> str:
-    mode = (text_mode or "3d_text").strip().lower()
-    if mode in _TEXT_MODES:
-        return mode
-    return "3d_text"
+    return _resolve_text_mode(text_mode)[0]
 
 
 def _text_extrusion_depth(font_size: float) -> float:
@@ -161,9 +170,90 @@ def _text_span_dict(text_item: NormalizedText) -> Dict[str, Any]:
 
 def _provenance_entity_type(text_mode: str) -> str:
     mode = _normalize_text_mode(text_mode)
+    if mode == "labels":
+        return "native_label"
+    if mode == "3d_text":
+        return "native_3d_text"
     if mode in {"glyphs", "geometry"}:
         return "outline_curve_or_mesh"
-    return "native_3d_text"
+    return "fallback_geometry"
+
+
+def _record_text_mode_fallback(
+    provenance_opts: Any,
+    *,
+    requested: str,
+    delivered: str,
+    reason: str,
+) -> None:
+    """Accumulate a reportable TEXTMODE-1 fallback on the active import."""
+    if provenance_opts is None:
+        return
+    requested_mode = str(requested or "").strip().lower()
+    delivered_mode = str(delivered or "").strip().lower()
+    fallback_reason = str(reason or "").strip()
+    if not requested_mode or not delivered_mode or requested_mode == delivered_mode:
+        return
+    try:
+        records = getattr(provenance_opts, "_text_mode_fallbacks", None)
+        if not isinstance(records, list):
+            records = []
+            provenance_opts._text_mode_fallbacks = records  # noqa: B010
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            if (
+                record.get("requested") == requested_mode
+                and record.get("delivered") == delivered_mode
+                and record.get("reason") == fallback_reason
+            ):
+                record["count"] = int(record.get("count", 0) or 0) + 1
+                return
+        records.append(
+            {
+                "requested": requested_mode,
+                "delivered": delivered_mode,
+                "reason": fallback_reason or "unspecified",
+                "count": 1,
+            }
+        )
+    except (AttributeError, TypeError, ValueError):
+        return
+
+
+def _record_delivered_text_entity(provenance_opts: Any, delivered_mode: str) -> None:
+    """Accumulate delivered text entity buckets for import_report honesty."""
+    if provenance_opts is None:
+        return
+    try:
+        counts = getattr(provenance_opts, "_text_delivered_entity_counts", None)
+        if not isinstance(counts, dict):
+            counts = {}
+            provenance_opts._text_delivered_entity_counts = counts  # noqa: B010
+        bucket = _provenance_entity_type(delivered_mode)
+        counts[bucket] = int(counts.get(bucket, 0) or 0) + 1
+    except (AttributeError, TypeError, ValueError):
+        return
+
+
+def _warn_unknown_text_mode_once(provenance_opts: Any, requested_mode: str) -> None:
+    """Surface unsupported text-mode input without flooding multi-span logs."""
+    warned = False
+    if provenance_opts is not None:
+        try:
+            seen = getattr(provenance_opts, "_text_mode_normalization_warnings", None)
+            if not isinstance(seen, set):
+                seen = set()
+                provenance_opts._text_mode_normalization_warnings = seen  # noqa: B010
+            warned = requested_mode in seen
+            seen.add(requested_mode)
+        except (AttributeError, TypeError):
+            warned = False
+    if not warned:
+        LOGGER.warning(
+            "Unknown Blender text mode %r; delivering 3d_text and recording a TEXTMODE-1 fallback.",
+            requested_mode,
+        )
 
 
 def _record_text_provenance(
@@ -171,7 +261,8 @@ def _record_text_provenance(
     *,
     page_number: int,
     text_item: NormalizedText,
-    text_mode: str,
+    requested_text_mode: str,
+    delivered_text_mode: str,
     parent_handle: str = "",
 ) -> None:
     if provenance_opts is None:
@@ -184,10 +275,10 @@ def _record_text_provenance(
             page=int(page_number),
             span=_text_span_dict(text_item),
             text=str(text_item.text or ""),
-            created_entity_type=_provenance_entity_type(text_mode),
+            created_entity_type=_provenance_entity_type(delivered_text_mode),
             parent_handle=str(parent_handle or ""),
             import_mode=str(getattr(provenance_opts, "import_mode", "") or ""),
-            text_mode=str(text_mode or ""),
+            text_mode=str(requested_text_mode or ""),
         )
     except (ImportError, TypeError, ValueError):
         pass
@@ -217,7 +308,15 @@ def build_text(
     if not text_item.text or not text_item.text.strip():
         return None
 
-    mode = _normalize_text_mode(text_mode)
+    mode, requested_mode, normalized_unknown_mode = _resolve_text_mode(text_mode)
+    if normalized_unknown_mode:
+        _warn_unknown_text_mode_once(provenance_opts, requested_mode)
+        _record_text_mode_fallback(
+            provenance_opts,
+            requested=requested_mode,
+            delivered=mode,
+            reason="unknown_text_mode_normalized",
+        )
     obj_name = f"P{page_number}_text_{mode}_{text_item.id}"
 
     # Create font curve data
@@ -291,14 +390,44 @@ def build_text(
         obj.rotation_euler = (0.0, 0.0, math.radians(text_item.rotation))
 
     if mode in {"glyphs", "geometry"}:
-        obj = _meshify_text_object(obj, collection, mode)
+        mesh_obj = _meshify_text_object(obj, collection, mode)
+        if mesh_obj is obj:
+            delivered_mode = "labels"
+            try:
+                obj["pdf_text_requested_mode"] = requested_mode
+                obj["pdf_text_mode"] = delivered_mode
+                obj["pdf_text_fallback_reason"] = "meshify_failed"
+            except Exception:
+                pass
+            LOGGER.warning(
+                "Blender mesh conversion failed for %s text; retaining editable label font curve.",
+                requested_mode,
+            )
+            _record_text_mode_fallback(
+                provenance_opts,
+                requested=requested_mode,
+                delivered=delivered_mode,
+                reason="meshify_failed",
+            )
+        else:
+            obj = mesh_obj
+            delivered_mode = mode
+    else:
+        delivered_mode = mode
+    if normalized_unknown_mode:
+        try:
+            obj["pdf_text_requested_mode"] = requested_mode
+        except Exception:
+            pass
     _record_text_provenance(
         provenance_opts,
         page_number=page_number,
         text_item=text_item,
-        text_mode=mode,
+        requested_text_mode=requested_mode,
+        delivered_text_mode=delivered_mode,
         parent_handle=str(getattr(obj, "name", "") or ""),
     )
+    _record_delivered_text_entity(provenance_opts, delivered_mode)
     return obj
 
 
