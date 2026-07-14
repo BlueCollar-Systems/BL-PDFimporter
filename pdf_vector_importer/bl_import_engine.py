@@ -1585,6 +1585,7 @@ def import_pdf(
 
             # 9i. Build image/raster planes
             image_count = 0
+            raster_page_delivered = False
             if not import_cfg.ignore_images:
                 _progress(_page_progress(i, 0.92), f"Building images for page {page_num}...")
                 t_phase = time.perf_counter()
@@ -1633,6 +1634,8 @@ def import_pdf(
                 for placement in placements:
                     if _create_image_plane(placement, page_col, z_offset_m=image_z_offset_m):
                         image_count += 1
+                        if isinstance(placement, dict) and placement.get("xref") == -1:
+                            raster_page_delivered = True
                     elif isinstance(placement, dict) and int(placement.get("xref", 0) or 0) == -1:
                         _record_raster_delivery_failure(
                             total_stats["raster_delivery_failures"],
@@ -1645,7 +1648,7 @@ def import_pdf(
                             f"Raster delivery failed on page {page_num}; see import report.",
                         )
                 _add_phase_ms("images_ms", t_phase)
-            if import_mode == "raster" and image_count > 0:
+            if raster_page_delivered:
                 raster_pages_imported += 1
 
             # 9j. Multi-page stacking: shift this page's collection downward

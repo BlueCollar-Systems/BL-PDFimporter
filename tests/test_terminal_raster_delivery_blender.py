@@ -240,3 +240,50 @@ def test_auto_raster_delivery_failure_marks_fallback_as_used(monkeypatch, tmp_pa
         "used": True,
         "reason": "raster_delivery_failed",
     }
+
+
+def test_hybrid_sparse_shell_raster_success_is_reported_as_fallback(monkeypatch, tmp_path):
+    """A successful terminal raster in Hybrid mode must not be reported as no fallback."""
+    input_pdf = tmp_path / "input.pdf"
+    report_path = tmp_path / "import_report.json"
+    input_pdf.write_bytes(b"%PDF-1.7\n")
+
+    monkeypatch.setattr(bl_import_engine, "bpy", _FakeBpy())
+    monkeypatch.setattr(bl_import_engine, "check_pymupdf", lambda: True)
+    monkeypatch.setattr(bl_import_engine, "ensure_lib_path", lambda: None)
+    monkeypatch.setattr(fitz_loader, "import_fitz", lambda **_kwargs: object())
+    monkeypatch.setattr(fitz_loader, "safe_open", lambda _path: _Document())
+    monkeypatch.setattr(bl_import_engine, "extract_page", lambda *_args, **_kwargs: _page_data())
+    monkeypatch.setattr(bl_import_engine, "build_page", lambda *_args, **_kwargs: {
+        "curves": 0,
+        "meshes": 0,
+        "circles": 0,
+        "arcs": 0,
+        "skipped_fill_only": 0,
+        "model3d_solids": 0,
+    })
+    monkeypatch.setattr(bl_import_engine, "build_all_text", lambda *_args, **_kwargs: 0)
+    monkeypatch.setattr(bl_import_engine, "_extract_image_placements", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(bl_import_engine, "_render_page_raster", lambda *_args, **_kwargs: _raster_placement())
+    monkeypatch.setattr(bl_import_engine, "_create_image_plane", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(bl_import_engine.tempfile, "mkdtemp", lambda **_kwargs: str(tmp_path))
+    monkeypatch.setattr(bl_import_engine, "_pymupdf_version", lambda: "")
+
+    stats = bl_import_engine.import_pdf(
+        str(input_pdf),
+        config={
+            "mode": "hybrid",
+            "pages": "1",
+            "import_report_path": str(report_path),
+            "auto_focus_view": False,
+            "auto_hide_default_cube": False,
+        },
+    )
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert stats["images"] == 1
+    assert stats["raster_delivery_failures"] == []
+    assert report["fallback"] == {
+        "used": True,
+        "reason": "raster_fallback_1_page",
+    }
