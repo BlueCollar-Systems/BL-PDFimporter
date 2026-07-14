@@ -223,8 +223,30 @@ def write_import_report(
         or _default_import_report_path(filepath)
     )
     elapsed = float(stats.get("elapsed", 0.0) or 0.0)
-    fallback_used = raster_pages > 0 or import_mode == "raster"
-    if import_mode == "raster":
+    raster_delivery_failures = []
+    for record in list(stats.get("raster_delivery_failures") or []):
+        if not isinstance(record, dict):
+            continue
+        try:
+            page = int(record.get("page", 0) or 0)
+        except (TypeError, ValueError):
+            page = 0
+        stage = str(record.get("stage") or "").strip()
+        reason = str(record.get("reason") or "").strip()
+        if page > 0 and stage and reason:
+            raster_delivery_failures.append({
+                "page": page,
+                "stage": stage,
+                "reason": reason,
+            })
+    fallback_used = (
+        raster_pages > 0
+        or import_mode == "raster"
+        or bool(raster_delivery_failures)
+    )
+    if raster_delivery_failures:
+        fallback_reason = "raster_delivery_failed"
+    elif import_mode == "raster":
         fallback_reason = "forced_raster_mode"
     elif raster_pages > 0:
         fallback_reason = f"raster_fallback_{raster_pages}_page{'s' if raster_pages != 1 else ''}"
@@ -265,6 +287,9 @@ def write_import_report(
         "resolved_scale": stats.get("resolved_scale"),
         "scale_hints": stats.get("scale_hints"),
     }
+    if raster_delivery_failures:
+        extra["raster_delivery_failures"] = raster_delivery_failures
+        extra["raster_delivery_failure_count"] = len(raster_delivery_failures)
     if int(stats.get("recognition_skipped_pages", 0) or 0) > 0:
         extra["recognition_skipped_pages"] = int(stats.get("recognition_skipped_pages", 0) or 0)
     # TEXTMODE-1 item 12: unknown text_mode strings are normalized to the
@@ -315,6 +340,22 @@ def write_import_report(
         text_fallback=text_fallback,
         extra=extra,
     )
+    if raster_delivery_failures:
+        diagnostics = report.extra.get("diagnostics")
+        if isinstance(diagnostics, dict):
+            signals = list(diagnostics.get("signals") or [])
+            if "raster_delivery_failed" not in signals:
+                signals.append("raster_delivery_failed")
+            diagnostics["signals"] = signals
+            actions = list(diagnostics.get("recommended_actions") or [])
+            action = (
+                "The terminal raster image could not be created in Blender; "
+                "retry the import or choose Vector/Hybrid mode, then inspect "
+                "extra.raster_delivery_failures."
+            )
+            if action not in actions:
+                actions.append(action)
+            diagnostics["recommended_actions"] = actions
 
     provenance_objects = list(getattr(provenance_opts, "_source_provenance_objects", []) or [])
     if provenance_objects:
@@ -951,6 +992,23 @@ def _render_page_raster(page, page_num: int, import_cfg, image_dir: str) -> Opti
     }
 
 
+def _record_raster_delivery_failure(
+    failures: List[Dict[str, Any]],
+    *,
+    page_num: int,
+    stage: str,
+    reason: str,
+) -> None:
+    """Keep terminal-raster delivery failures visible to the caller/report."""
+    record = {
+        "page": int(page_num),
+        "stage": str(stage),
+        "reason": str(reason),
+    }
+    if record not in failures:
+        failures.append(record)
+
+
 def _create_image_plane(
     placement: dict,
     collection: bpy.types.Collection,
@@ -1303,6 +1361,7 @@ def import_pdf(
             "text_glyph_estimate": 0,
             "parts_bootstrap_text_items": [],
             "model3d_solids": 0,
+            "raster_delivery_failures": [],
         }
         raster_pages_imported = 0
         total_page_count = max(1, len(page_indices))
@@ -1534,6 +1593,17 @@ def import_pdf(
                     rendered = _render_page_raster(page, page_num, import_cfg, image_dir)
                     if rendered:
                         placements.append(rendered)
+                    else:
+                        _record_raster_delivery_failure(
+                            total_stats["raster_delivery_failures"],
+                            page_num=page_num,
+                            stage="render",
+                            reason="raster_render_failed",
+                        )
+                        _progress(
+                            _page_progress(i, 0.94),
+                            f"Raster delivery failed on page {page_num}; see import report.",
+                        )
                 else:
                     placements = _extract_image_placements(doc, page, page_num, import_cfg, image_dir)
                     if (
@@ -1548,10 +1618,32 @@ def import_pdf(
                         rendered = _render_page_raster(page, page_num, import_cfg, image_dir)
                         if rendered:
                             placements.append(rendered)
+                        else:
+                            _record_raster_delivery_failure(
+                                total_stats["raster_delivery_failures"],
+                                page_num=page_num,
+                                stage="render",
+                                reason="raster_render_failed",
+                            )
+                            _progress(
+                                _page_progress(i, 0.94),
+                                f"Raster delivery failed on page {page_num}; see import report.",
+                            )
 
                 for placement in placements:
                     if _create_image_plane(placement, page_col, z_offset_m=image_z_offset_m):
                         image_count += 1
+                    elif isinstance(placement, dict) and int(placement.get("xref", 0) or 0) == -1:
+                        _record_raster_delivery_failure(
+                            total_stats["raster_delivery_failures"],
+                            page_num=page_num,
+                            stage="plane",
+                            reason="raster_plane_creation_failed",
+                        )
+                        _progress(
+                            _page_progress(i, 0.94),
+                            f"Raster delivery failed on page {page_num}; see import report.",
+                        )
                 _add_phase_ms("images_ms", t_phase)
             if import_mode == "raster" and image_count > 0:
                 raster_pages_imported += 1
