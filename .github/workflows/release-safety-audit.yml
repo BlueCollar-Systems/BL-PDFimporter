@@ -1,0 +1,63 @@
+name: release-safety-audit
+
+# SWEEP-05 (round 21 sweep): the auto-release job is gated by
+# `!contains(head_commit.message, '[skip release]')`, so its stranded-release
+# audit never runs exactly when a product commit is mislabeled [skip release]
+# — the failure mode that stranded 6ddd4ce/bb0b8a4 above v1.0.64. This
+# workflow runs the warn-only product-delta audit on EVERY main push,
+# regardless of commit message, and never mints. Warnings land in the job
+# summary and the runner-local .release-safety/warnings.json semantics
+# (report mode, exit 0).
+
+on:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Warn-only stranded-release audit
+        run: |
+          set -e
+          VERSION=$(python - <<'PY'
+          import pathlib, re
+          text = pathlib.Path("pdf_vector_importer/__init__.py").read_text(encoding="utf-8")
+          match = re.search(r'"version":\s*\((\d+),\s*(\d+),\s*(\d+)\)', text)
+          if not match:
+              raise SystemExit("Could not parse version tuple from pdf_vector_importer/__init__.py")
+          print(".".join(match.groups()))
+          PY
+          )
+          TAG="v${VERSION}"
+          if ! git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            echo "::notice::Tag ${TAG} does not exist yet — version was bumped; auto-release owns minting. Nothing stranded to audit."
+            exit 0
+          fi
+          python scripts/release_safety.py audit-existing-tag \
+            --repo "${GITHUB_REPOSITORY}" \
+            --tag "${TAG}" \
+            --before "${{ github.event.before }}" \
+            --head "${GITHUB_SHA}" \
+            --session-id "${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --mode report \
+            --summary "$GITHUB_STEP_SUMMARY" \
+            --warnings-file .release-safety/warnings.json
