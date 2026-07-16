@@ -1,6 +1,7 @@
 """BCS-ARCH-001 clean-break contract: old --preset and quality-tier flags are gone."""
 from __future__ import annotations
 
+import ast
 import os
 import subprocess
 import sys
@@ -143,13 +144,50 @@ class TestRule5OperatorPropsRemoved(unittest.TestCase):
         self.assertNotIn("Import text as Blender text objects (default)", self.source)
 
     def test_no_legacy_preset_labels(self) -> None:
+        # RB-11: the old file-wide quoted-word ban also fired on unrelated
+        # docstrings, tooltips, or comments. The behavior this test protects
+        # is narrower: the operator must not OFFER a legacy preset as a UI
+        # choice, so scope the ban to strings inside EnumProperty items.
+        tree = ast.parse(self.source)
+        module_assigns: dict[str, ast.AST] = {}
+        for stmt in tree.body:
+            if isinstance(stmt, ast.Assign):
+                for target in stmt.targets:
+                    if isinstance(target, ast.Name):
+                        module_assigns[target.id] = stmt.value
+            elif isinstance(stmt, ast.AnnAssign) and stmt.value is not None:
+                if isinstance(stmt.target, ast.Name):
+                    module_assigns[stmt.target.id] = stmt.value
+        enum_item_strings: list[str] = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+            if name != "EnumProperty":
+                continue
+            for keyword in node.keywords:
+                if keyword.arg != "items":
+                    continue
+                value = keyword.value
+                if isinstance(value, ast.Name):
+                    value = module_assigns.get(value.id)
+                if value is None:
+                    continue
+                for sub in ast.walk(value):
+                    if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+                        enum_item_strings.append(sub.value)
+        self.assertTrue(
+            enum_item_strings,
+            "No EnumProperty items found in operators.py — scoping broke.",
+        )
         for label in (
             "Fast", "Balanced", "Full", "Max Fidelity", "Raster Image",
             "Custom...", "Shop Drawing", "Technical Drawing",
         ):
             self.assertNotIn(
-                f'"{label}"', self.source,
-                f"Operator still references legacy preset label {label!r}.",
+                label, enum_item_strings,
+                f"EnumProperty items still offer legacy preset label {label!r}.",
             )
 
 
@@ -157,9 +195,12 @@ class TestTextDefaults(unittest.TestCase):
     """Core config defaults must not silently return to Labels."""
 
     def test_embedded_configs_default_to_3d_text(self) -> None:
-        source = ADDON_CONFIG_PY.read_text(encoding="utf-8")
-        self.assertIn('text_mode: str = "3d_text"', source)
-        self.assertNotIn('text_mode: str = "labels"', source)
+        # RB-11: value-lock the synced pdfcadcore default instead of grepping
+        # the literal source declaration — the exact-string lock constrained
+        # implementation wording rather than the default value it protects.
+        from pdf_vector_importer.pdfcadcore.import_config import ImportConfig
+
+        self.assertEqual(ImportConfig().text_mode, "3d_text")
 
     def test_engine_passes_text_mode_to_builder(self) -> None:
         source = IMPORT_ENGINE_PY.read_text(encoding="utf-8")
