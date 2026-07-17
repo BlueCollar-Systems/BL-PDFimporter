@@ -4,6 +4,7 @@ from __future__ import annotations
 import builtins
 import math
 from hashlib import sha256
+from io import BytesIO
 from pathlib import Path
 import sys
 import types
@@ -221,6 +222,42 @@ class _Object(dict):
         return None
 
 
+class _AffineMatrix(tuple):
+    def __new__(cls, rows):
+        return super().__new__(
+            cls,
+            tuple(tuple(float(value) for value in row) for row in rows),
+        )
+
+    @classmethod
+    def Identity(cls, size):
+        return cls(
+            tuple(
+                tuple(1.0 if row == column else 0.0 for column in range(size))
+                for row in range(size)
+            )
+        )
+
+    def __matmul__(self, vector):
+        values = tuple(float(value) for value in vector)
+        homogeneous = (*values[:3], 1.0)
+        return tuple(
+            sum(self[row][column] * homogeneous[column] for column in range(4))
+            for row in range(3)
+        )
+
+
+def _install_mathutils(monkeypatch):
+    monkeypatch.setitem(
+        sys.modules,
+        "mathutils",
+        types.SimpleNamespace(
+            Matrix=_AffineMatrix,
+            Vector=lambda values: tuple(float(value) for value in values),
+        ),
+    )
+
+
 class _CollectionObjects:
     def __init__(self):
         self.items = []
@@ -394,6 +431,69 @@ def _font_asset():
         ascender=800,
         descender=-200,
         glyph_advances=tuple(500 for _index in range(128)),
+    )
+
+
+def _metric_font_asset():
+    from fontTools.fontBuilder import FontBuilder
+    from fontTools.pens.ttGlyphPen import TTGlyphPen
+
+    def glyph(points=()):
+        pen = TTGlyphPen(None)
+        if points:
+            pen.moveTo(points[0])
+            for point in points[1:]:
+                pen.lineTo(point)
+            pen.closePath()
+        return pen.glyph()
+
+    builder = FontBuilder(1000, isTTF=True)
+    glyph_order = (".notdef", "A", "space")
+    builder.setupGlyphOrder(glyph_order)
+    builder.setupGlyf({
+        ".notdef": glyph(((0, 0), (400, 0), (400, 700), (0, 700))),
+        "A": glyph(((100, -200), (500, -200), (500, 700), (100, 700))),
+        "space": glyph(),
+    })
+    builder.setupHorizontalMetrics({
+        ".notdef": (500, 0),
+        "A": (500, 100),
+        "space": (300, 0),
+    })
+    builder.setupHorizontalHeader(ascent=1200, descent=-300)
+    builder.setupCharacterMap({65: "A", 32: "space"})
+    builder.setupNameTable({
+        "familyName": "MetricFixture",
+        "styleName": "Regular",
+        "uniqueFontIdentifier": "MetricFixture Regular",
+        "fullName": "MetricFixture Regular",
+        "psName": "MetricFixture-Regular",
+    })
+    builder.setupOS2(
+        sTypoAscender=1200,
+        sTypoDescender=-300,
+        usWinAscent=1200,
+        usWinDescent=300,
+    )
+    builder.setupPost()
+    builder.setupMaxp()
+    stream = BytesIO()
+    builder.save(stream)
+    font_bytes = stream.getvalue()
+    return types.SimpleNamespace(
+        asset_id=f"sha256:{sha256(font_bytes).hexdigest()}",
+        usable_sha256=sha256(font_bytes).hexdigest(),
+        usable_format="ttf",
+        usable_bytes=font_bytes,
+        source_sha256="metric-source",
+        base_font_name="MetricFixture",
+        source_xref=9,
+        page_number=2,
+        span_font_name="MetricFixture",
+        units_per_em=1000,
+        ascender=1200,
+        descender=-300,
+        glyph_advances=(500, 500, 300),
     )
 
 
@@ -751,6 +851,130 @@ def test_positioned_whitespace_without_glyph_id_uses_source_layout_identity_metr
     assert metrics["zero_ink_identity"] is True
     assert metrics["local_advance"] == pytest.approx(0.006)
     assert metrics["local_line_height"] == pytest.approx(0.006)
+
+
+def test_positioned_font_axis_metrics_use_upem_for_horizontal_glyph_domain():
+    layout = _character_layout()[0]
+    layout.glyph_id = 1
+    parent = _item()
+    parent.font_asset = _metric_font_asset()
+    child = bl_text_builder._character_text_item(parent, layout)
+    data = _FontData("MetricDomain")
+    data.size = 0.006
+    obj = _Object("MetricDomain", data)
+    obj["pdf_baseline_alignment"] = "BOTTOM"
+
+    metrics = bl_text_builder._positioned_font_axis_metrics(obj, child)
+
+    assert metrics["design_unit_scale"] == pytest.approx(0.006 / 1000.0)
+    assert metrics["local_advance"] == pytest.approx(0.003)
+    assert metrics["local_line_height"] == pytest.approx(0.009)
+    assert metrics["local_baseline_y"] == pytest.approx(0.0018)
+    assert metrics["source_ink_bounds_design_units"] == pytest.approx(
+        (100.0, -200.0, 500.0, 700.0)
+    )
+
+
+def test_positioned_metric_affine_stores_exact_source_glyph_world_ink_bounds(monkeypatch):
+    _install_mathutils(monkeypatch)
+    layout = _character_layout()[0]
+    layout.glyph_id = 1
+    parent = _item()
+    parent.font_asset = _metric_font_asset()
+    child = bl_text_builder._character_text_item(parent, layout)
+    data = _FontData("SourceBounds")
+    data.size = 0.006
+    obj = _Object("SourceBounds", data)
+    obj["pdf_baseline_alignment"] = "BOTTOM_BASELINE"
+
+    bl_text_builder._apply_target_quad_affine(obj, child, 0.0)
+
+    assert obj.get("pdf_metric_expected_world_ink_bounds_m") == pytest.approx(
+        (0.0132, 0.0232, 0.018, 0.0268)
+    )
+
+
+def test_positioned_metric_verification_rejects_evaluated_ink_bounds_outside_exact_source_glyph_bounds(
+    monkeypatch,
+):
+    _install(monkeypatch)
+    _install_mathutils(monkeypatch)
+    identity = _AffineMatrix.Identity(4)
+    child = bl_text_builder._character_text_item(_item(), _character_layout()[0])
+    child.insertion = (0.0, 0.0)
+    child.target_quad_model = (
+        (0.0, 1000.0),
+        (1000.0, 1000.0),
+        (1000.0, 0.0),
+        (0.0, 0.0),
+    )
+    data = _FontData("OverwideInk")
+    obj = _Object("OverwideInk", data)
+    obj.matrix_world = identity
+    obj._base_dimensions = (0.75, 1.0, 0.0)
+    obj.bound_box = (
+        (0.0, 0.0, 0.0),
+        (0.75, 0.0, 0.0),
+        (0.75, 1.0, 0.0),
+        (0.0, 1.0, 0.0),
+        (0.0, 0.0, 0.0),
+        (0.75, 0.0, 0.0),
+        (0.75, 1.0, 0.0),
+        (0.0, 1.0, 0.0),
+    )
+    obj.update({
+        "pdf_metric_local_advance": 1.0,
+        "pdf_metric_local_line_height": 1.0,
+        "pdf_metric_local_baseline_y": 0.0,
+        "pdf_metric_zero_ink_identity": False,
+        "pdf_metric_expected_world_ink_bounds_m": [0.0, 0.0, 0.5, 1.0],
+        "pdf_affine_matrix": [value for row in identity for value in row],
+    })
+
+    failures, evidence = bl_text_builder._verify_metric_character_transform(obj, child)
+
+    assert "evaluated_ink_bounds_outside_exact_source_glyph_bounds" in failures
+    assert evidence["expected_world_ink_bounds_m"] == pytest.approx(
+        (0.0, 0.0, 0.5, 1.0)
+    )
+    assert evidence["actual_world_ink_bounds_m"] == pytest.approx(
+        (0.0, 0.0, 0.75, 1.0)
+    )
+
+
+def test_positioned_metric_verification_preserves_explicit_zero_ink_identity(monkeypatch):
+    _install(monkeypatch)
+    _install_mathutils(monkeypatch)
+    identity = _AffineMatrix.Identity(4)
+    layout = TextCharLayout(
+        text=" ",
+        glyph_id=None,
+        source_origin_pdf=(0.0, 0.0),
+        source_bbox_pdf=(0.0, 0.0, 1000.0, 1000.0),
+        source_quad_pdf=((0.0, 0.0), (1000.0, 0.0), (1000.0, 1000.0), (0.0, 1000.0)),
+        target_origin=(0.0, 0.0),
+        target_quad=((0.0, 1000.0), (1000.0, 1000.0), (1000.0, 0.0), (0.0, 0.0)),
+        advance_width=1000.0,
+        glyph_height=1000.0,
+    )
+    child = bl_text_builder._character_text_item(_item(), layout)
+    data = _FontData("ZeroInk")
+    obj = _Object("ZeroInk", data)
+    obj.matrix_world = identity
+    obj.update({
+        "pdf_metric_local_advance": 1.0,
+        "pdf_metric_local_line_height": 1.0,
+        "pdf_metric_local_baseline_y": 0.0,
+        "pdf_metric_zero_ink_identity": True,
+        "pdf_affine_matrix": [value for row in identity for value in row],
+    })
+
+    failures, evidence = bl_text_builder._verify_metric_character_transform(obj, child)
+
+    assert failures == []
+    assert evidence["zero_ink_identity"] is True
+    assert evidence["expected_world_ink_bounds_m"] is None
+    assert evidence["actual_world_ink_bounds_m"] is None
 
 
 def test_affine_coefficients_preserve_shear_and_mirror():

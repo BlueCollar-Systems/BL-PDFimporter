@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from hashlib import sha256
+from io import BytesIO
 import logging
 import math
 import os
@@ -27,7 +28,11 @@ from .text_delivery import (
 MM_TO_M = 0.001
 _FONT_SIZE_SCALE = 1.0
 _FONT_CACHE: Dict[str, bpy.types.VectorFont] = {}
+_EXACT_GLYPH_DESIGN_BOUNDS_CACHE: Dict[
+    Tuple[str, int], Optional[Tuple[float, float, float, float]]
+] = {}
 _TEXT_MODES = {"labels", "text", "3d_text", "glyphs", "geometry", "raster"}
+_METRIC_INK_BOUNDS_TOLERANCE_M = 5e-5
 LOGGER = logging.getLogger(__name__)
 
 
@@ -375,6 +380,100 @@ def _quad_requires_full_affine(quad) -> bool:
     return abs(dot) > 1e-6 or determinant < 0.0
 
 
+def _exact_glyph_design_bounds(asset, glyph_id: int):
+    """Return source-font design bounds for one glyph, never host-derived bounds."""
+    try:
+        data = bytes(asset.usable_bytes)
+        digest = str(asset.usable_sha256 or "")
+        expected_upem = int(asset.units_per_em)
+        glyph_id = int(glyph_id)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise RuntimeError("exact embedded glyph bound source is unavailable") from exc
+    if (
+        not data
+        or not digest
+        or sha256(data).hexdigest() != digest
+        or expected_upem <= 0
+        or glyph_id < 0
+    ):
+        raise RuntimeError("exact embedded glyph bound source is invalid")
+    cache_key = (digest, glyph_id)
+    if cache_key in _EXACT_GLYPH_DESIGN_BOUNDS_CACHE:
+        return _EXACT_GLYPH_DESIGN_BOUNDS_CACHE[cache_key]
+
+    try:
+        from fontTools.pens.boundsPen import BoundsPen
+        from fontTools.ttLib import TTFont, TTLibError
+    except ImportError as exc:
+        raise RuntimeError("fontTools is unavailable for exact glyph bounds") from exc
+
+    font = None
+    try:
+        font = TTFont(BytesIO(data), lazy=False, recalcTimestamp=False)
+        if int(font["head"].unitsPerEm) != expected_upem:
+            raise RuntimeError("embedded font metric metadata does not match glyph design units")
+        glyph_order = tuple(font.getGlyphOrder())
+        glyph_name = glyph_order[glyph_id]
+        glyph_set = font.getGlyphSet()
+        pen = BoundsPen(glyph_set)
+        glyph_set[glyph_name].draw(pen)
+        if pen.bounds is None:
+            bounds = None
+        else:
+            bounds = tuple(float(value) for value in pen.bounds)
+            if len(bounds) != 4 or not all(math.isfinite(value) for value in bounds):
+                raise RuntimeError("exact embedded glyph bounds are non-finite")
+    except RuntimeError:
+        raise
+    except (AttributeError, IndexError, KeyError, OSError, TTLibError, TypeError, ValueError) as exc:
+        raise RuntimeError("exact embedded glyph bounds are unavailable") from exc
+    finally:
+        if font is not None:
+            font.close()
+    _EXACT_GLYPH_DESIGN_BOUNDS_CACHE[cache_key] = bounds
+    return bounds
+
+
+def _metric_expected_world_ink_bounds(metric_evidence, matrix_values):
+    """Transform exact source glyph bounds through the intended metric affine."""
+    source_bounds = metric_evidence.get("source_ink_bounds_design_units")
+    if source_bounds is None:
+        return None
+    x0, y0, x1, y1 = (float(value) for value in source_bounds)
+    unit_scale = float(metric_evidence["design_unit_scale"])
+    baseline_y = float(metric_evidence["local_baseline_y"])
+    local_bounds = (
+        x0 * unit_scale,
+        y0 * unit_scale + baseline_y,
+        x1 * unit_scale,
+        y1 * unit_scale + baseline_y,
+    )
+    matrix = tuple(tuple(float(value) for value in row) for row in matrix_values)
+    if len(matrix) != 4 or any(len(row) != 4 for row in matrix):
+        raise ValueError("a 4x4 metric affine matrix is required for glyph bounds")
+    points = tuple(
+        (
+            matrix[0][0] * x + matrix[0][1] * y + matrix[0][3],
+            matrix[1][0] * x + matrix[1][1] * y + matrix[1][3],
+        )
+        for x, y in (
+            (local_bounds[0], local_bounds[1]),
+            (local_bounds[2], local_bounds[1]),
+            (local_bounds[2], local_bounds[3]),
+            (local_bounds[0], local_bounds[3]),
+        )
+    )
+    values = tuple(value for point in points for value in point)
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError("computed exact glyph world bounds are non-finite")
+    return (
+        min(point[0] for point in points),
+        min(point[1] for point in points),
+        max(point[0] for point in points),
+        max(point[1] for point in points),
+    )
+
+
 def _positioned_font_axis_metrics(obj, text_item) -> Dict[str, Any]:
     asset = getattr(text_item, "font_asset", None)
     glyph_id = getattr(text_item, "source_glyph_id", None)
@@ -410,9 +509,11 @@ def _positioned_font_axis_metrics(obj, text_item) -> Dict[str, Any]:
             "descender": 0,
             "advance_units": 0,
             "line_height_units": 0,
+            "design_unit_scale": 0.0,
             "local_advance": local_advance,
             "local_line_height": local_line_height,
             "local_baseline_y": local_baseline_y,
+            "source_ink_bounds_design_units": None,
             "metric_source": "source_layout_zero_ink",
             "zero_ink_identity": True,
         }
@@ -438,10 +539,14 @@ def _positioned_font_axis_metrics(obj, text_item) -> Dict[str, Any]:
         or size <= 0.0
     ):
         raise RuntimeError("exact embedded font metrics are invalid for positioned character")
-    local_unit_scale = size / float(line_height_units)
+    design_unit_scale = size / float(units_per_em)
+    source_ink_bounds = _exact_glyph_design_bounds(asset, glyph_id)
+    zero_ink_identity = source_ink_bounds is None
+    if zero_ink_identity and str(getattr(text_item, "text", "") or "").strip():
+        raise RuntimeError("visible positioned character has no exact source glyph ink bounds")
     baseline_alignment = str(obj.get("pdf_baseline_alignment", "") or "")
     local_baseline_y = (
-        -float(descender) * local_unit_scale
+        -float(descender) * design_unit_scale
         if baseline_alignment == "BOTTOM"
         else 0.0
     )
@@ -452,11 +557,13 @@ def _positioned_font_axis_metrics(obj, text_item) -> Dict[str, Any]:
         "descender": descender,
         "advance_units": advance_units,
         "line_height_units": line_height_units,
-        "local_advance": float(advance_units) * local_unit_scale,
-        "local_line_height": size,
+        "design_unit_scale": design_unit_scale,
+        "local_advance": float(advance_units) * design_unit_scale,
+        "local_line_height": float(line_height_units) * design_unit_scale,
         "local_baseline_y": local_baseline_y,
+        "source_ink_bounds_design_units": source_ink_bounds,
         "metric_source": "embedded_font_glyph_metrics",
-        "zero_ink_identity": False,
+        "zero_ink_identity": zero_ink_identity,
     }
 
 
@@ -493,6 +600,12 @@ def _apply_target_quad_affine(
             target_quad=target_quad,
             z=float(z_offset_m),
         )
+        expected_ink_bounds = _metric_expected_world_ink_bounds(
+            metric_evidence, matrix_values
+        )
+        metric_evidence.pop("source_ink_bounds_design_units", None)
+        if expected_ink_bounds is not None:
+            metric_evidence["expected_world_ink_bounds_m"] = list(expected_ink_bounds)
     else:
         try:
             corners = list(obj.bound_box)
@@ -1228,6 +1341,80 @@ def _verify_metric_character_transform(obj, text_item) -> tuple[list[str], Dict[
         )
         evaluated_matrix = [float(value) for row in matrix for value in row]
         intended_matrix = [float(value) for value in obj.get("pdf_affine_matrix", [])]
+        zero_ink_identity = bool(obj.get("pdf_metric_zero_ink_identity", False))
+        expected_world_ink_bounds = None
+        actual_world_ink_bounds = None
+        ink_bounds_verified = zero_ink_identity
+        if not zero_ink_identity:
+            try:
+                expected_world_ink_bounds = tuple(
+                    float(value)
+                    for value in obj.get("pdf_metric_expected_world_ink_bounds_m", [])
+                )
+                if (
+                    len(expected_world_ink_bounds) != 4
+                    or not all(
+                        math.isfinite(value) for value in expected_world_ink_bounds
+                    )
+                    or expected_world_ink_bounds[0] > expected_world_ink_bounds[2]
+                    or expected_world_ink_bounds[1] > expected_world_ink_bounds[3]
+                ):
+                    raise ValueError("invalid exact source glyph world bounds")
+            except (AttributeError, TypeError, ValueError):
+                expected_world_ink_bounds = None
+                failures.append("exact_source_glyph_ink_bounds_unavailable")
+            try:
+                evaluated_corners = tuple(evaluated.bound_box)
+                if not evaluated_corners:
+                    raise ValueError("evaluated glyph has no bound-box corners")
+                evaluated_world_points = tuple(
+                    matrix @ Vector(tuple(float(value) for value in corner[:3]))
+                    for corner in evaluated_corners
+                )
+                evaluated_xs = tuple(float(point[0]) for point in evaluated_world_points)
+                evaluated_ys = tuple(float(point[1]) for point in evaluated_world_points)
+                actual_world_ink_bounds = (
+                    min(evaluated_xs),
+                    min(evaluated_ys),
+                    max(evaluated_xs),
+                    max(evaluated_ys),
+                )
+                if not all(math.isfinite(value) for value in actual_world_ink_bounds):
+                    raise ValueError("evaluated glyph bounds are non-finite")
+            except (AttributeError, IndexError, TypeError, ValueError):
+                actual_world_ink_bounds = None
+                failures.append("evaluated_glyph_ink_bounds_unverifiable")
+            if (
+                expected_world_ink_bounds is not None
+                and actual_world_ink_bounds is not None
+            ):
+                # Blender tessellates font curves. 0.05 mm permits that finite
+                # host approximation while remaining far below visible overscale.
+                tolerance = _METRIC_INK_BOUNDS_TOLERANCE_M
+                outside = (
+                    actual_world_ink_bounds[0]
+                    < expected_world_ink_bounds[0] - tolerance
+                    or actual_world_ink_bounds[1]
+                    < expected_world_ink_bounds[1] - tolerance
+                    or actual_world_ink_bounds[2]
+                    > expected_world_ink_bounds[2] + tolerance
+                    or actual_world_ink_bounds[3]
+                    > expected_world_ink_bounds[3] + tolerance
+                )
+                mismatch = any(
+                    abs(actual - expected) > tolerance
+                    for actual, expected in zip(  # noqa: B905
+                        actual_world_ink_bounds, expected_world_ink_bounds
+                    )
+                )
+                if outside:
+                    failures.append(
+                        "evaluated_ink_bounds_outside_exact_source_glyph_bounds"
+                    )
+                elif mismatch:
+                    failures.append("evaluated_ink_bounds_mismatch_exact_source_glyph_bounds")
+                else:
+                    ink_bounds_verified = True
         finite_values = (
             *actual_baseline,
             *actual_advance,
@@ -1255,6 +1442,19 @@ def _verify_metric_character_transform(obj, text_item) -> tuple[list[str], Dict[
             local_baseline_y_m=local_baseline_y,
             evaluated_affine_matrix=evaluated_matrix,
             intended_affine_matrix=intended_matrix,
+            zero_ink_identity=zero_ink_identity,
+            expected_world_ink_bounds_m=(
+                list(expected_world_ink_bounds)
+                if expected_world_ink_bounds is not None
+                else None
+            ),
+            actual_world_ink_bounds_m=(
+                list(actual_world_ink_bounds)
+                if actual_world_ink_bounds is not None
+                else None
+            ),
+            ink_bounds_tolerance_m=_METRIC_INK_BOUNDS_TOLERANCE_M,
+            evaluated_ink_bounds_verified=ink_bounds_verified,
             affine_carrier=str(obj.get("pdf_affine_carrier", "") or ""),
             baseline_alignment=str(obj.get("pdf_baseline_alignment", "") or ""),
             evaluated_bounds_verified=True,
@@ -1670,9 +1870,13 @@ def _copy_object_transform(source, target) -> None:
         "pdf_metric_descender",
         "pdf_metric_advance_units",
         "pdf_metric_line_height_units",
+        "pdf_metric_design_unit_scale",
         "pdf_metric_local_advance",
         "pdf_metric_local_line_height",
         "pdf_metric_local_baseline_y",
+        "pdf_metric_metric_source",
+        "pdf_metric_zero_ink_identity",
+        "pdf_metric_expected_world_ink_bounds_m",
         "pdf_metric_target_origin_m",
         "pdf_metric_target_horizontal_axis_m",
         "pdf_metric_target_vertical_axis_m",
