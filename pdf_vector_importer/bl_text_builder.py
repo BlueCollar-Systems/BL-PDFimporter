@@ -2892,11 +2892,25 @@ def _prepare_positioned_converted_candidate(
     delivered,
     item_id,
     depsgraph,
+    source_verification,
     mesh_factory=None,
 ):
     """Convert one evaluated FONT without forcing a dependency-graph update."""
     final_data = None
     final = None
+    source_evidence = dict(source_verification or {})
+    try:
+        source_marks_zero_ink = bool(
+            source.get("pdf_metric_zero_ink_identity", False)
+        )
+    except (AttributeError, ReferenceError, TypeError):
+        source_marks_zero_ink = False
+    verified_zero_ink = (
+        source_marks_zero_ink
+        and source_evidence.get("zero_ink_identity") is True
+        and source_evidence.get("evaluated_ink_bounds_verified") is True
+        and not str(getattr(text_item, "text", "") or "").strip()
+    )
     try:
         evaluated = source.evaluated_get(depsgraph)
         if delivered == "glyphs":
@@ -2915,7 +2929,7 @@ def _prepare_positioned_converted_candidate(
                     ),
                     owned_objects=_owned_objects_for_text_entity(source),
                     owned_datablocks=(source_data,),
-                )
+                ), None
             converted = to_curve(depsgraph, apply_modifiers=False)
             try:
                 final_data = converted.copy()
@@ -2924,6 +2938,18 @@ def _prepare_positioned_converted_candidate(
                 if callable(clear):
                     clear()
             if not list(getattr(final_data, "splines", []) or []):
+                if verified_zero_ink:
+                    return None, final_data, None, {
+                        **source_evidence,
+                        "item_id": item_id,
+                        "zero_ink_identity": True,
+                        "evaluated_ink_bounds_verified": True,
+                        "conversion_outcome": (
+                            "verified_zero_ink_no_physical_entity"
+                        ),
+                        "converted_datablock_kind": "CURVE",
+                        "converted_ink_element_count": 0,
+                    }
                 return None, final_data, AttemptOutcome.failed(
                     "glyph_curve_has_no_verified_splines",
                     evidence={"item_id": item_id},
@@ -2933,13 +2959,25 @@ def _prepare_positioned_converted_candidate(
                     ),
                     owned_objects=_owned_objects_for_text_entity(source),
                     owned_datablocks=(source_data, final_data),
-                )
+                ), None
             final_data.name = f"{source.name}_glyph_curve"
         elif delivered == "geometry":
             if not callable(mesh_factory):  # pragma: no cover - checked by caller
                 raise RuntimeError("positioned mesh conversion capability disappeared")
             final_data = mesh_factory(evaluated, depsgraph=depsgraph)
             if not list(getattr(final_data, "vertices", []) or []):
+                if verified_zero_ink:
+                    return None, final_data, None, {
+                        **source_evidence,
+                        "item_id": item_id,
+                        "zero_ink_identity": True,
+                        "evaluated_ink_bounds_verified": True,
+                        "conversion_outcome": (
+                            "verified_zero_ink_no_physical_entity"
+                        ),
+                        "converted_datablock_kind": "MESH",
+                        "converted_ink_element_count": 0,
+                    }
                 return None, final_data, AttemptOutcome.failed(
                     "geometry_mesh_has_no_verified_vertices",
                     evidence={"item_id": item_id},
@@ -2949,7 +2987,7 @@ def _prepare_positioned_converted_candidate(
                     ),
                     owned_objects=_owned_objects_for_text_entity(source),
                     owned_datablocks=(source_data, final_data),
-                )
+                ), None
             final_data.name = f"{source.name}_mesh"
         else:  # pragma: no cover - caller constrains the rung
             raise ValueError(f"unsupported positioned representation: {delivered}")
@@ -2966,7 +3004,7 @@ def _prepare_positioned_converted_candidate(
         _copy_text_material_metadata(source, final)
         final["pdf_text_source"] = str(text_item.text)
         collection.objects.link(final)
-        return final, final_data, None
+        return final, final_data, None, None
     except Exception as exc:
         reason = (
             "glyph_curve_conversion_failed_not_impossibility_proof"
@@ -2990,7 +3028,7 @@ def _prepare_positioned_converted_candidate(
                 for value in (source_data, final_data)
                 if _valid_owned_ref(value)
             ),
-        )
+        ), None
 
 
 def _attempt_positioned_converted_characters(
@@ -3027,13 +3065,18 @@ def _attempt_positioned_converted_characters(
         layout = candidate["layout"]
         child = candidate["child"]
         return {
+            "item_id": item_id,
             "character_index": candidate["index"],
             "text": str(layout.text),
             "glyph_id": getattr(layout, "glyph_id", None),
+            "advance_width_model": float(layout.advance_width),
             "source_origin_pdf": list(layout.source_origin_pdf),
+            "source_bbox_pdf": list(layout.source_bbox_pdf),
             "source_quad_pdf": [list(point) for point in layout.source_quad_pdf],
             "target_origin_model": list(layout.target_origin),
             "target_quad_model": [list(point) for point in layout.target_quad],
+            "requested_representation": requested,
+            "delivered_representation": delivered,
             "positioned_character": bool(
                 getattr(child, "positioned_character", False)
             ),
@@ -3122,6 +3165,8 @@ def _attempt_positioned_converted_characters(
             "source_data": source_data,
             "final": None,
             "final_data": None,
+            "source_verification": None,
+            "zero_ink_evidence": None,
         })
 
     try:
@@ -3152,6 +3197,7 @@ def _attempt_positioned_converted_characters(
                 candidate["index"],
                 source_records,
             )
+        candidate["source_verification"] = dict(source_outcome.evidence or {})
         source_records.append(character_record(candidate, source_outcome))
 
     try:
@@ -3168,26 +3214,77 @@ def _attempt_positioned_converted_characters(
         return aggregate_failure(failure, records=source_records)
 
     for candidate in candidates:
-        final, final_data, failure = _prepare_positioned_converted_candidate(
-            candidate["source"],
-            candidate["source_data"],
-            candidate["child"],
-            collection,
-            page_number=page_number,
-            requested=requested,
-            delivered=delivered,
-            item_id=item_id,
-            depsgraph=depsgraph,
-            mesh_factory=mesh_factory,
+        final, final_data, failure, zero_ink_evidence = (
+            _prepare_positioned_converted_candidate(
+                candidate["source"],
+                candidate["source_data"],
+                candidate["child"],
+                collection,
+                page_number=page_number,
+                requested=requested,
+                delivered=delivered,
+                item_id=item_id,
+                depsgraph=depsgraph,
+                source_verification=candidate["source_verification"],
+                mesh_factory=mesh_factory,
+            )
         )
         candidate["final"] = final
         candidate["final_data"] = final_data
+        candidate["zero_ink_evidence"] = zero_ink_evidence
         if failure is not None:
             records = list(source_records)
             records[candidate["index"]] = character_record(candidate, failure)
             return aggregate_failure(failure, candidate["index"], records)
 
     for candidate in candidates:
+        if candidate["zero_ink_evidence"] is not None:
+            cleanup_outcome = AttemptOutcome.delivered(
+                candidate["source"],
+                entity_ids=(candidate["source"].name,),
+                evidence=dict(candidate["zero_ink_evidence"]),
+                owned_artifacts=(
+                    *_owned_artifacts_for_text_entity(
+                        candidate["source"], candidate["source_data"]
+                    ),
+                    _artifact(None, candidate["final_data"]),
+                ),
+                owned_objects=_owned_objects_for_text_entity(candidate["source"]),
+                owned_datablocks=(
+                    candidate["source_data"],
+                    candidate["final_data"],
+                ),
+            )
+            cleanup = _cleanup_attempt(cleanup_outcome, collection)
+            if cleanup.get("status") != "complete":
+                failure = AttemptOutcome.failed(
+                    "verified_zero_ink_candidate_cleanup_failed",
+                    evidence={"item_id": item_id, "cleanup": cleanup},
+                    owned_artifacts=cleanup_outcome.owned_artifacts,
+                    owned_objects=cleanup_outcome.owned_objects,
+                    owned_datablocks=cleanup_outcome.owned_datablocks,
+                )
+                return aggregate_failure(
+                    failure,
+                    candidate["index"],
+                    source_records,
+                )
+            candidate["source"] = None
+            candidate["source_data"] = None
+            candidate["final_data"] = None
+            candidate["zero_ink_evidence"].update(
+                cleanup=cleanup,
+                zero_ink_source_font_cleaned=True,
+                empty_conversion_datablock_cleaned=True,
+            )
+            zero_ink_outcome = AttemptOutcome.delivered(
+                None,
+                evidence=dict(candidate["zero_ink_evidence"]),
+            )
+            source_records[candidate["index"]] = character_record(
+                candidate, zero_ink_outcome
+            )
+            continue
         cleanup, remaining_objects, remaining_data = _remove_object_and_data(
             candidate["source"], candidate["source_data"], collection
         )
@@ -3221,6 +3318,13 @@ def _attempt_positioned_converted_characters(
     outcomes = []
     character_evidence = []
     for candidate in candidates:
+        if candidate["zero_ink_evidence"] is not None:
+            zero_ink_outcome = AttemptOutcome.delivered(
+                None,
+                evidence=dict(candidate["zero_ink_evidence"]),
+            )
+            character_evidence.append(character_record(candidate, zero_ink_outcome))
+            continue
         verification_failure, verification_evidence = _verify_converted_candidate(
             candidate["final"],
             candidate["final_data"],
@@ -3268,13 +3372,34 @@ def _attempt_positioned_converted_characters(
         except (AttributeError, ReferenceError, TypeError, ValueError):
             pass
 
+    if not outcomes:
+        failure = AttemptOutcome.failed(
+            "positioned_conversion_has_no_visible_entities",
+            evidence={
+                "item_id": item_id,
+                "character_entities": character_evidence,
+                "zero_ink_character_count": len(character_evidence),
+            },
+        )
+        return aggregate_failure(failure, records=character_evidence)
+
     first = outcomes[0]
+    zero_ink_count = sum(
+        1
+        for candidate in candidates
+        if candidate["zero_ink_evidence"] is not None
+    )
+    physical_entity_count = sum(len(outcome.entity_ids) for outcome in outcomes)
     evidence = {
         **_font_asset_evidence(text_item),
         **dict(first.evidence or {}),
         "item_id": item_id,
         "character_positioning_preserved": True,
-        "character_count": len(outcomes),
+        "character_count": len(candidates),
+        "attempted_character_count": len(candidates),
+        "visible_character_count": len(outcomes),
+        "zero_ink_character_count": zero_ink_count,
+        "physical_entity_count": physical_entity_count,
         "character_entities": character_evidence,
         "dependency_graph_updates": 2,
     }

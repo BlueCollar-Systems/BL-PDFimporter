@@ -552,6 +552,123 @@ def _character_layout():
     )
 
 
+def _mixed_zero_ink_character_layout():
+    return (
+        TextCharLayout(
+            text="A",
+            glyph_id=37,
+            source_origin_pdf=(10.0, 20.0),
+            source_bbox_pdf=(10.0, 10.0, 16.0, 22.0),
+            source_quad_pdf=((10.0, 10.0), (16.0, 10.0), (16.0, 22.0), (10.0, 22.0)),
+            target_origin=(12.0, 24.0),
+            target_quad=((12.0, 30.0), (18.0, 30.0), (18.0, 24.0), (12.0, 24.0)),
+            advance_width=6.0,
+            glyph_height=6.0,
+        ),
+        TextCharLayout(
+            text=" ",
+            glyph_id=None,
+            source_origin_pdf=(16.0, 20.0),
+            source_bbox_pdf=(16.0, 10.0, 19.0, 22.0),
+            source_quad_pdf=((16.0, 10.0), (19.0, 10.0), (19.0, 22.0), (16.0, 22.0)),
+            target_origin=(18.0, 24.0),
+            target_quad=((18.0, 30.0), (21.0, 30.0), (21.0, 24.0), (18.0, 24.0)),
+            advance_width=3.0,
+            glyph_height=6.0,
+        ),
+        TextCharLayout(
+            text="B",
+            glyph_id=91,
+            source_origin_pdf=(19.0, 20.0),
+            source_bbox_pdf=(19.0, 10.0, 25.0, 22.0),
+            source_quad_pdf=((19.0, 10.0), (25.0, 10.0), (25.0, 22.0), (19.0, 22.0)),
+            target_origin=(21.0, 24.0),
+            target_quad=((21.0, 30.0), (27.0, 30.0), (27.0, 24.0), (21.0, 24.0)),
+            advance_width=6.0,
+            glyph_height=6.0,
+        ),
+    )
+
+
+def _install_positioned_empty_conversion_host(
+    monkeypatch,
+    fake,
+    *,
+    empty_visible_glyphs=False,
+):
+    def apply_metric_identity(obj, text_item, *_args, **_kwargs):
+        zero_ink = not str(text_item.text).strip()
+        obj["pdf_full_affine_applied"] = True
+        obj["pdf_metric_affine_applied"] = True
+        obj["pdf_metric_zero_ink_identity"] = zero_ink
+        obj["pdf_metric_metric_source"] = (
+            "source_layout_zero_ink" if zero_ink else "embedded_font_glyph_metrics"
+        )
+        obj["pdf_metric_local_advance"] = float(text_item.advance_width) * 0.001
+        obj["pdf_metric_local_line_height"] = float(text_item.glyph_height) * 0.001
+        obj["pdf_metric_local_baseline_y"] = 0.0
+        obj["pdf_metric_target_origin_m"] = [
+            float(text_item.insertion[0]) * 0.001,
+            float(text_item.insertion[1]) * 0.001,
+        ]
+        return None
+
+    def verify_metric_identity(obj, text_item):
+        origin = [
+            float(text_item.insertion[0]) * 0.001,
+            float(text_item.insertion[1]) * 0.001,
+        ]
+        zero_ink = bool(obj.get("pdf_metric_zero_ink_identity", False))
+        return (
+            [],
+            {
+                "expected_location_m": origin,
+                "actual_baseline_anchor_m": origin,
+                "evaluated_bounds_verified": True,
+                "evaluated_ink_bounds_verified": True,
+                "zero_ink_identity": zero_ink,
+                "local_advance_m": float(text_item.advance_width) * 0.001,
+            },
+        )
+
+    original_to_curve = _Object.to_curve
+    original_curve_copy = _CurveData.copy
+
+    def copy_curve_preserving_empty_ink(self):
+        copied = original_curve_copy(self)
+        copied.splines = list(self.splines)
+        return copied
+
+    def to_curve_with_expected_empty_ink(self, depsgraph, apply_modifiers=False):
+        curve = original_to_curve(
+            self,
+            depsgraph,
+            apply_modifiers=apply_modifiers,
+        )
+        if empty_visible_glyphs or not str(self.data.body).strip():
+            curve.splines = []
+        return curve
+
+    original_to_mesh = fake.data.meshes.new_from_object
+
+    def to_mesh_with_expected_empty_ink(evaluated, depsgraph=None):
+        mesh = original_to_mesh(evaluated, depsgraph=depsgraph)
+        if empty_visible_glyphs or not str(evaluated.data.body).strip():
+            mesh.vertices = []
+            mesh.polygons = []
+        return mesh
+
+    monkeypatch.setattr(bl_text_builder, "_apply_target_quad_affine", apply_metric_identity)
+    monkeypatch.setattr(
+        bl_text_builder,
+        "_verify_transform_and_dimensions",
+        verify_metric_identity,
+    )
+    monkeypatch.setattr(_Object, "to_curve", to_curve_with_expected_empty_ink)
+    monkeypatch.setattr(_CurveData, "copy", copy_curve_preserving_empty_ink)
+    monkeypatch.setattr(fake.data.meshes, "new_from_object", to_mesh_with_expected_empty_ink)
+
+
 def _install(monkeypatch, **kwargs):
     fake = _FakeBpy(**kwargs)
     monkeypatch.setattr(bl_text_builder, "bpy", fake)
@@ -775,6 +892,132 @@ def test_positioned_conversion_batches_source_and_final_dependency_graph_updates
         (expected_type, 2),
         (expected_type, 2),
     ]
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_type"),
+    [("glyphs", "CURVE"), ("geometry", "MESH")],
+)
+def test_positioned_conversion_preserves_zero_ink_space_and_delivers_visible_siblings(
+    monkeypatch,
+    mode,
+    expected_type,
+):
+    fake, collection = _install(monkeypatch)
+    _install_positioned_empty_conversion_host(monkeypatch, fake)
+    opts = types.SimpleNamespace(import_mode="vector", text_mode=mode)
+    item = _item()
+    item.text = "A B"
+    item.normalized = "A B"
+    item.source_char_layout = _mixed_zero_ink_character_layout()
+    item.requires_individual_positioning = True
+
+    obj = bl_text_builder.build_text(
+        item,
+        collection,
+        page_number=2,
+        text_mode=mode,
+        provenance_opts=opts,
+    )
+
+    assert obj is not None and obj.type == expected_type
+    assert len(collection.objects.items) == 2
+    assert {candidate.type for candidate in collection.objects.items} == {
+        expected_type
+    }
+    assert {
+        candidate.get("pdf_text_source") for candidate in collection.objects.items
+    } == {"A", "B"}
+    record = opts._text_delivery_records[-1]
+    assert record["status"] == "delivered"
+    assert record["requested_representation"] == mode
+    assert record["final_representation"] == mode
+    assert record["fallback_used"] is False
+    assert len(record["attempts"]) == 1
+    assert len(record["entity_ids"]) == 2
+    evidence = record["attempts"][0]["evidence"]
+    assert evidence["character_count"] == 3
+    assert evidence["attempted_character_count"] == 3
+    assert evidence["physical_entity_count"] == 2
+    assert evidence["visible_character_count"] == 2
+    assert evidence["zero_ink_character_count"] == 1
+    characters = evidence["character_entities"]
+    assert [entry["character_index"] for entry in characters] == [0, 1, 2]
+    assert [entry["text"] for entry in characters] == ["A", " ", "B"]
+    assert [entry["requested_representation"] for entry in characters] == [mode] * 3
+    assert [entry["delivered_representation"] for entry in characters] == [mode] * 3
+    space = characters[1]
+    assert space["item_id"] == "page:2:text:41"
+    assert space["glyph_id"] is None
+    assert space["advance_width_model"] == pytest.approx(3.0)
+    assert space["source_origin_pdf"] == [16.0, 20.0]
+    assert space["target_origin_model"] == [18.0, 24.0]
+    assert space["entity_ids"] == []
+    assert space["verification"]["zero_ink_identity"] is True
+    assert space["verification"]["evaluated_ink_bounds_verified"] is True
+    assert space["verification"]["conversion_outcome"] == (
+        "verified_zero_ink_no_physical_entity"
+    )
+    assert space["verification"]["cleanup"]["status"] == "complete"
+    assert all(
+        str(candidate.get("pdf_text_source", "")).strip()
+        for candidate in collection.objects.items
+    )
+    assert len(fake.data.objects.removed) == 3
+    expected_removed_curves = 4 if mode == "glyphs" else 3
+    assert len(fake.data.curves.removed) >= expected_removed_curves
+    assert len(fake.data.meshes.removed) == (1 if mode == "geometry" else 0)
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_reason"),
+    [
+        ("glyphs", "glyph_curve_has_no_verified_splines"),
+        ("geometry", "geometry_mesh_has_no_verified_vertices"),
+    ],
+)
+def test_positioned_non_whitespace_empty_conversion_hard_fails_without_zero_ink_relabel(
+    monkeypatch,
+    mode,
+    expected_reason,
+):
+    fake, collection = _install(monkeypatch)
+    _install_positioned_empty_conversion_host(
+        monkeypatch,
+        fake,
+        empty_visible_glyphs=True,
+    )
+    opts = types.SimpleNamespace(import_mode="vector", text_mode=mode)
+    item = _item()
+    item.text = "A"
+    item.normalized = "A"
+    item.source_char_layout = (_character_layout()[0],)
+    item.requires_individual_positioning = True
+
+    obj = bl_text_builder.build_text(
+        item,
+        collection,
+        page_number=2,
+        text_mode=mode,
+        provenance_opts=opts,
+    )
+
+    assert obj is None
+    assert collection.objects.items == []
+    record = opts._text_delivery_records[-1]
+    assert record["status"] == "failed"
+    assert [attempt["attempted_representation"] for attempt in record["attempts"]] == [
+        mode
+    ]
+    attempt = record["attempts"][0]
+    assert attempt["reason"] == expected_reason
+    assert attempt["cleanup"]["status"] == "complete"
+    assert attempt["evidence"]["failed_character_index"] == 0
+    verification = attempt["evidence"]["character_entities"][0]["verification"]
+    assert verification.get("zero_ink_identity") is not True
+    assert verification.get("conversion_outcome") != (
+        "verified_zero_ink_no_physical_entity"
+    )
 
 
 @pytest.mark.parametrize(
