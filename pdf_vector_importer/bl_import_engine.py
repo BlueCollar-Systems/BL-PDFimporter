@@ -28,7 +28,11 @@ from .pdfcadcore import (
     classify_page_content, tag_hatch_primitives, cleanup_primitives,
 )
 from .bl_geometry_builder import build_page
-from .bl_text_builder import build_all_text
+from .bl_text_builder import build_all_text, cleanup_delivery_outcome
+from .pdfcadcore.primitive_extractor import (
+    _page_rotation_transform,
+    _transform_pdf_point,
+)
 from .text_delivery import normalize_representation
 
 _MM_PER_PT = 25.4 / 72.0
@@ -215,6 +219,8 @@ def _text_fallback_from_provenance(provenance_opts: Any) -> Optional[Dict[str, A
             ),
             "count": sum(groups.values()),
         }
+    if delivery["items"]:
+        return None
     try:
         records = list(getattr(provenance_opts, "_text_mode_fallbacks", []) or [])
     except (AttributeError, TypeError):
@@ -302,6 +308,7 @@ def write_import_report(
     elapsed = float(stats.get("elapsed", 0.0) or 0.0)
     text_delivery = _text_delivery_from_provenance(provenance_opts)
     text_delivery_summary = text_delivery["summary"]
+    text_fallback = _text_fallback_from_provenance(provenance_opts)
     raster_delivery_failures = []
     for record in list(stats.get("raster_delivery_failures") or []):
         if not isinstance(record, dict):
@@ -328,28 +335,41 @@ def write_import_report(
         for record in geometry_delivery_issues
         if str(record.get("status") or "").strip().lower() != "verified"
     ]
+    if (
+        raster_delivery_failures
+        and isinstance(text_fallback, dict)
+        and str(text_fallback.get("delivered") or "").strip().lower() == "raster"
+    ):
+        text_fallback = None
     raster_is_fallback = raster_pages > 0 and import_mode != "raster"
+    geometry_approximations = [
+        record
+        for record in geometry_delivery_issues
+        if str(record.get("status") or "").strip().lower() == "verified"
+    ]
+    text_fallback_attempted = any(
+        bool(record.get("fallback_attempted"))
+        or len(tuple(record.get("attempts") or ())) > 1
+        for record in text_delivery["items"]
+    )
     fallback_used = (
         raster_is_fallback
-        or bool(raster_delivery_failures)
-        or bool(geometry_delivery_issues)
+        or bool(geometry_approximations)
         or int(text_delivery_summary["fallback_items"]) > 0
-        or int(text_delivery_summary["failed_items"]) > 0
+        or text_fallback is not None
     )
-    if raster_delivery_failures:
-        fallback_reason = "raster_delivery_failed"
-    elif geometry_delivery_failures:
-        count = len(geometry_delivery_failures)
-        fallback_reason = f"geometry_delivery_failed_{count}_primitive{'s' if count != 1 else ''}"
-    elif int(text_delivery_summary["failed_items"]) > 0:
-        fallback_reason = f"text_delivery_failed_{text_delivery_summary['failed_items']}_items"
-    elif raster_is_fallback:
+    fallback_attempted = (
+        fallback_used
+        or text_fallback_attempted
+        or bool(raster_delivery_failures and import_mode != "raster")
+    )
+    if raster_is_fallback:
         fallback_reason = f"raster_fallback_{raster_pages}_page{'s' if raster_pages != 1 else ''}"
     elif int(text_delivery_summary["fallback_items"]) > 0:
         count = int(text_delivery_summary["fallback_items"])
         fallback_reason = f"text_fallback_{count}_item{'s' if count != 1 else ''}"
-    elif geometry_delivery_issues:
-        count = len(geometry_delivery_issues)
+    elif geometry_approximations:
+        count = len(geometry_approximations)
         fallback_reason = f"geometry_approximation_{count}_primitive{'s' if count != 1 else ''}"
     else:
         fallback_reason = None
@@ -361,7 +381,6 @@ def write_import_report(
     text_source_spans = int(stats.get("text_source_spans", stats.get("text_items", 0)) or 0)
     text_glyph_estimate = int(stats.get("text_glyph_estimate", 0) or 0)
     bootstrap_text_items = list(stats.get("parts_bootstrap_text_items") or [])
-    text_fallback = _text_fallback_from_provenance(provenance_opts)
     try:
         delivered_text_counts = getattr(provenance_opts, "_text_delivered_entity_counts", None)
     except AttributeError:
@@ -379,6 +398,34 @@ def write_import_report(
             font_rendered = None
 
     text_mode = str(config.get("text_mode") or "3d_text")
+    import_text_enabled = bool(config.get("import_text", True)) and text_mode != "none"
+    delivery_source_items = int(text_delivery_summary["source_items"])
+    delivery_delivered_items = int(text_delivery_summary["delivered_items"])
+    delivery_failed_items = int(text_delivery_summary["failed_items"])
+    text_delivery_required = bool(import_text_enabled and text_source_spans > 0)
+    text_delivery_verified = bool(
+        not text_delivery_required
+        or (
+            delivery_source_items == text_source_spans
+            and delivery_delivered_items == delivery_source_items
+            and delivery_failed_items == 0
+        )
+    )
+    terminal_failure = {}
+    if not text_delivery_verified:
+        terminal_failure["text_delivery"] = {
+            "required_source_items": text_source_spans,
+            "recorded_source_items": delivery_source_items,
+            "delivered_items": delivery_delivered_items,
+            "failed_items": delivery_failed_items,
+            "failed_item_ids": list(text_delivery_summary["failed_item_ids"]),
+        }
+    if raster_delivery_failures:
+        terminal_failure["raster_delivery"] = list(raster_delivery_failures)
+    if geometry_delivery_failures:
+        terminal_failure["geometry_delivery"] = list(geometry_delivery_failures)
+    if stats.get("temp_cleanup_error"):
+        terminal_failure["temp_cleanup"] = str(stats.get("temp_cleanup_error"))
     extra = {
         "curves": int(stats.get("curves", 0) or 0),
         "meshes": int(stats.get("meshes", 0) or 0),
@@ -387,9 +434,21 @@ def write_import_report(
         "model_3d": stats.get("model_3d"),
         "resolved_scale": stats.get("resolved_scale"),
         "scale_hints": stats.get("scale_hints"),
+        "fallback_attempted": bool(fallback_attempted),
+        "result_status": "incomplete" if terminal_failure else "success",
     }
+    if terminal_failure:
+        extra["terminal_failure"] = terminal_failure
     if int(text_delivery_summary["source_items"]) > 0:
         extra["text_delivery"] = text_delivery
+    if text_source_spans > 0 or int(text_delivery_summary["source_items"]) > 0:
+        extra["text_representation_delivery"] = {
+            "required": text_delivery_required,
+            "verified": text_delivery_verified,
+            "source_items": delivery_source_items,
+            "delivered_items": delivery_delivered_items,
+            "failed_items": delivery_failed_items,
+        }
     if raster_delivery_failures:
         extra["raster_delivery_failures"] = raster_delivery_failures
         extra["raster_delivery_failure_count"] = len(raster_delivery_failures)
@@ -434,12 +493,16 @@ def write_import_report(
         pages=int(stats.get("pages_imported", stats.get("pages", 0)) or 0),
         primitive_count=int(stats.get("primitives", 0) or 0),
         text_count=int(stats.get("text_items", 0) or 0),
+        image_count=int(stats.get("images", 0) or 0),
         layer_count=int(stats.get("collections", 0) or 0),
         elapsed_ms=elapsed * 1000.0,
         performance_phases=phases or None,
         peak_mb=sample_process_mb(),
         warnings=(
-            int(text_delivery_summary["failed_items"])
+            max(
+                int(text_delivery_summary["failed_items"]),
+                1 if not text_delivery_verified else 0,
+            )
             + len(raster_delivery_failures)
             + len(geometry_delivery_issues)
             + (1 if stats.get("temp_cleanup_error") else 0)
@@ -448,7 +511,7 @@ def write_import_report(
         fallback_reason=fallback_reason,
         pdf_engine_version=_pymupdf_version(),
         import_text=bool(config.get("import_text", True)),
-        text_mode=text_mode,
+        text_mode=text_mode if import_text_enabled else None,
         text_source_spans=text_source_spans,
         text_glyph_estimate=text_glyph_estimate,
         text_fallback=text_fallback,
@@ -1034,14 +1097,14 @@ def _extract_image_placements(doc, page, page_num: int, import_cfg, image_dir: s
     except ImportError:
         import fitz  # type: ignore
 
-    # Use rotation-corrected height for Y-flip — same logic as primitive_extractor.
-    _rot = int(getattr(page, "rotation", 0) or 0) % 360
-    try:
-        _mb = page.mediabox
-        _mb_w, _mb_h = float(_mb.width), float(_mb.height)
-    except AttributeError:
-        _mb_w, _mb_h = float(page.rect.width), float(page.rect.height)
-    page_height = _mb_w if _rot in (90, 270) else _mb_h
+    page_rect = page.rect
+    page_height = float(page_rect.height)
+    page_x0 = float(getattr(page_rect, "x0", 0.0) or 0.0)
+    page_y0 = float(getattr(page_rect, "y0", 0.0) or 0.0)
+    page_rotation = _page_rotation_transform(
+        page_rect,
+        getattr(page, "rotation_matrix", fitz.Matrix(1, 0, 0, 1, 0, 0)),
+    )
     seen_xrefs: set[int] = set()
 
     for img_info in page.get_images(full=True):
@@ -1067,26 +1130,57 @@ def _extract_image_placements(doc, page, page_num: int, import_cfg, image_dir: s
         except (RuntimeError, OSError, ValueError, TypeError):
             continue
 
-        rects = page.get_image_rects(xref)
-        for rect in rects:
-            x0, y0, x1, y1 = float(rect.x0), float(rect.y0), float(rect.x1), float(rect.y1)
-            left = min(x0, x1)
-            right = max(x0, x1)
-
-            if import_cfg.flip_y:
-                bottom_pt = page_height - max(y0, y1)
-                top_pt = page_height - min(y0, y1)
-            else:
-                bottom_pt = min(y0, y1)
-                top_pt = max(y0, y1)
+        try:
+            image_rects = page.get_image_rects(xref, transform=True)
+        except TypeError:
+            image_rects = [
+                (
+                    rect,
+                    fitz.Matrix(
+                        float(rect.width),
+                        0.0,
+                        0.0,
+                        float(rect.height),
+                        float(rect.x0),
+                        float(rect.y0),
+                    ),
+                )
+                for rect in page.get_image_rects(xref)
+            ]
+        for _rect, image_transform in image_rects:
+            quad_mm = []
+            for unit_x, unit_y in ((0.0, 1.0), (1.0, 1.0), (1.0, 0.0), (0.0, 0.0)):
+                point = fitz.Point(unit_x, unit_y) * image_transform
+                display_x, display_y = _transform_pdf_point(
+                    float(point.x),
+                    float(point.y),
+                    page_rotation,
+                )
+                x_pt = display_x - page_x0
+                y_pt = display_y - page_y0
+                if import_cfg.flip_y:
+                    y_pt = page_height - y_pt
+                quad_mm.append(
+                    (
+                        x_pt * _MM_PER_PT * import_cfg.user_scale,
+                        y_pt * _MM_PER_PT * import_cfg.user_scale,
+                    )
+                )
+            xs = [point[0] for point in quad_mm]
+            ys = [point[1] for point in quad_mm]
+            left = min(xs)
+            right = max(xs)
+            bottom = min(ys)
+            top = max(ys)
 
             placements.append(
                 {
                     "path": image_path,
-                    "x_mm": left * _MM_PER_PT * import_cfg.user_scale,
-                    "y_mm": bottom_pt * _MM_PER_PT * import_cfg.user_scale,
-                    "width_mm": (right - left) * _MM_PER_PT * import_cfg.user_scale,
-                    "height_mm": (top_pt - bottom_pt) * _MM_PER_PT * import_cfg.user_scale,
+                    "x_mm": left,
+                    "y_mm": bottom,
+                    "width_mm": right - left,
+                    "height_mm": top - bottom,
+                    "quad_mm": quad_mm,
                     "xref": xref,
                     "page_number": page_num,
                 }
@@ -1404,6 +1498,46 @@ def _record_raster_delivery_failure(
         failures.append(record)
 
 
+def _image_plane_geometry(placement: dict):
+    """Return plane origin, local vertices, winding, and stable image UVs."""
+
+    quad_mm = placement.get("quad_mm")
+    if isinstance(quad_mm, (list, tuple)) and len(quad_mm) == 4:
+        quad = [
+            (float(point[0]) * _MM_TO_M, float(point[1]) * _MM_TO_M)
+            for point in quad_mm
+        ]
+    else:
+        x = float(placement.get("x_mm", 0.0)) * _MM_TO_M
+        y = float(placement.get("y_mm", 0.0)) * _MM_TO_M
+        width = max(float(placement.get("width_mm", 0.0)) * _MM_TO_M, 1e-9)
+        height = max(float(placement.get("height_mm", 0.0)) * _MM_TO_M, 1e-9)
+        quad = [
+            (x, y),
+            (x + width, y),
+            (x + width, y + height),
+            (x, y + height),
+        ]
+    origin_x, origin_y = quad[0]
+    vertices = [
+        (point_x - origin_x, point_y - origin_y, 0.0)
+        for point_x, point_y in quad
+    ]
+    signed_area_twice = sum(
+        quad[index][0] * quad[(index + 1) % 4][1]
+        - quad[index][1] * quad[(index + 1) % 4][0]
+        for index in range(4)
+    )
+    face = (0, 1, 2, 3) if signed_area_twice >= 0.0 else (0, 3, 2, 1)
+    uv_by_vertex = {
+        0: (0.0, 0.0),
+        1: (1.0, 0.0),
+        2: (1.0, 1.0),
+        3: (0.0, 1.0),
+    }
+    return (origin_x, origin_y), vertices, face, uv_by_vertex
+
+
 def _create_image_plane(
     placement: dict,
     collection: bpy.types.Collection,
@@ -1422,10 +1556,6 @@ def _create_image_plane(
         return None
     image_sha256 = hashlib.sha256(image_bytes).hexdigest()
 
-    x = float(placement.get("x_mm", 0.0)) * _MM_TO_M
-    y = float(placement.get("y_mm", 0.0)) * _MM_TO_M
-    width = max(float(placement.get("width_mm", 0.0)) * _MM_TO_M, 1e-9)
-    height = max(float(placement.get("height_mm", 0.0)) * _MM_TO_M, 1e-9)
     page_num = int(placement.get("page_number", 0))
     xref = int(placement.get("xref", -1))
 
@@ -1436,25 +1566,14 @@ def _create_image_plane(
     material_created = False
     image_created = False
     try:
+        (x, y), verts, face, uv_by_vert = _image_plane_geometry(placement)
         mesh = bpy.data.meshes.new(f"PDF_ImgMesh_{page_num}_{xref}")
-        verts = [
-            (0.0, 0.0, 0.0),
-            (width, 0.0, 0.0),
-            (width, height, 0.0),
-            (0.0, height, 0.0),
-        ]
-        mesh.from_pydata(verts, [], [(0, 1, 2, 3)])
+        mesh.from_pydata(verts, [], [face])
         mesh.update()
         try:
             uv_layer = mesh.uv_layers.new(name="UVMap")
             if uv_layer is None:
                 raise RuntimeError("UVMap creation returned no layer")
-            uv_by_vert = {
-                0: (0.0, 0.0),
-                1: (1.0, 0.0),
-                2: (1.0, 1.0),
-                3: (0.0, 1.0),
-            }
             for poly in mesh.polygons:
                 for loop_idx in poly.loop_indices:
                     v_idx = mesh.loops[loop_idx].vertex_index
@@ -1716,6 +1835,7 @@ def _reverify_text_delivery_after_stack(
     *,
     page_number: int,
     stack_offset_m: float,
+    provenance_opts=None,
 ):
     """Bind proof to final host state after every page-placement mutation."""
     failures = []
@@ -1800,13 +1920,73 @@ def _reverify_text_delivery_after_stack(
         if delivered_attempt:
             delivered_attempt["final_state_verification"] = final_proof
         if record_failures:
+            item_id = str(record.get("item_id") or "")
+            outcomes = getattr(provenance_opts, "_text_delivery_outcomes", None)
+            outcome = outcomes.get(item_id) if isinstance(outcomes, dict) else None
+            if outcome is None:
+                cleanup = {
+                    "status": "failed",
+                    "removed": [],
+                    "detail": "runtime delivery ownership record missing",
+                }
+            else:
+                try:
+                    cleanup = cleanup_delivery_outcome(outcome)
+                except Exception as exc:
+                    cleanup = {
+                        "status": "failed",
+                        "removed": [],
+                        "exception_type": type(exc).__name__,
+                        "detail": str(exc),
+                    }
+                if cleanup.get("status") == "complete" and isinstance(outcomes, dict):
+                    outcomes.pop(item_id, None)
+            final_proof["cleanup"] = cleanup
             failure = {
-                "item_id": str(record.get("item_id") or ""),
+                "item_id": item_id,
                 "page": int(page_number),
                 "failures": list(record_failures),
+                "cleanup": cleanup,
             }
             failures.append(failure)
             record["status"] = "failed"
+            record["reason"] = "post_stack_final_state_verification_failed"
+            record["final_representation"] = None
+            record["fallback_used"] = False
+            if cleanup.get("status") == "complete":
+                record["entity_ids"] = []
+            if provenance_opts is not None:
+                counts = getattr(
+                    provenance_opts,
+                    "_text_delivered_entity_counts",
+                    None,
+                )
+                bucket = {
+                    "labels": "native_label",
+                    "text": "native_text",
+                    "3d_text": "native_3d_text",
+                    "glyphs": "glyph_curve",
+                    "geometry": "geometry_mesh",
+                    "raster": "raster_patch",
+                }.get(representation)
+                if isinstance(counts, dict) and bucket:
+                    counts[bucket] = max(0, int(counts.get(bucket, 0) or 0) - 1)
+                provenance = getattr(
+                    provenance_opts,
+                    "_source_provenance_objects",
+                    None,
+                )
+                if isinstance(provenance, list):
+                    source_span_id = int(record.get("source_span_id", 0) or 0)
+                    provenance[:] = [
+                        value
+                        for value in provenance
+                        if not (
+                            int(getattr(value, "page", 0) or 0) == int(page_number)
+                            and int(getattr(value, "span_id", -1) or -1)
+                            == source_span_id
+                        )
+                    ]
     return failures
 
 
@@ -2318,13 +2498,14 @@ def import_pdf(
             # 9j. Multi-page stacking: shift this page's collection downward
             if len(page_indices) > 1 and _page_stack_offset_m != 0.0:
                 _stack_page_objects(page_col.all_objects, _page_stack_offset_m)
-            total_stats["text_final_state_failures"].extend(
-                _reverify_text_delivery_after_stack(
-                    getattr(import_cfg, "_text_delivery_records", ()),
-                    page_number=page_num,
-                    stack_offset_m=_page_stack_offset_m,
-                )
+            final_text_failures = _reverify_text_delivery_after_stack(
+                getattr(import_cfg, "_text_delivery_records", ()),
+                page_number=page_num,
+                stack_offset_m=_page_stack_offset_m,
+                provenance_opts=import_cfg,
             )
+            total_stats["text_final_state_failures"].extend(final_text_failures)
+            text_count = max(0, int(text_count) - len(final_text_failures))
             # Advance offset for the next page (page_data.height is in mm)
             page_height_m = page_data.height * _MM_TO_M
             _page_stack_offset_m -= _page_stack_step(

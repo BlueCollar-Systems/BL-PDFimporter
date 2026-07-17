@@ -2,13 +2,19 @@
 from __future__ import annotations
 
 import math
+import os
 from pathlib import Path
 
 import pytest
 
 from pdf_vector_importer.pdfcadcore import embedded_fonts
 from pdf_vector_importer.pdfcadcore.embedded_fonts import EmbeddedFontCatalog
-from pdf_vector_importer.pdfcadcore.primitive_extractor import _extract_text, extract_page
+from pdf_vector_importer.pdfcadcore.primitive_extractor import (
+    _extract_text,
+    _page_rotation_transform,
+    _transform_pdf_point,
+    extract_page,
+)
 
 try:
     import pymupdf as fitz
@@ -16,7 +22,48 @@ except ImportError:  # pragma: no cover
     import fitz  # type: ignore
 
 
-WELDING_PDFS = Path(r"C:\Users\Rowdy Payton\Desktop\PDFTest Files")
+def _find_welding_pdf(filename: str) -> Path | None:
+    candidates = []
+    configured = os.environ.get("BCS_PDF_TEST_FILES", "").strip()
+    if configured:
+        candidates.append(Path(configured).expanduser())
+    corpus = os.environ.get("BCS_CORPUS_ROOT", "").strip()
+    if corpus:
+        corpus_root = Path(corpus).expanduser()
+        candidates.extend(
+            (
+                corpus_root,
+                corpus_root / "PDFTest Files",
+                corpus_root / "pdfs",
+                corpus_root / "source-pdfs",
+            )
+        )
+    repository = Path(__file__).resolve().parents[1]
+    candidates.extend(
+        (
+            repository / "tests" / "fixtures",
+            repository / "test-data",
+            Path.home() / "Desktop" / "PDFTest Files",
+        )
+    )
+    seen = set()
+    for root in candidates:
+        key = str(root.resolve(strict=False)).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        path = root / filename
+        if path.is_file():
+            return path
+    return None
+
+
+def test_welding_pdf_discovery_uses_configured_portable_root(monkeypatch, tmp_path):
+    fixture = tmp_path / "AWSWeldSymbolchart.pdf"
+    fixture.write_bytes(b"%PDF-1.7\n")
+    monkeypatch.setenv("BCS_PDF_TEST_FILES", str(tmp_path))
+
+    assert _find_welding_pdf(fixture.name) == fixture
 
 
 def test_page_font_inventory_failure_is_bound_to_each_span_and_not_absence():
@@ -406,9 +453,9 @@ def test_welding_pdfs_preserve_source_truth_and_item_font_evidence(
     filename: str,
     expected_spans: int,
 ):
-    pdf_path = WELDING_PDFS / filename
-    if not pdf_path.is_file():
-        pytest.skip(f"owner welding PDF missing: {pdf_path}")
+    pdf_path = _find_welding_pdf(filename)
+    if pdf_path is None:
+        pytest.skip(f"welding PDF fixture missing: {filename}")
 
     doc = fitz.open(str(pdf_path))
     try:
@@ -420,6 +467,22 @@ def test_welding_pdfs_preserve_source_truth_and_item_font_evidence(
         if expected_spans == 0:
             assert len(page.get_images(full=True)) == 1
             assert page.rotation == 90
+            xref = int(page.get_images(full=True)[0][0])
+            image_rect, image_matrix = page.get_image_rects(xref, transform=True)[0]
+            assert tuple(image_matrix) == pytest.approx((792.0, 0.0, 0.0, 612.0, 0.0, 0.0))
+            rotation = _page_rotation_transform(page.rect, page.rotation_matrix)
+            display_points = [
+                _transform_pdf_point(
+                    *(fitz.Point(u, v) * image_matrix),
+                    rotation,
+                )
+                for u, v in ((0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0))
+            ]
+            assert tuple(image_rect) == pytest.approx((0.0, 0.0, 792.0, 612.0))
+            assert min(point[0] for point in display_points) == pytest.approx(page.rect.x0)
+            assert max(point[0] for point in display_points) == pytest.approx(page.rect.x1)
+            assert min(point[1] for point in display_points) == pytest.approx(page.rect.y0)
+            assert max(point[1] for point in display_points) == pytest.approx(page.rect.y1)
             return
 
         font_names = {item.font_name for item in data.text_items}

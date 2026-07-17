@@ -45,7 +45,7 @@ jobs:
         run: |
           set -e
           python -m pip install --upgrade pip
-          python -m pip install "PyMuPDF>=1.24,<2.0" pytest
+          python -m pip install "PyMuPDF>=1.24,<2.0" "fonttools==4.60.2" pytest
           python pdfcadcore_sync_check.py --skip-cross-repo
           python -m pytest tests/ -q --basetemp "$RUNNER_TEMP/pytest-blender"
 

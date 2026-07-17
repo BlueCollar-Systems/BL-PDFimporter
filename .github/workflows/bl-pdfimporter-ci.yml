@@ -78,7 +78,7 @@ jobs:
         run: ruff check --select F,B pdf_vector_importer
 
       - name: Install dependencies
-        run: pip install "PyMuPDF>=1.24,<2.0" pytest
+        run: pip install "PyMuPDF>=1.24,<2.0" "fonttools==4.60.2" pytest
 
       - name: Verify pdfcadcore sync manifest
         run: python pdfcadcore_sync_check.py --skip-cross-repo

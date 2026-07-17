@@ -257,11 +257,14 @@ def deliver_item(
         "attempts": [],
         "final_representation": None,
         "status": "failed",
+        "fallback_attempted": False,
         "fallback_used": False,
         "entity_ids": [],
     }
 
     for index, representation in enumerate(fallback_ladder(requested_mode)):
+        if index > 0:
+            record["fallback_attempted"] = True
         try:
             outcome = attempt(representation)
             if not isinstance(outcome, AttemptOutcome):
@@ -328,8 +331,9 @@ def deliver_item(
                 record["attempts"].append(attempt_record)
                 record["final_representation"] = representation
                 record["status"] = "delivered"
-                record["fallback_used"] = representation != requested_mode
+                record["fallback_used"] = index > 0
                 record["entity_ids"] = list(attempt_record["entity_ids"])
+                record["_delivered_outcome"] = outcome
                 return outcome.entity, record
 
         try:
@@ -350,7 +354,6 @@ def deliver_item(
         if outcome.status != "impossible":
             break
 
-    record["fallback_used"] = len(record["attempts"]) > 1
     return None, record
 
 

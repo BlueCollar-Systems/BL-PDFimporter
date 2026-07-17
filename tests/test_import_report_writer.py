@@ -74,6 +74,210 @@ class TestImportReportWriter(unittest.TestCase):
             data = json.loads(report_path.read_text(encoding="utf-8"))
             self.assertEqual(data["fallback"], {"used": False, "reason": None})
 
+    def test_image_count_and_text_disabled_summary_are_truthful(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="bl_import_report_") as tmp:
+            report_path = Path(tmp) / "import_report.json"
+            with patch(
+                "pdf_vector_importer.bl_import_engine._pymupdf_version",
+                return_value="",
+            ):
+                write_import_report(
+                    str(Path(tmp) / "sample.pdf"),
+                    {"import_text": False, "text_mode": "3d_text"},
+                    {
+                        "pages_imported": 1,
+                        "primitives": 0,
+                        "text_items": 0,
+                        "collections": 1,
+                        "images": 2,
+                        "elapsed": 0.1,
+                    },
+                    import_mode="raster",
+                    raster_pages=1,
+                    output_path=str(report_path),
+                )
+            data = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual(data["result"]["images"], 2)
+            summary = data["extra"]["human_summary"]
+            self.assertIn("2 raster/image placements", summary)
+            self.assertNotIn("3D text", summary)
+
+    def test_verified_text_delivery_satisfies_import_contract_gate(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="bl_import_report_") as tmp:
+            report_path = Path(tmp) / "import_report.json"
+            provenance = types.SimpleNamespace(
+                _text_delivery_records=[
+                    {
+                        "item_id": "page:1:text:1",
+                        "page": 1,
+                        "requested_representation": "text",
+                        "final_representation": "text",
+                        "status": "delivered",
+                        "fallback_used": False,
+                        "entity_ids": ["P1_text_1"],
+                        "attempts": [],
+                    }
+                ],
+                _text_delivered_entity_counts={"native_text": 1},
+            )
+            with patch(
+                "pdf_vector_importer.bl_import_engine._pymupdf_version",
+                return_value="",
+            ):
+                write_import_report(
+                    str(Path(tmp) / "sample.pdf"),
+                    {"import_text": True, "text_mode": "text"},
+                    {
+                        "pages_imported": 1,
+                        "primitives": 0,
+                        "text_items": 1,
+                        "text_source_spans": 1,
+                        "collections": 1,
+                        "elapsed": 0.1,
+                    },
+                    import_mode="vector",
+                    output_path=str(report_path),
+                    provenance_opts=provenance,
+                )
+            data = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                data["extra"]["text_representation_delivery"],
+                {
+                    "required": True,
+                    "verified": True,
+                    "source_items": 1,
+                    "delivered_items": 1,
+                    "failed_items": 0,
+                },
+            )
+            self.assertTrue(data["extra"]["import_contract_ready"]["ready"])
+            self.assertTrue(
+                data["extra"]["import_contract_ready"]["checks"]["text_delivery"]
+            )
+
+    def test_missing_required_text_delivery_is_terminally_incomplete(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="bl_import_report_") as tmp:
+            report_path = Path(tmp) / "import_report.json"
+            with patch(
+                "pdf_vector_importer.bl_import_engine._pymupdf_version",
+                return_value="",
+            ):
+                write_import_report(
+                    str(Path(tmp) / "sample.pdf"),
+                    {"import_text": True, "text_mode": "text"},
+                    {
+                        "pages_imported": 1,
+                        "primitives": 0,
+                        "text_items": 0,
+                        "text_source_spans": 1,
+                        "collections": 1,
+                        "elapsed": 0.1,
+                    },
+                    import_mode="vector",
+                    output_path=str(report_path),
+                )
+            data = json.loads(report_path.read_text(encoding="utf-8"))
+            delivery = data["extra"]["text_representation_delivery"]
+            self.assertTrue(delivery["required"])
+            self.assertFalse(delivery["verified"])
+            self.assertEqual(data["extra"]["result_status"], "incomplete")
+            self.assertIn("text_delivery", data["extra"]["terminal_failure"])
+            self.assertFalse(data["extra"]["import_contract_ready"]["ready"])
+
+    def test_disabled_text_delivery_is_not_required_by_contract(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="bl_import_report_") as tmp:
+            report_path = Path(tmp) / "import_report.json"
+            with patch(
+                "pdf_vector_importer.bl_import_engine._pymupdf_version",
+                return_value="",
+            ):
+                write_import_report(
+                    str(Path(tmp) / "sample.pdf"),
+                    {"import_text": False, "text_mode": "3d_text"},
+                    {
+                        "pages_imported": 1,
+                        "primitives": 1,
+                        "text_items": 0,
+                        "text_source_spans": 3,
+                        "collections": 1,
+                        "elapsed": 0.1,
+                    },
+                    import_mode="vector",
+                    output_path=str(report_path),
+                )
+            data = json.loads(report_path.read_text(encoding="utf-8"))
+            delivery = data["extra"]["text_representation_delivery"]
+            self.assertFalse(delivery["required"])
+            self.assertTrue(delivery["verified"])
+            self.assertTrue(data["extra"]["import_contract_ready"]["ready"])
+            self.assertTrue(
+                data["extra"]["import_contract_ready"]["checks"]["text_delivery"]
+            )
+
+    def test_text_mode_none_is_not_required_by_contract(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="bl_import_report_") as tmp:
+            report_path = Path(tmp) / "import_report.json"
+            with patch(
+                "pdf_vector_importer.bl_import_engine._pymupdf_version",
+                return_value="",
+            ):
+                write_import_report(
+                    str(Path(tmp) / "sample.pdf"),
+                    {"import_text": True, "text_mode": "none"},
+                    {
+                        "pages_imported": 1,
+                        "primitives": 1,
+                        "text_items": 0,
+                        "text_source_spans": 3,
+                        "collections": 1,
+                        "elapsed": 0.1,
+                    },
+                    import_mode="vector",
+                    output_path=str(report_path),
+                )
+            data = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertFalse(
+                data["extra"]["text_representation_delivery"]["required"]
+            )
+            self.assertTrue(data["extra"]["import_contract_ready"]["ready"])
+
+    def test_delivery_failure_is_incomplete_not_a_used_fallback(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="bl_import_report_") as tmp:
+            report_path = Path(tmp) / "import_report.json"
+            with patch(
+                "pdf_vector_importer.bl_import_engine._pymupdf_version",
+                return_value="",
+            ):
+                write_import_report(
+                    str(Path(tmp) / "sample.pdf"),
+                    {"import_text": False},
+                    {
+                        "pages_imported": 1,
+                        "primitives": 0,
+                        "text_items": 0,
+                        "collections": 1,
+                        "elapsed": 0.1,
+                        "raster_delivery_failures": [
+                            {
+                                "page": 1,
+                                "stage": "render",
+                                "reason": "raster_render_failed",
+                            }
+                        ],
+                    },
+                    import_mode="auto",
+                    output_path=str(report_path),
+                )
+            data = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual(data["fallback"], {"used": False, "reason": None})
+            self.assertTrue(data["extra"]["fallback_attempted"])
+            self.assertEqual(data["extra"]["result_status"], "incomplete")
+            self.assertIn("raster_delivery", data["extra"]["terminal_failure"])
+            self.assertFalse(data["extra"]["import_contract_ready"]["ready"])
+            self.assertFalse(
+                data["extra"]["import_contract_ready"]["checks"]["result_succeeded"]
+            )
+
     def test_import_report_refuses_nonfinite_json_instead_of_emitting_nan(self) -> None:
         report = ImportReport(performance={"peak_mb": float("nan")})
 

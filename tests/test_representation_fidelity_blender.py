@@ -1084,6 +1084,7 @@ def test_labels_use_item_specific_host_capability_proof_before_text_fallback(
     assert label_attempt["evidence"]["item_id"] == "page:2:text:41"
     assert label_attempt["evidence"]["capability"] == "persistent_renderable_model_label"
     assert record["fallback_used"] is True
+    assert record["fallback_attempted"] is True
 
 
 def test_generic_mesh_exception_stops_without_cross_type_fallback_and_cleans_owned_object(
@@ -1176,6 +1177,7 @@ def test_explicit_missing_mesh_capability_permits_closest_glyph_fallback(monkeyp
     record = opts._text_delivery_records[-1]
     assert [a["status"] for a in record["attempts"]] == ["impossible", "delivered"]
     assert record["fallback_used"] is True
+    assert record["fallback_attempted"] is True
 
 
 def test_all_structural_rungs_and_terminal_raster_failure_are_loud(monkeypatch):
@@ -1200,6 +1202,8 @@ def test_all_structural_rungs_and_terminal_raster_failure_are_loud(monkeypatch):
     assert all(a["status"] == "impossible" for a in record["attempts"][:-1])
     assert record["attempts"][-1]["status"] == "failed"
     assert record["attempts"][-1]["reason"] == "terminal_raster_not_verified"
+    assert record["fallback_attempted"] is True
+    assert record["fallback_used"] is False
     assert collection.objects.items == []
 
 
@@ -1605,6 +1609,7 @@ def test_structured_item_bound_font_proof_can_advance_to_closest_fallback(
     assert entity is not None
     assert attempted == ["text", "3d_text"]
     assert record["fallback_used"] is True
+    assert record["fallback_attempted"] is True
 
 
 def test_wrong_page_exact_font_asset_fails_before_host_load(monkeypatch):
@@ -1648,6 +1653,28 @@ def test_corrupt_deterministic_font_cache_is_atomically_repaired(monkeypatch, tm
     assert obj is not None
     assert cache_path.read_bytes() == item.font_asset.usable_bytes
     assert fake.data.fonts.loaded == [(str(cache_path), False)]
+
+
+def test_removed_blender_font_datablock_is_evicted_and_reloaded(monkeypatch, tmp_path):
+    fake, _collection = _install(monkeypatch)
+    item = _item()
+    digest = item.font_asset.usable_sha256
+    monkeypatch.setattr(bl_text_builder.tempfile, "gettempdir", lambda: str(tmp_path))
+
+    class RemovedFont:
+        @property
+        def packed_file(self):
+            raise ReferenceError("StructRNA of type VectorFont has been removed")
+
+    stale = RemovedFont()
+    bl_text_builder._FONT_CACHE[digest] = stale
+
+    font, failure = bl_text_builder._load_exact_font(item, "page:2:text:41", 2)
+
+    assert failure is None
+    assert font is not None and font is not stale
+    assert bl_text_builder._FONT_CACHE[digest] is font
+    assert len(fake.data.fonts.loaded) == 1
 
 
 def test_font_cache_uses_unique_attempt_temp_files_and_leaves_none_behind(

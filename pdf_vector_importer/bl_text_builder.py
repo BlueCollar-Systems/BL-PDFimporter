@@ -743,7 +743,7 @@ def _load_exact_font(text_item: NormalizedText, item_id: str, page_number: int):
     if cached is not None:
         try:
             verify_packed_sha256(cached, expected_sha)
-        except PackedAssetError:
+        except (PackedAssetError, ReferenceError, AttributeError):
             _FONT_CACHE.pop(expected_sha, None)
         else:
             return cached, None
@@ -2462,6 +2462,12 @@ def _cleanup_attempt(outcome: AttemptOutcome, collection) -> Dict[str, Any]:
     return {"status": "complete", "removed": removed}
 
 
+def cleanup_delivery_outcome(outcome: AttemptOutcome) -> Dict[str, Any]:
+    """Remove every runtime-owned artifact from one delivered text outcome."""
+
+    return _cleanup_attempt(outcome, None)
+
+
 def _append_delivery_record(provenance_opts: Any, record: Dict[str, Any]) -> None:
     if provenance_opts is None:
         return
@@ -3163,6 +3169,7 @@ def build_text(
             "attempts": [],
             "final_representation": None,
             "status": "failed",
+            "fallback_attempted": False,
             "fallback_used": False,
             "entity_ids": [],
             "reason": "empty_source_text",
@@ -3238,6 +3245,7 @@ def build_text(
         attempt=attempt,
         cleanup=lambda outcome: _cleanup_attempt(outcome, collection),
     )
+    delivered_outcome = record.pop("_delivered_outcome", None)
     _append_delivery_record(provenance_opts, record)
     if obj is None:
         LOGGER.error(
@@ -3247,6 +3255,13 @@ def build_text(
             [attempt_record.get("attempted_representation") for attempt_record in record["attempts"]],
         )
         return None
+
+    if provenance_opts is not None and isinstance(delivered_outcome, AttemptOutcome):
+        outcomes = getattr(provenance_opts, "_text_delivery_outcomes", None)
+        if not isinstance(outcomes, dict):
+            outcomes = {}
+            provenance_opts._text_delivery_outcomes = outcomes  # noqa: B010
+        outcomes[item_id] = delivered_outcome
 
     delivered = str(record["final_representation"])
     if delivered != requested:

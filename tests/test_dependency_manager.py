@@ -1,12 +1,58 @@
 from __future__ import annotations
 
 import tempfile
+import subprocess
 import sys
 import unittest
+import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
 from pdf_vector_importer import dependency_manager
+from scripts import smoke_release_zip
+
+
+def _write_synthetic_release_zip(path: Path, *, include_fonttools: bool) -> None:
+    fonttools_members = {
+        "pdf_vector_importer/lib/fontTools/__init__.py",
+        "pdf_vector_importer/lib/fontTools/ttLib/__init__.py",
+        "pdf_vector_importer/lib/fontTools/cffLib/__init__.py",
+        "pdf_vector_importer/lib/fonttools-4.60.2.dist-info/METADATA",
+        "pdf_vector_importer/lib/fonttools-4.60.2.dist-info/WHEEL",
+        "pdf_vector_importer/lib/fonttools-4.60.2.dist-info/licenses/LICENSE",
+        "pdf_vector_importer/lib/fonttools-4.60.2.dist-info/licenses/LICENSE.external",
+    }
+    members = set(smoke_release_zip.REQUIRED_MEMBERS) - fonttools_members
+    members.add("pdf_vector_importer/pdfcadcore/__init__.py")
+    if include_fonttools:
+        members.update(fonttools_members)
+
+    content = {
+        "pdf_vector_importer/__init__.py": (
+            "bl_info = {'version': (1, 0, 67)}\n"
+            "def register():\n    pass\n"
+        ),
+        "pdf_vector_importer/pdfcadcore/fitz_loader.py": (
+            "class _Fitz:\n    open = staticmethod(lambda *_a, **_k: None)\n"
+            "def import_fitz(**_kwargs):\n    return _Fitz()\n"
+        ),
+        "pdf_vector_importer/lib/fontTools/__init__.py": "__version__ = '4.60.2'\n",
+        "pdf_vector_importer/lib/fontTools/ttLib/__init__.py": "class TTFont:\n    pass\n",
+        "pdf_vector_importer/lib/fontTools/cffLib/__init__.py": "class CFFFontSet:\n    pass\n",
+        "pdf_vector_importer/lib/fonttools-4.60.2.dist-info/METADATA": (
+            "Metadata-Version: 2.4\nName: fonttools\nVersion: 4.60.2\n"
+        ),
+        "pdf_vector_importer/lib/fonttools-4.60.2.dist-info/WHEEL": (
+            "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n"
+        ),
+        "pdf_vector_importer/lib/fonttools-4.60.2.dist-info/licenses/LICENSE": "MIT\n",
+        "pdf_vector_importer/lib/fonttools-4.60.2.dist-info/licenses/LICENSE.external": (
+            "External notices\n"
+        ),
+    }
+    with zipfile.ZipFile(path, "w") as archive:
+        for member in sorted(members):
+            archive.writestr(member, content.get(member, ""))
 
 
 class TestDependencyManager(unittest.TestCase):
@@ -77,6 +123,42 @@ class TestDependencyManager(unittest.TestCase):
         source = Path(dependency_manager.__file__).read_text(encoding="utf-8")
         self.assertIn("from .pdfcadcore.fitz_loader import import_fitz", source)
         self.assertNotIn("from pdfcadcore.fitz_loader import import_fitz", source)
+
+    def test_ci_installs_the_declared_fonttools_dependency(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        for relative in (
+            ".github/workflows/bl-pdfimporter-ci.yml",
+            ".github/workflows/auto-release.yml",
+        ):
+            source = (root / relative).read_text(encoding="utf-8").lower()
+            self.assertIn('"fonttools==4.60.2"', source, relative)
+
+    def test_release_zip_smoke_rejects_missing_fonttools_runtime_and_licenses(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="bl_zip_smoke_") as tmp:
+            zip_path = Path(tmp) / "missing-fonttools.zip"
+            _write_synthetic_release_zip(zip_path, include_fonttools=False)
+            script = Path(smoke_release_zip.__file__).resolve()
+            result = subprocess.run(
+                [sys.executable, str(script), str(zip_path)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("fonttools", (result.stderr + result.stdout).lower())
+
+    def test_release_zip_smoke_imports_fonttools_cross_platform(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="bl_zip_smoke_") as tmp:
+            zip_path = Path(tmp) / "complete.zip"
+            _write_synthetic_release_zip(zip_path, include_fonttools=True)
+            script = Path(smoke_release_zip.__file__).resolve()
+            result = subprocess.run(
+                [sys.executable, str(script), str(zip_path)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
 
 
 if __name__ == "__main__":

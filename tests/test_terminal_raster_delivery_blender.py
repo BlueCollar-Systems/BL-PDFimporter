@@ -20,8 +20,9 @@ if not hasattr(sys.modules["bpy"], "types"):
 if "bmesh" not in sys.modules:
     sys.modules["bmesh"] = types.SimpleNamespace()
 
-from pdf_vector_importer import bl_import_engine
+from pdf_vector_importer import bl_import_engine, bl_text_builder
 from pdf_vector_importer.pdfcadcore import fitz_loader
+from pdf_vector_importer.text_delivery import AttemptOutcome
 
 try:
     import pymupdf as fitz
@@ -134,6 +135,134 @@ def _raster_placement():
         "xref": -1,
         "page_number": 1,
     }
+
+
+def test_rotated_embedded_image_placement_preserves_pdf_transform_and_uv_order(
+    tmp_path,
+):
+    pdf_path = tmp_path / "rotated-image.pdf"
+    document = fitz.open()
+    page = document.new_page(width=792.0, height=612.0)
+    pixmap = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 2, 1), False)
+    pixmap.clear_with(0x336699)
+    page.insert_image(page.rect, pixmap=pixmap, keep_proportion=False)
+    page.set_rotation(90)
+    document.save(str(pdf_path))
+    document.close()
+
+    document = fitz.open(str(pdf_path))
+    try:
+        page = document[0]
+        placements = bl_import_engine._extract_image_placements(
+            document,
+            page,
+            1,
+            types.SimpleNamespace(flip_y=True, user_scale=1.0),
+            str(tmp_path),
+        )
+    finally:
+        document.close()
+
+    assert len(placements) == 1
+    placement = placements[0]
+    # Vertex order is Blender UV order: image bottom-left, bottom-right,
+    # top-right, top-left after the PDF image and page transforms.
+    expected_quad = [
+        (0.0, 279.4),
+        (0.0, 0.0),
+        (215.9, 0.0),
+        (215.9, 279.4),
+    ]
+    for actual, expected in zip(placement["quad_mm"], expected_quad, strict=True):
+        assert actual == pytest.approx(expected)
+    assert placement["x_mm"] == pytest.approx(0.0)
+    assert placement["y_mm"] == pytest.approx(0.0)
+    assert placement["width_mm"] == pytest.approx(215.9)
+    assert placement["height_mm"] == pytest.approx(279.4)
+
+
+def test_embedded_image_transform_uses_crop_local_userunit_safe_page_rotation(
+    tmp_path,
+):
+    pdf_path = tmp_path / "crop-rotate-userunit-image.pdf"
+    document = fitz.open()
+    page = document.new_page(width=800.0, height=600.0)
+    pixmap = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 2, 1), False)
+    pixmap.clear_with(0x336699)
+    page.insert_image(
+        fitz.Rect(120.0, 80.0, 520.0, 280.0),
+        pixmap=pixmap,
+        keep_proportion=False,
+    )
+    page.set_cropbox(fitz.Rect(100.0, 50.0, 700.0, 550.0))
+    page.set_rotation(90)
+    document.xref_set_key(page.xref, "UserUnit", "2")
+    document.save(str(pdf_path))
+    document.close()
+
+    document = fitz.open(str(pdf_path))
+    try:
+        placements = bl_import_engine._extract_image_placements(
+            document,
+            document[0],
+            1,
+            types.SimpleNamespace(flip_y=True, user_scale=1.0),
+            str(tmp_path),
+        )
+    finally:
+        document.close()
+
+    placement = placements[0]
+    expected_quad = [
+        (190.5, 409.2222222222),
+        (190.5, 127.0),
+        (331.6111111111, 127.0),
+        (331.6111111111, 409.2222222222),
+    ]
+    for actual, expected in zip(placement["quad_mm"], expected_quad, strict=True):
+        assert actual == pytest.approx(expected)
+    assert placement["x_mm"] == pytest.approx(190.5)
+    assert placement["y_mm"] == pytest.approx(127.0)
+    assert placement["width_mm"] == pytest.approx(141.1111111111)
+    assert placement["height_mm"] == pytest.approx(282.2222222222)
+
+
+def test_image_plane_geometry_uses_transformed_quad_without_changing_uvs():
+    placement = {
+        "quad_mm": [
+            (0.0, 279.4),
+            (0.0, 0.0),
+            (215.9, 0.0),
+            (215.9, 279.4),
+        ]
+    }
+
+    origin, vertices, face, uv_by_vertex = bl_import_engine._image_plane_geometry(
+        placement
+    )
+
+    assert origin == pytest.approx((0.0, 0.2794))
+    expected_vertices = [
+        (0.0, 0.0, 0.0),
+        (0.0, -0.2794, 0.0),
+        (0.2159, -0.2794, 0.0),
+        (0.2159, 0.0, 0.0),
+    ]
+    for actual, expected in zip(vertices, expected_vertices, strict=True):
+        assert actual == pytest.approx(expected)
+    assert face == (0, 1, 2, 3)
+    assert uv_by_vertex == {
+        0: (0.0, 0.0),
+        1: (1.0, 0.0),
+        2: (1.0, 1.0),
+        3: (0.0, 1.0),
+    }
+
+    _, _, mirrored_face, mirrored_uvs = bl_import_engine._image_plane_geometry(
+        {"quad_mm": [(0.0, 0.0), (-1.0, 0.0), (-1.0, 1.0), (0.0, 1.0)]}
+    )
+    assert mirrored_face == (0, 3, 2, 1)
+    assert mirrored_uvs == uv_by_vertex
 
 
 def _run_raster_import(monkeypatch, tmp_path, *, rendered, plane_created):
@@ -810,6 +939,158 @@ def test_post_stack_reverification_binds_final_entity_locations(monkeypatch):
     assert proof["entities"][0]["actual_location_m"] == [0.01, -0.08, 0.0]
 
 
+def test_post_stack_failure_cleans_owned_delivery_and_repairs_runtime_truth(monkeypatch):
+    class Registry:
+        def __init__(self, values=()):
+            self.items = {value.name: value for value in values}
+            self.removed = []
+
+        def get(self, name):
+            return self.items.get(name)
+
+        def remove(self, value, **_kwargs):
+            self.items.pop(value.name, None)
+            self.removed.append(value.name)
+
+    class Object(dict):
+        def __init__(self, name, data):
+            super().__init__()
+            self.name = name
+            self.type = "MESH"
+            self.location = [0.01, -0.08, 0.0]
+            self.data = data
+
+    data = types.SimpleNamespace(name="Text_9_mesh", type="MESH")
+    obj = Object("Text_9", data)
+    objects = Registry([obj])
+    meshes = Registry([data])
+    fake_bpy = types.SimpleNamespace(
+        data=types.SimpleNamespace(
+            objects=objects,
+            meshes=meshes,
+            curves=Registry(),
+            materials=Registry(),
+            images=Registry(),
+            fonts=Registry(),
+        ),
+        context=types.SimpleNamespace(
+            view_layer=types.SimpleNamespace(update=lambda: None),
+        ),
+    )
+    monkeypatch.setattr(bl_import_engine, "bpy", fake_bpy)
+    monkeypatch.setattr(bl_text_builder, "bpy", fake_bpy)
+
+    item_id = "page:2:text:9"
+    outcome = AttemptOutcome.delivered(
+        obj,
+        entity_ids=(obj.name,),
+        owned_objects=(obj,),
+        owned_datablocks=(data,),
+    )
+    provenance = types.SimpleNamespace(page=2, span_id=9)
+    opts = types.SimpleNamespace(
+        _text_delivery_outcomes={item_id: outcome},
+        _text_delivered_entity_counts={"native_text": 1},
+        _source_provenance_objects=[provenance],
+    )
+    record = {
+        "item_id": item_id,
+        "page": 2,
+        "source_span_id": 9,
+        "status": "delivered",
+        "requested_representation": "text",
+        "final_representation": "text",
+        "fallback_attempted": False,
+        "fallback_used": False,
+        "entity_ids": [obj.name],
+        "attempts": [{
+            "status": "delivered",
+            "evidence": {"actual_location_m": [0.01, 0.02]},
+        }],
+    }
+
+    failures = bl_import_engine._reverify_text_delivery_after_stack(
+        [record],
+        page_number=2,
+        stack_offset_m=-0.10,
+        provenance_opts=opts,
+    )
+
+    assert len(failures) == 1
+    assert failures[0]["cleanup"]["status"] == "complete"
+    assert record["status"] == "failed"
+    assert record["reason"] == "post_stack_final_state_verification_failed"
+    assert record["final_representation"] is None
+    assert record["entity_ids"] == []
+    assert record["fallback_used"] is False
+    assert objects.removed == [obj.name]
+    assert meshes.removed == [data.name]
+    assert opts._text_delivered_entity_counts["native_text"] == 0
+    assert opts._source_provenance_objects == []
+    assert opts._text_delivery_outcomes == {}
+
+
+def test_post_stack_cleanup_exception_stays_reportable_and_preserves_orphan_id(
+    monkeypatch,
+):
+    obj = types.SimpleNamespace(
+        name="Text_9",
+        type="MESH",
+        location=[0.01, -0.08, 0.0],
+    )
+    monkeypatch.setattr(
+        bl_import_engine,
+        "bpy",
+        types.SimpleNamespace(
+            data=types.SimpleNamespace(
+                objects=types.SimpleNamespace(
+                    get=lambda name: obj if name == obj.name else None
+                )
+            ),
+            context=types.SimpleNamespace(
+                view_layer=types.SimpleNamespace(update=lambda: None),
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        bl_import_engine,
+        "cleanup_delivery_outcome",
+        lambda _outcome: (_ for _ in ()).throw(RuntimeError("cleanup blocked")),
+    )
+    item_id = "page:2:text:9"
+    opts = types.SimpleNamespace(
+        _text_delivery_outcomes={item_id: object()},
+        _text_delivered_entity_counts={"native_text": 1},
+    )
+    record = {
+        "item_id": item_id,
+        "page": 2,
+        "source_span_id": 9,
+        "status": "delivered",
+        "final_representation": "text",
+        "fallback_used": False,
+        "entity_ids": [obj.name],
+        "attempts": [{
+            "status": "delivered",
+            "evidence": {"actual_location_m": [0.01, 0.02]},
+        }],
+    }
+
+    failures = bl_import_engine._reverify_text_delivery_after_stack(
+        [record],
+        page_number=2,
+        stack_offset_m=-0.10,
+        provenance_opts=opts,
+    )
+
+    assert failures[0]["cleanup"]["status"] == "failed"
+    assert failures[0]["cleanup"]["exception_type"] == "RuntimeError"
+    assert record["status"] == "failed"
+    assert record["entity_ids"] == [obj.name]
+    assert opts._text_delivery_outcomes[item_id] is not None
+    assert opts._text_delivered_entity_counts["native_text"] == 0
+
+
 def test_page_stacking_moves_only_roots_when_text_uses_affine_carrier():
     carrier = types.SimpleNamespace(name="Text_9_Affine", parent=None, location=[0.0, 0.0, 0.0])
     text = types.SimpleNamespace(
@@ -916,6 +1197,60 @@ def test_owned_import_image_temp_directory_is_removed_after_packed_delivery(
     assert not image_dir.exists()
 
 
+def test_import_stats_exclude_post_stack_failed_text(monkeypatch, tmp_path):
+    input_pdf = tmp_path / "input.pdf"
+    input_pdf.write_bytes(b"%PDF-1.7\n")
+    image_dir = tmp_path / "images"
+    image_dir.mkdir()
+
+    monkeypatch.setattr(bl_import_engine, "bpy", _FakeBpy())
+    monkeypatch.setattr(bl_import_engine, "check_pymupdf", lambda: True)
+    monkeypatch.setattr(bl_import_engine, "ensure_lib_path", lambda: None)
+    monkeypatch.setattr(fitz_loader, "import_fitz", lambda **_kwargs: object())
+    monkeypatch.setattr(fitz_loader, "safe_open", lambda _path: _Document())
+    monkeypatch.setattr(bl_import_engine, "extract_page", lambda *_args, **_kwargs: _page_data())
+    monkeypatch.setattr(
+        bl_import_engine,
+        "build_page",
+        lambda *_args, **_kwargs: {
+            "curves": 0,
+            "meshes": 0,
+            "circles": 0,
+            "arcs": 0,
+            "skipped_fill_only": 0,
+            "model3d_solids": 0,
+        },
+    )
+    monkeypatch.setattr(bl_import_engine, "build_all_text", lambda *_args, **_kwargs: 1)
+    monkeypatch.setattr(bl_import_engine, "_extract_image_placements", lambda *_args: [])
+    monkeypatch.setattr(
+        bl_import_engine,
+        "_reverify_text_delivery_after_stack",
+        lambda *_args, **_kwargs: [{"item_id": "page:1:text:1"}],
+    )
+    monkeypatch.setattr(bl_import_engine.tempfile, "mkdtemp", lambda **_kwargs: str(image_dir))
+    monkeypatch.setattr(
+        bl_import_engine,
+        "write_import_report",
+        lambda *_args, **_kwargs: str(tmp_path / "import_report.json"),
+    )
+
+    stats = bl_import_engine.import_pdf(
+        str(input_pdf),
+        config={
+            "mode": "vector",
+            "pages": "1",
+            "import_text": True,
+            "text_mode": "text",
+            "auto_focus_view": False,
+            "auto_hide_default_cube": False,
+        },
+    )
+
+    assert stats["text_items"] == 0
+    assert stats["text_final_state_failures"] == [{"item_id": "page:1:text:1"}]
+
+
 def test_unknown_text_representation_fails_before_root_collection_creation(
     monkeypatch,
     tmp_path,
@@ -971,7 +1306,7 @@ def test_strict_text_fidelity_false_is_rejected_before_import_mutation(monkeypat
     assert fake_bpy.data.collections.items == []
 
 
-def test_terminal_raster_failure_is_loud_in_report_without_clobbering_text_fallback(
+def test_terminal_raster_failure_is_loud_and_not_counted_as_text_fallback(
     monkeypatch,
     tmp_path,
 ):
@@ -1008,16 +1343,15 @@ def test_terminal_raster_failure_is_loud_in_report_without_clobbering_text_fallb
     )
 
     report = json.loads(report_path.read_text(encoding="utf-8"))
-    assert report["fallback"]["reason"] == "raster_delivery_failed"
-    assert report["fallback"]["text"] == {
-        "requested": "text",
-        "delivered": "raster",
-        "reason": "exact_source_font_unavailable_for_item",
-        "count": 1,
-    }
+    assert report["fallback"] == {"used": False, "reason": None}
     assert report["extra"]["raster_delivery_failures"] == stats["raster_delivery_failures"]
+    assert report["extra"]["result_status"] == "incomplete"
+    assert set(report["extra"]["terminal_failure"]) == {
+        "raster_delivery",
+        "text_delivery",
+    }
     assert "raster_delivery_failed" in report["extra"]["diagnostics"]["signals"]
-    assert report["result"]["warnings"] == 1
+    assert report["result"]["warnings"] == 2
 
 
 def test_report_preserves_every_item_attempt_and_summarizes_failures_loudly(
@@ -1148,7 +1482,7 @@ def test_report_preserves_every_item_attempt_and_summarizes_failures_loudly(
     assert "text_delivery_failed" in signals
 
 
-def test_auto_raster_delivery_failure_marks_fallback_as_used(monkeypatch, tmp_path):
+def test_auto_raster_delivery_failure_marks_fallback_attempted_not_used(monkeypatch, tmp_path):
     report_path = tmp_path / "import_report.json"
     monkeypatch.setattr(bl_import_engine, "_pymupdf_version", lambda: "")
     stats = {
@@ -1173,10 +1507,9 @@ def test_auto_raster_delivery_failure_marks_fallback_as_used(monkeypatch, tmp_pa
     )
 
     report = json.loads(report_path.read_text(encoding="utf-8"))
-    assert report["fallback"] == {
-        "used": True,
-        "reason": "raster_delivery_failed",
-    }
+    assert report["fallback"] == {"used": False, "reason": None}
+    assert report["extra"]["fallback_attempted"] is True
+    assert report["extra"]["result_status"] == "incomplete"
 
 
 def test_hybrid_sparse_shell_raster_success_is_reported_as_fallback(monkeypatch, tmp_path):

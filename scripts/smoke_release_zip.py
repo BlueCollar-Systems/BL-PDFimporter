@@ -24,6 +24,13 @@ REQUIRED_MEMBERS = {
     "pdf_vector_importer/lib/pymupdf/_extra.pyd",
     "pdf_vector_importer/lib/pymupdf/_mupdf.pyd",
     "pdf_vector_importer/lib/pymupdf/mupdfcpp64.dll",
+    "pdf_vector_importer/lib/fontTools/__init__.py",
+    "pdf_vector_importer/lib/fontTools/ttLib/__init__.py",
+    "pdf_vector_importer/lib/fontTools/cffLib/__init__.py",
+    "pdf_vector_importer/lib/fonttools-4.60.2.dist-info/METADATA",
+    "pdf_vector_importer/lib/fonttools-4.60.2.dist-info/WHEEL",
+    "pdf_vector_importer/lib/fonttools-4.60.2.dist-info/licenses/LICENSE",
+    "pdf_vector_importer/lib/fonttools-4.60.2.dist-info/licenses/LICENSE.external",
 }
 
 
@@ -50,6 +57,33 @@ def main() -> int:
             )
         with tempfile.TemporaryDirectory(prefix="bl_addon_zip_") as tmp:
             zf.extractall(tmp)
+            lib_dir = Path(tmp) / "pdf_vector_importer" / "lib"
+            fonttools_code = "\n".join(
+                (
+                    "import sys",
+                    f"sys.path.insert(0, {str(lib_dir)!r})",
+                    "import fontTools",
+                    "from fontTools.ttLib import TTFont",
+                    "from fontTools.cffLib import CFFFontSet",
+                    "assert fontTools.__version__ == '4.60.2'",
+                    "assert TTFont is not None and CFFFontSet is not None",
+                    f"metadata = ({str(lib_dir)!r} + '/fonttools-4.60.2.dist-info/METADATA')",
+                    "assert 'Version: 4.60.2' in open(metadata, encoding='utf-8').read()",
+                    f"license_dir = ({str(lib_dir)!r} + '/fonttools-4.60.2.dist-info/licenses')",
+                    "assert open(license_dir + '/LICENSE', encoding='utf-8').read().strip()",
+                    "assert open(license_dir + '/LICENSE.external', encoding='utf-8').read().strip()",
+                )
+            )
+            fonttools_proc = subprocess.run(
+                [sys.executable, "-S", "-c", fonttools_code],
+                capture_output=True,
+                text=True,
+            )
+            if fonttools_proc.returncode != 0:
+                raise SystemExit(
+                    "Vendored FontTools import/metadata/license smoke failed: "
+                    + (fonttools_proc.stderr.strip() or fonttools_proc.stdout.strip())
+                )
             sys.path.insert(0, tmp)
             addon = importlib.import_module("pdf_vector_importer")
             version = addon.bl_info.get("version")
@@ -58,7 +92,7 @@ def main() -> int:
             if not callable(getattr(addon, "register", None)):
                 raise SystemExit("pdf_vector_importer.register is missing")
             if sys.platform == "win32":
-                lib_dir = str(Path(tmp) / "pdf_vector_importer" / "lib")
+                lib_dir = str(lib_dir)
                 code = (
                     "import sys; "
                     f"sys.path.insert(0, r'{tmp}'); "
