@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import builtins
 import copy
+import json
 import math
 from hashlib import sha256
 from io import BytesIO
@@ -22,8 +23,10 @@ if "bpy" not in sys.modules:
             VectorFont=object,
         )
     )
+if "bmesh" not in sys.modules:
+    sys.modules["bmesh"] = types.SimpleNamespace()
 
-from pdf_vector_importer import bl_text_builder
+from pdf_vector_importer import bl_import_engine, bl_text_builder
 from pdf_vector_importer.pdfcadcore.primitives import NormalizedText, TextCharLayout
 from pdf_vector_importer.text_delivery import AttemptOutcome, deliver_item, fallback_ladder
 
@@ -1060,6 +1063,23 @@ def test_positioned_whitespace_only_delivers_verified_zero_ink_without_host_enti
     assert provenance.created_entity_type == f"blender_zero_ink_{mode}_identity"
     assert provenance.parent_handle == evidence["logical_delivery_id"]
     assert fake.data.materials.items == {}
+    manifest = opts._zero_ink_source_manifests[record["item_id"]]
+    assert manifest["source_text"] == "  "
+    assert [character["text"] for character in manifest["characters"]] == [" ", " "]
+
+    monkeypatch.setattr(bl_import_engine, "bpy", fake)
+    failures = bl_import_engine._reverify_text_delivery_after_stack(
+        [record],
+        page_number=2,
+        stack_offset_m=-0.10,
+        provenance_opts=opts,
+    )
+
+    assert failures == []
+    final_proof = record["final_state_verification"]
+    assert final_proof["status"] == "verified"
+    assert final_proof["logical_zero_ink_delivery"] is True
+    assert final_proof["entities"] == []
 
 
 @pytest.mark.parametrize("mode", ["glyphs", "geometry"])
@@ -2468,6 +2488,53 @@ def test_missing_delivered_identity_retains_owned_refs_for_cleanup():
     assert cleanup_calls[0].owned_datablocks == (owned_data,)
 
 
+_ZERO_INK_SOURCE_MANIFEST_SCHEMA = "positioned_zero_ink_source_manifest_v1"
+_ZERO_INK_CHARACTER_SOURCE_FIELDS = (
+    "character_item_id",
+    "character_index",
+    "text",
+    "glyph_id",
+    "advance_width_model",
+    "glyph_height_model",
+    "source_origin_pdf",
+    "source_bbox_pdf",
+    "source_quad_pdf",
+    "target_origin_model",
+    "target_quad_model",
+)
+
+
+def _zero_ink_source_manifest_from_evidence(evidence):
+    return {
+        "schema": _ZERO_INK_SOURCE_MANIFEST_SCHEMA,
+        "importer_id": evidence["importer_id"],
+        "item_id": evidence["item_id"],
+        "page_number": evidence["page_number"],
+        "source_span_id": evidence["source_span_id"],
+        "requested_representation": evidence["requested_representation"],
+        "source_text": evidence["source_text"],
+        "character_count": evidence["source_character_count"],
+        "characters": [
+            {
+                field: copy.deepcopy(character[field])
+                for field in _ZERO_INK_CHARACTER_SOURCE_FIELDS
+            }
+            for character in evidence["character_entities"]
+        ],
+    }
+
+
+def _zero_ink_manifest_sha256(manifest):
+    payload = json.dumps(
+        manifest,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return sha256(payload.encode("utf-8")).hexdigest()
+
+
 def _verified_zero_ink_delivery_evidence(
     *,
     requested="glyphs",
@@ -2483,6 +2550,7 @@ def _verified_zero_ink_delivery_evidence(
             "text": " ",
             "glyph_id": None,
             "advance_width_model": 3.0,
+            "glyph_height_model": 12.0,
             "source_origin_pdf": [10.0 + index * 3.0, 20.0],
             "source_bbox_pdf": [
                 10.0 + index * 3.0,
@@ -2525,7 +2593,7 @@ def _verified_zero_ink_delivery_evidence(
         for character in characters
         for removed_id in character["verification"]["cleanup"]["removed"]
     ]
-    return {
+    evidence = {
         "proof_kind": "positioned_zero_ink_delivery_v1",
         "logical_delivery_id": f"{item_id}:zero-ink:{delivered}",
         "importer_id": "bc_pdf_vector_importer.blender",
@@ -2534,6 +2602,7 @@ def _verified_zero_ink_delivery_evidence(
         "source_span_id": 41,
         "requested_representation": requested,
         "delivered_representation": delivered,
+        "source_text": "  ",
         "zero_ink_delivery": True,
         "zero_ink_identity_verified": True,
         "no_visible_ink_expected": True,
@@ -2547,16 +2616,38 @@ def _verified_zero_ink_delivery_evidence(
         "cleanup_verified": True,
         "cleanup": {"status": "complete", "removed": removed},
     }
+    manifest = _zero_ink_source_manifest_from_evidence(evidence)
+    digest = _zero_ink_manifest_sha256(manifest)
+    evidence["source_manifest_schema"] = _ZERO_INK_SOURCE_MANIFEST_SCHEMA
+    evidence["source_manifest_sha256"] = digest
+    for character in evidence["character_entities"]:
+        character["source_manifest_sha256"] = digest
+        verification = character["verification"]
+        verification.update({
+            "source_manifest_schema": _ZERO_INK_SOURCE_MANIFEST_SCHEMA,
+            "source_manifest_sha256": digest,
+            "item_id": evidence["item_id"],
+            "page_number": evidence["page_number"],
+            "source_span_id": evidence["source_span_id"],
+            "character_item_id": character["character_item_id"],
+            "character_index": character["character_index"],
+            "source_character_text": character["text"],
+            "source_glyph_id": character["glyph_id"],
+            "requested_representation": requested,
+        })
+    return evidence
 
 
 def test_entityless_zero_ink_delivery_requires_complete_bound_proof_and_stays_requested():
     evidence = _verified_zero_ink_delivery_evidence()
+    source_manifest = _zero_ink_source_manifest_from_evidence(evidence)
 
     entity, record = deliver_item(
         item_id="page:2:text:41",
         page_number=2,
         source_span_id=41,
         requested="glyphs",
+        expected_zero_ink_manifest=source_manifest,
         attempt=lambda _representation: AttemptOutcome.delivered(
             None,
             entity_ids=(),
@@ -2595,6 +2686,23 @@ def test_entityless_zero_ink_delivery_requires_complete_bound_proof_and_stays_re
         ("character_entity", "zero_ink_character_has_physical_entity_identity"),
         ("character_proof", "zero_ink_character_identity_unverified"),
         ("character_cleanup", "zero_ink_character_cleanup_incomplete"),
+        ("source_text", "zero_ink_source_manifest_mismatch"),
+        ("glyph_identity", "zero_ink_source_manifest_mismatch"),
+        ("advance", "zero_ink_source_manifest_mismatch"),
+        ("glyph_height", "zero_ink_source_manifest_mismatch"),
+        ("source_origin", "zero_ink_source_manifest_mismatch"),
+        ("source_bbox", "zero_ink_source_manifest_mismatch"),
+        ("source_quad", "zero_ink_source_manifest_mismatch"),
+        ("target_origin", "zero_ink_source_manifest_mismatch"),
+        ("target_quad", "zero_ink_source_manifest_mismatch"),
+        (
+            "nested_item_identity",
+            "zero_ink_character_verification_item_identity_unbound",
+        ),
+        (
+            "nested_manifest_identity",
+            "zero_ink_character_verification_manifest_identity_unbound",
+        ),
     ],
 )
 def test_entityless_zero_ink_delivery_rejects_partial_or_forged_evidence(
@@ -2602,6 +2710,7 @@ def test_entityless_zero_ink_delivery_rejects_partial_or_forged_evidence(
     expected_failure,
 ):
     evidence = copy.deepcopy(_verified_zero_ink_delivery_evidence())
+    source_manifest = _zero_ink_source_manifest_from_evidence(evidence)
     if corruption == "cleanup_missing":
         evidence.pop("cleanup_verified")
     elif corruption == "cleanup_failed":
@@ -2634,12 +2743,39 @@ def test_entityless_zero_ink_delivery_rejects_partial_or_forged_evidence(
         evidence["character_entities"][0]["verification"]["cleanup"][
             "status"
         ] = "failed"
+    elif corruption == "source_text":
+        evidence["source_text"] = "   "
+    elif corruption == "glyph_identity":
+        evidence["character_entities"][0]["glyph_id"] = 77
+    elif corruption == "advance":
+        evidence["character_entities"][0]["advance_width_model"] = 300.0
+    elif corruption == "glyph_height":
+        evidence["character_entities"][0]["glyph_height_model"] = 1200.0
+    elif corruption == "source_origin":
+        evidence["character_entities"][0]["source_origin_pdf"] = [999.0, 20.0]
+    elif corruption == "source_bbox":
+        evidence["character_entities"][0]["source_bbox_pdf"] = [0.0, 0.0, 1.0, 1.0]
+    elif corruption == "source_quad":
+        evidence["character_entities"][0]["source_quad_pdf"][0][0] = 999.0
+    elif corruption == "target_origin":
+        evidence["character_entities"][0]["target_origin_model"] = [999.0, 24.0]
+    elif corruption == "target_quad":
+        evidence["character_entities"][0]["target_quad_model"][0][0] = 999.0
+    elif corruption == "nested_item_identity":
+        evidence["character_entities"][0]["verification"]["item_id"] = (
+            "page:2:text:replayed"
+        )
+    elif corruption == "nested_manifest_identity":
+        evidence["character_entities"][0]["verification"][
+            "source_manifest_sha256"
+        ] = "0" * 64
 
     entity, record = deliver_item(
         item_id="page:2:text:41",
         page_number=2,
         source_span_id=41,
         requested="glyphs",
+        expected_zero_ink_manifest=source_manifest,
         attempt=lambda _representation: AttemptOutcome.delivered(
             None,
             entity_ids=(),
@@ -2657,6 +2793,11 @@ def test_entityless_zero_ink_delivery_rejects_partial_or_forged_evidence(
 
 def test_entityless_zero_ink_delivery_cannot_be_used_as_a_fallback_rung():
     attempts = []
+    evidence = _verified_zero_ink_delivery_evidence(
+        requested="glyphs",
+        delivered="geometry",
+    )
+    source_manifest = _zero_ink_source_manifest_from_evidence(evidence)
 
     def attempt(representation):
         attempts.append(representation)
@@ -2677,10 +2818,7 @@ def test_entityless_zero_ink_delivery_cannot_be_used_as_a_fallback_rung():
         return AttemptOutcome.delivered(
             None,
             entity_ids=(),
-            evidence=_verified_zero_ink_delivery_evidence(
-                requested="glyphs",
-                delivered="geometry",
-            ),
+            evidence=evidence,
         )
 
     entity, record = deliver_item(
@@ -2688,6 +2826,7 @@ def test_entityless_zero_ink_delivery_cannot_be_used_as_a_fallback_rung():
         page_number=2,
         source_span_id=41,
         requested="glyphs",
+        expected_zero_ink_manifest=source_manifest,
         attempt=attempt,
         cleanup=lambda _outcome: {"status": "complete", "removed": []},
     )
@@ -2709,12 +2848,14 @@ def test_entityless_zero_ink_conversion_proof_cannot_authorize_raster_delivery()
         requested="raster",
         delivered="raster",
     )
+    source_manifest = _zero_ink_source_manifest_from_evidence(evidence)
 
     entity, record = deliver_item(
         item_id="page:2:text:41",
         page_number=2,
         source_span_id=41,
         requested="raster",
+        expected_zero_ink_manifest=source_manifest,
         attempt=lambda _representation: AttemptOutcome.delivered(
             None,
             entity_ids=(),
@@ -2734,16 +2875,19 @@ def test_entityless_zero_ink_conversion_proof_cannot_authorize_raster_delivery()
 
 def test_entityless_zero_ink_delivery_cannot_retain_live_owned_artifacts():
     owned_object = object()
+    evidence = _verified_zero_ink_delivery_evidence()
+    source_manifest = _zero_ink_source_manifest_from_evidence(evidence)
 
     entity, record = deliver_item(
         item_id="page:2:text:41",
         page_number=2,
         source_span_id=41,
         requested="glyphs",
+        expected_zero_ink_manifest=source_manifest,
         attempt=lambda _representation: AttemptOutcome.delivered(
             None,
             entity_ids=(),
-            evidence=_verified_zero_ink_delivery_evidence(),
+            evidence=evidence,
             owned_artifacts=({"object_id": "live-zero-ink-artifact"},),
             owned_objects=(owned_object,),
         ),
@@ -2757,3 +2901,74 @@ def test_entityless_zero_ink_delivery_cannot_retain_live_owned_artifacts():
     assert "zero_ink_delivery_retains_owned_artifacts" in attempt["evidence"][
         "proof_failures"
     ]
+
+
+def test_entityless_zero_ink_delivery_requires_independent_source_manifest():
+    evidence = _verified_zero_ink_delivery_evidence()
+
+    entity, record = deliver_item(
+        item_id="page:2:text:41",
+        page_number=2,
+        source_span_id=41,
+        requested="glyphs",
+        attempt=lambda _representation: AttemptOutcome.delivered(
+            None,
+            entity_ids=(),
+            evidence=evidence,
+        ),
+        cleanup=lambda _outcome: {"status": "complete", "removed": []},
+    )
+
+    assert entity is None
+    assert record["status"] == "failed"
+    failures = record["attempts"][0]["evidence"]["proof_failures"]
+    assert "zero_ink_source_manifest_missing" in failures
+
+
+def test_zero_ink_expected_manifest_is_frozen_before_attempt_callback_runs():
+    evidence = _verified_zero_ink_delivery_evidence()
+    source_manifest = _zero_ink_source_manifest_from_evidence(evidence)
+
+    def attempt(_representation):
+        source_manifest["characters"][0]["advance_width_model"] = 999.0
+        return AttemptOutcome.delivered(None, entity_ids=(), evidence=evidence)
+
+    entity, record = deliver_item(
+        item_id="page:2:text:41",
+        page_number=2,
+        source_span_id=41,
+        requested="glyphs",
+        expected_zero_ink_manifest=source_manifest,
+        attempt=attempt,
+        cleanup=lambda _outcome: pytest.fail(
+            "the pre-attempt source snapshot still matches the delivery proof"
+        ),
+    )
+
+    assert entity is None
+    assert record["status"] == "delivered"
+
+
+def test_zero_ink_invalid_expected_manifest_fails_closed_without_raising():
+    evidence = _verified_zero_ink_delivery_evidence()
+    source_manifest = _zero_ink_source_manifest_from_evidence(evidence)
+    source_manifest["characters"][0] = None
+
+    entity, record = deliver_item(
+        item_id="page:2:text:41",
+        page_number=2,
+        source_span_id=41,
+        requested="glyphs",
+        expected_zero_ink_manifest=source_manifest,
+        attempt=lambda _representation: AttemptOutcome.delivered(
+            None,
+            entity_ids=(),
+            evidence=evidence,
+        ),
+        cleanup=lambda _outcome: {"status": "complete", "removed": []},
+    )
+
+    assert entity is None
+    assert record["status"] == "failed"
+    failures = record["attempts"][0]["evidence"]["proof_failures"]
+    assert "zero_ink_source_manifest_character_invalid" in failures

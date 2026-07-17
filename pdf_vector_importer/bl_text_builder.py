@@ -19,8 +19,10 @@ from .pdfcadcore.primitives import NormalizedText
 from .pdfcadcore.text_scale import calibrate_text_size_to_bbox
 from .text_delivery import (
     IMPORTER_ID,
+    ZERO_INK_SOURCE_MANIFEST_SCHEMA,
     AttemptOutcome,
     deliver_item,
+    freeze_zero_ink_source_manifest,
     normalize_representation,
 )
 
@@ -2688,6 +2690,58 @@ def _append_delivery_record(provenance_opts: Any, record: Dict[str, Any]) -> Non
     records.append(record)
 
 
+def _positioned_zero_ink_source_manifest(
+    text_item: NormalizedText,
+    *,
+    item_id: str,
+    page_number: int,
+    requested: str,
+) -> Dict[str, Any]:
+    """Snapshot source character/layout truth before any host mutation."""
+    layouts = tuple(getattr(text_item, "source_char_layout", ()) or ())
+    characters = []
+    for index, layout in enumerate(layouts):
+        glyph_id = getattr(layout, "glyph_id", None)
+        characters.append({
+            "character_item_id": f"{item_id}:char:{index}",
+            "character_index": index,
+            "text": str(layout.text),
+            "glyph_id": int(glyph_id) if glyph_id is not None else None,
+            "advance_width_model": float(layout.advance_width),
+            "glyph_height_model": float(layout.glyph_height),
+            "source_origin_pdf": [
+                float(layout.source_origin_pdf[0]),
+                float(layout.source_origin_pdf[1]),
+            ],
+            "source_bbox_pdf": [
+                float(value) for value in layout.source_bbox_pdf
+            ],
+            "source_quad_pdf": [
+                [float(point[0]), float(point[1])]
+                for point in layout.source_quad_pdf
+            ],
+            "target_origin_model": [
+                float(layout.target_origin[0]),
+                float(layout.target_origin[1]),
+            ],
+            "target_quad_model": [
+                [float(point[0]), float(point[1])]
+                for point in layout.target_quad
+            ],
+        })
+    return {
+        "schema": ZERO_INK_SOURCE_MANIFEST_SCHEMA,
+        "importer_id": IMPORTER_ID,
+        "item_id": str(item_id),
+        "page_number": int(page_number),
+        "source_span_id": int(text_item.id),
+        "requested_representation": str(requested),
+        "source_text": str(text_item.text),
+        "character_count": len(characters),
+        "characters": characters,
+    }
+
+
 def _character_text_item(text_item: NormalizedText, layout) -> NormalizedText:
     target_quad = tuple(
         (float(point[0]), float(point[1])) for point in layout.target_quad
@@ -3047,6 +3101,8 @@ def _attempt_positioned_converted_characters(
     item_id,
     visual_style,
     z_offset_m,
+    source_manifest=None,
+    source_manifest_sha256="",
 ):
     """Batch positioned FONT evaluation and CURVE/MESH verification by item."""
     layouts = tuple(getattr(text_item, "source_char_layout", ()) or ())
@@ -3070,13 +3126,32 @@ def _attempt_positioned_converted_characters(
     def character_record(candidate, outcome):
         layout = candidate["layout"]
         child = candidate["child"]
-        return {
+        verification = dict(outcome.evidence or {})
+        character_id = f"{item_id}:char:{candidate['index']}"
+        glyph_id = getattr(layout, "glyph_id", None)
+        if verification.get("zero_ink_identity") is True:
+            verification.update({
+                "source_manifest_schema": ZERO_INK_SOURCE_MANIFEST_SCHEMA,
+                "source_manifest_sha256": source_manifest_sha256,
+                "item_id": str(item_id),
+                "page_number": int(page_number),
+                "source_span_id": int(text_item.id),
+                "character_item_id": character_id,
+                "character_index": candidate["index"],
+                "source_character_text": str(layout.text),
+                "source_glyph_id": (
+                    int(glyph_id) if glyph_id is not None else None
+                ),
+                "requested_representation": requested,
+            })
+        record = {
             "item_id": item_id,
-            "character_item_id": f"{item_id}:char:{candidate['index']}",
+            "character_item_id": character_id,
             "character_index": candidate["index"],
             "text": str(layout.text),
-            "glyph_id": getattr(layout, "glyph_id", None),
+            "glyph_id": int(glyph_id) if glyph_id is not None else None,
             "advance_width_model": float(layout.advance_width),
+            "glyph_height_model": float(layout.glyph_height),
             "source_origin_pdf": list(layout.source_origin_pdf),
             "source_bbox_pdf": list(layout.source_bbox_pdf),
             "source_quad_pdf": [list(point) for point in layout.source_quad_pdf],
@@ -3088,8 +3163,11 @@ def _attempt_positioned_converted_characters(
                 getattr(child, "positioned_character", False)
             ),
             "entity_ids": [str(value) for value in outcome.entity_ids],
-            "verification": dict(outcome.evidence or {}),
+            "verification": verification,
         }
+        if verification.get("zero_ink_identity") is True:
+            record["source_manifest_sha256"] = source_manifest_sha256
+        return record
 
     def ownership(extra_outcomes=()):
         artifacts = []
@@ -3413,6 +3491,13 @@ def _attempt_positioned_converted_characters(
             "logical_delivery_id": f"{item_id}:zero-ink:{delivered}",
             "requested_representation": requested,
             "delivered_representation": delivered,
+            "source_manifest_schema": ZERO_INK_SOURCE_MANIFEST_SCHEMA,
+            "source_manifest_sha256": source_manifest_sha256,
+            "source_text": str(
+                source_manifest.get("source_text", text_item.text)
+                if isinstance(source_manifest, dict)
+                else text_item.text
+            ),
             "zero_ink_delivery": True,
             "zero_ink_identity_verified": True,
             "no_visible_ink_expected": True,
@@ -3482,6 +3567,8 @@ def _attempt_positioned_characters(
     item_id,
     visual_style,
     z_offset_m,
+    source_manifest=None,
+    source_manifest_sha256="",
 ):
     layouts = tuple(getattr(text_item, "source_char_layout", ()) or ())
     if not layouts:
@@ -3520,6 +3607,8 @@ def _attempt_positioned_characters(
             item_id=item_id,
             visual_style=visual_style,
             z_offset_m=z_offset_m,
+            source_manifest=source_manifest,
+            source_manifest_sha256=source_manifest_sha256,
         )
 
     raise ValueError(f"unsupported positioned representation: {delivered}")
@@ -3559,6 +3648,26 @@ def build_text(
 
     effective_page = int(page_number or getattr(text_item, "page_number", 0) or 0)
     item_id = f"page:{effective_page}:text:{int(text_item.id)}"
+    zero_ink_source_manifest = None
+    zero_ink_source_manifest_sha256 = ""
+    if (
+        requested in {"glyphs", "geometry"}
+        and bool(getattr(text_item, "requires_individual_positioning", False))
+    ):
+        try:
+            raw_manifest = _positioned_zero_ink_source_manifest(
+                text_item,
+                item_id=item_id,
+                page_number=effective_page,
+                requested=requested,
+            )
+            (
+                zero_ink_source_manifest,
+                zero_ink_source_manifest_sha256,
+            ) = freeze_zero_ink_source_manifest(raw_manifest)
+        except (AttributeError, IndexError, TypeError, ValueError, OverflowError):
+            zero_ink_source_manifest = None
+            zero_ink_source_manifest_sha256 = ""
 
     def attempt(representation: str) -> AttemptOutcome:
         if representation == "labels":
@@ -3576,6 +3685,8 @@ def build_text(
                 item_id=item_id,
                 visual_style=visual_style,
                 z_offset_m=z_offset_m,
+                source_manifest=zero_ink_source_manifest,
+                source_manifest_sha256=zero_ink_source_manifest_sha256,
             )
         if representation in {"text", "3d_text"}:
             return _attempt_native_font(
@@ -3622,6 +3733,7 @@ def build_text(
         page_number=effective_page,
         source_span_id=int(text_item.id),
         requested=requested,
+        expected_zero_ink_manifest=zero_ink_source_manifest,
         attempt=attempt,
         cleanup=lambda outcome: _cleanup_attempt(outcome, collection),
     )
@@ -3648,6 +3760,16 @@ def build_text(
             outcomes = {}
             provenance_opts._text_delivery_outcomes = outcomes  # noqa: B010
         outcomes[item_id] = delivered_outcome
+        if zero_ink_delivery and isinstance(zero_ink_source_manifest, dict):
+            manifests = getattr(
+                provenance_opts,
+                "_zero_ink_source_manifests",
+                None,
+            )
+            if not isinstance(manifests, dict):
+                manifests = {}
+                provenance_opts._zero_ink_source_manifests = manifests  # noqa: B010
+            manifests[item_id] = zero_ink_source_manifest
 
     delivered = str(record["final_representation"])
     if delivered != requested:

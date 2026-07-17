@@ -2,12 +2,28 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from hashlib import sha256
+import json
 import math
 from typing import Any, Callable, Dict, Sequence, Tuple
 
 
 REPRESENTATIONS = ("labels", "text", "3d_text", "glyphs", "geometry", "raster")
 IMPORTER_ID = "bc_pdf_vector_importer.blender"
+ZERO_INK_SOURCE_MANIFEST_SCHEMA = "positioned_zero_ink_source_manifest_v1"
+_ZERO_INK_CHARACTER_SOURCE_FIELDS = (
+    "character_item_id",
+    "character_index",
+    "text",
+    "glyph_id",
+    "advance_width_model",
+    "glyph_height_model",
+    "source_origin_pdf",
+    "source_bbox_pdf",
+    "source_quad_pdf",
+    "target_origin_model",
+    "target_quad_model",
+)
 _LADDERS = {
     "labels": ("labels", "text", "3d_text", "glyphs", "geometry", "raster"),
     "text": ("text", "3d_text", "glyphs", "geometry", "raster"),
@@ -255,6 +271,143 @@ def _strict_int(value: Any):
     return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
+def freeze_zero_ink_source_manifest(manifest: Any) -> tuple[Dict[str, Any], str]:
+    """Return an immutable-by-value JSON snapshot and its canonical digest."""
+    if not isinstance(manifest, dict):
+        raise TypeError("zero-ink source manifest must be a dictionary")
+    payload = json.dumps(
+        manifest,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    snapshot = json.loads(payload)
+    return snapshot, sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _prepare_zero_ink_source_manifest(manifest: Any):
+    if manifest is None:
+        return None, None, None
+    try:
+        snapshot, digest = freeze_zero_ink_source_manifest(manifest)
+    except (TypeError, ValueError, OverflowError) as exc:
+        return None, None, f"{type(exc).__name__}: {exc}"
+    return snapshot, digest, None
+
+
+def _zero_ink_manifest_contract_failures(
+    manifest: Any,
+    *,
+    item_id: str,
+    page_number: int,
+    source_span_id: int,
+    requested_representation: str,
+) -> list[str]:
+    failures: list[str] = []
+    if not isinstance(manifest, dict):
+        return ["zero_ink_source_manifest_invalid"]
+    if manifest.get("schema") != ZERO_INK_SOURCE_MANIFEST_SCHEMA:
+        failures.append("zero_ink_source_manifest_schema_unverified")
+    if manifest.get("importer_id") != IMPORTER_ID:
+        failures.append("zero_ink_source_manifest_importer_identity_unbound")
+    if str(manifest.get("item_id") or "") != str(item_id):
+        failures.append("zero_ink_source_manifest_item_identity_unbound")
+    if _strict_int(manifest.get("page_number")) != int(page_number):
+        failures.append("zero_ink_source_manifest_page_identity_unbound")
+    if _strict_int(manifest.get("source_span_id")) != int(source_span_id):
+        failures.append("zero_ink_source_manifest_span_identity_unbound")
+    if manifest.get("requested_representation") != requested_representation:
+        failures.append("zero_ink_source_manifest_representation_unbound")
+    source_text = manifest.get("source_text")
+    if not isinstance(source_text, str) or not source_text or source_text.strip():
+        failures.append("zero_ink_source_manifest_text_not_zero_ink")
+    characters = manifest.get("characters")
+    if not isinstance(characters, list):
+        failures.append("zero_ink_source_manifest_characters_invalid")
+        characters = []
+    character_count = _strict_int(manifest.get("character_count"))
+    if character_count is None or character_count <= 0:
+        failures.append("zero_ink_source_manifest_character_count_invalid")
+    elif character_count != len(characters):
+        failures.append("zero_ink_source_manifest_character_coverage_mismatch")
+    elif "".join(
+        str(character.get("text") or "")
+        if isinstance(character, dict)
+        else ""
+        for character in characters
+    ) != source_text:
+        failures.append("zero_ink_source_manifest_text_coverage_mismatch")
+
+    for expected_index, character in enumerate(characters):
+        if not isinstance(character, dict):
+            failures.append("zero_ink_source_manifest_character_invalid")
+            continue
+        expected_character_id = f"{item_id}:char:{expected_index}"
+        if str(character.get("character_item_id") or "") != expected_character_id:
+            failures.append("zero_ink_source_manifest_character_identity_unbound")
+        if _strict_int(character.get("character_index")) != expected_index:
+            failures.append("zero_ink_source_manifest_character_index_unbound")
+        character_text = character.get("text")
+        if (
+            not isinstance(character_text, str)
+            or not character_text
+            or character_text.strip()
+        ):
+            failures.append("zero_ink_source_manifest_character_text_not_zero_ink")
+        glyph_id = character.get("glyph_id")
+        if glyph_id is not None and _strict_int(glyph_id) is None:
+            failures.append("zero_ink_source_manifest_glyph_identity_invalid")
+        for metric_field in ("advance_width_model", "glyph_height_model"):
+            try:
+                metric = float(character.get(metric_field))
+            except (TypeError, ValueError):
+                metric = math.nan
+            if not math.isfinite(metric) or metric <= 0.0:
+                failures.append(f"zero_ink_source_manifest_{metric_field}_invalid")
+        for origin_field in ("source_origin_pdf", "target_origin_model"):
+            if not _finite_sequence(character.get(origin_field), 2):
+                failures.append(
+                    f"zero_ink_source_manifest_{origin_field}_invalid"
+                )
+        if not _finite_sequence(character.get("source_bbox_pdf"), 4):
+            failures.append("zero_ink_source_manifest_source_bbox_pdf_invalid")
+        for quad_field in ("source_quad_pdf", "target_quad_model"):
+            quad = character.get(quad_field)
+            if not (
+                isinstance(quad, list)
+                and len(quad) == 4
+                and all(_finite_sequence(point, 2) for point in quad)
+            ):
+                failures.append(f"zero_ink_source_manifest_{quad_field}_invalid")
+    return list(dict.fromkeys(failures))
+
+
+def _zero_ink_source_manifest_from_evidence(evidence: Dict[str, Any]):
+    characters = evidence.get("character_entities")
+    if not isinstance(characters, (list, tuple)):
+        characters = ()
+    return {
+        "schema": evidence.get("source_manifest_schema"),
+        "importer_id": evidence.get("importer_id"),
+        "item_id": evidence.get("item_id"),
+        "page_number": evidence.get("page_number"),
+        "source_span_id": evidence.get("source_span_id"),
+        "requested_representation": evidence.get("requested_representation"),
+        "source_text": evidence.get("source_text"),
+        "character_count": evidence.get("source_character_count"),
+        "characters": [
+            {
+                field_name: character.get(field_name)
+                for field_name in _ZERO_INK_CHARACTER_SOURCE_FIELDS
+            }
+            if isinstance(character, dict)
+            else {field_name: None for field_name in _ZERO_INK_CHARACTER_SOURCE_FIELDS}
+            for character in characters
+        ],
+    }
+
+
 def _zero_ink_delivery_proof_failures(
     *,
     attempted_representation: str,
@@ -263,6 +416,9 @@ def _zero_ink_delivery_proof_failures(
     page_number: int,
     source_span_id: int,
     outcome: AttemptOutcome,
+    expected_source_manifest=None,
+    expected_source_manifest_sha256=None,
+    expected_source_manifest_error=None,
 ) -> list[str]:
     """Reject an entity-less success unless every zero-ink fact is bound."""
     evidence = dict(outcome.evidence or {})
@@ -298,6 +454,37 @@ def _zero_ink_delivery_proof_failures(
         failures.append("zero_ink_visible_ink_absence_unverified")
     if outcome.owned_artifacts or outcome.owned_objects or outcome.owned_datablocks:
         failures.append("zero_ink_delivery_retains_owned_artifacts")
+
+    if expected_source_manifest_error:
+        failures.append("zero_ink_source_manifest_invalid")
+    elif expected_source_manifest is None or not expected_source_manifest_sha256:
+        failures.append("zero_ink_source_manifest_missing")
+    else:
+        failures.extend(
+            _zero_ink_manifest_contract_failures(
+                expected_source_manifest,
+                item_id=item_id,
+                page_number=page_number,
+                source_span_id=source_span_id,
+                requested_representation=requested_representation,
+            )
+        )
+        if evidence.get("source_manifest_schema") != ZERO_INK_SOURCE_MANIFEST_SCHEMA:
+            failures.append("zero_ink_source_manifest_schema_unverified")
+        if evidence.get("source_manifest_sha256") != expected_source_manifest_sha256:
+            failures.append("zero_ink_source_manifest_identity_unbound")
+        actual_manifest = _zero_ink_source_manifest_from_evidence(evidence)
+        try:
+            actual_snapshot, actual_digest = freeze_zero_ink_source_manifest(
+                actual_manifest
+            )
+        except (TypeError, ValueError, OverflowError):
+            actual_snapshot, actual_digest = None, None
+        if (
+            actual_snapshot != expected_source_manifest
+            or actual_digest != expected_source_manifest_sha256
+        ):
+            failures.append("zero_ink_source_manifest_mismatch")
 
     counts: Dict[str, Any] = {}
     for field_name in (
@@ -383,6 +570,12 @@ def _zero_ink_delivery_proof_failures(
             advance = math.nan
         if not math.isfinite(advance) or advance <= 0.0:
             failures.append("zero_ink_character_advance_unverified")
+        try:
+            glyph_height = float(character.get("glyph_height_model"))
+        except (TypeError, ValueError):
+            glyph_height = math.nan
+        if not math.isfinite(glyph_height) or glyph_height <= 0.0:
+            failures.append("zero_ink_character_glyph_height_unverified")
         for origin_field in ("source_origin_pdf", "target_origin_model"):
             if not _finite_sequence(character.get(origin_field), 2):
                 failures.append(f"zero_ink_character_{origin_field}_unverified")
@@ -408,6 +601,32 @@ def _zero_ink_delivery_proof_failures(
             != "verified_zero_ink_no_physical_entity"
         ):
             failures.append("zero_ink_character_identity_unverified")
+        if (
+            verification.get("item_id") != str(item_id)
+            or _strict_int(verification.get("page_number")) != int(page_number)
+            or _strict_int(verification.get("source_span_id"))
+            != int(source_span_id)
+            or verification.get("character_item_id") != expected_character_id
+            or _strict_int(verification.get("character_index")) != expected_index
+            or verification.get("source_character_text") != character_text
+            or verification.get("source_glyph_id") != character.get("glyph_id")
+            or verification.get("requested_representation")
+            != requested_representation
+        ):
+            failures.append(
+                "zero_ink_character_verification_item_identity_unbound"
+            )
+        if (
+            verification.get("source_manifest_schema")
+            != ZERO_INK_SOURCE_MANIFEST_SCHEMA
+            or verification.get("source_manifest_sha256")
+            != expected_source_manifest_sha256
+            or character.get("source_manifest_sha256")
+            != expected_source_manifest_sha256
+        ):
+            failures.append(
+                "zero_ink_character_verification_manifest_identity_unbound"
+            )
         character_cleanup = verification.get("cleanup")
         if (
             not isinstance(character_cleanup, dict)
@@ -427,17 +646,48 @@ def _zero_ink_delivery_proof_failures(
     return list(dict.fromkeys(failures))
 
 
+def zero_ink_delivery_proof_failures(
+    *,
+    attempted_representation: str,
+    requested_representation: str,
+    item_id: str,
+    page_number: int,
+    source_span_id: int,
+    outcome: AttemptOutcome,
+    expected_zero_ink_manifest=None,
+) -> list[str]:
+    """Validate a logical zero-ink delivery against independent source truth."""
+    snapshot, digest, error = _prepare_zero_ink_source_manifest(
+        expected_zero_ink_manifest
+    )
+    return _zero_ink_delivery_proof_failures(
+        attempted_representation=attempted_representation,
+        requested_representation=requested_representation,
+        item_id=item_id,
+        page_number=page_number,
+        source_span_id=source_span_id,
+        outcome=outcome,
+        expected_source_manifest=snapshot,
+        expected_source_manifest_sha256=digest,
+        expected_source_manifest_error=error,
+    )
+
+
 def deliver_item(
     *,
     item_id: str,
     page_number: int,
     source_span_id: int,
     requested: object,
+    expected_zero_ink_manifest=None,
     attempt: Callable[[str], AttemptOutcome],
     cleanup: Callable[[AttemptOutcome], Dict[str, Any]],
 ) -> tuple[Any, Dict[str, Any]]:
     """Attempt one finite ladder and return the verified entity plus record."""
     requested_mode = normalize_representation(requested)
+    expected_manifest, expected_manifest_sha256, expected_manifest_error = (
+        _prepare_zero_ink_source_manifest(expected_zero_ink_manifest)
+    )
     record: Dict[str, Any] = {
         "item_id": str(item_id),
         "page": int(page_number),
@@ -517,6 +767,9 @@ def deliver_item(
                     page_number=int(page_number),
                     source_span_id=int(source_span_id),
                     outcome=outcome,
+                    expected_source_manifest=expected_manifest,
+                    expected_source_manifest_sha256=expected_manifest_sha256,
+                    expected_source_manifest_error=expected_manifest_error,
                 )
                 if proof_failures:
                     outcome = AttemptOutcome.failed(
@@ -548,6 +801,9 @@ def deliver_item(
                         outcome.evidence["logical_delivery_id"]
                     )
                     record["physical_entity_count"] = 0
+                    record["source_manifest_sha256"] = str(
+                        expected_manifest_sha256 or ""
+                    )
                     record["_delivered_outcome"] = outcome
                     return None, record
             elif outcome.entity is None or not attempt_record["entity_ids"]:
@@ -599,7 +855,10 @@ def deliver_item(
 __all__ = [
     "AttemptOutcome",
     "REPRESENTATIONS",
+    "ZERO_INK_SOURCE_MANIFEST_SCHEMA",
     "deliver_item",
     "fallback_ladder",
+    "freeze_zero_ink_source_manifest",
     "normalize_representation",
+    "zero_ink_delivery_proof_failures",
 ]

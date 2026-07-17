@@ -939,6 +939,87 @@ def test_post_stack_reverification_binds_final_entity_locations(monkeypatch):
     assert proof["entities"][0]["actual_location_m"] == [0.01, -0.08, 0.0]
 
 
+def test_post_stack_zero_ink_claim_cannot_authorize_entityless_raster(monkeypatch):
+    monkeypatch.setattr(bl_import_engine, "bpy", _FakeBpy())
+    item_id = "page:2:text:41"
+    manifest = {
+        "schema": "positioned_zero_ink_source_manifest_v1",
+        "importer_id": "bc_pdf_vector_importer.blender",
+        "item_id": item_id,
+        "page_number": 2,
+        "source_span_id": 41,
+        "requested_representation": "raster",
+        "source_text": " ",
+        "character_count": 1,
+        "characters": [],
+    }
+    opts = types.SimpleNamespace(
+        _zero_ink_source_manifests={item_id: manifest},
+        _text_delivery_outcomes={},
+    )
+    record = {
+        "item_id": item_id,
+        "page": 2,
+        "source_span_id": 41,
+        "status": "delivered",
+        "requested_representation": "raster",
+        "final_representation": "raster",
+        "entity_ids": [],
+        "zero_ink_delivery": True,
+        "logical_delivery_id": f"{item_id}:zero-ink:raster",
+        "physical_entity_count": 0,
+        "attempts": [{
+            "status": "delivered",
+            "attempted_representation": "raster",
+            "entity_ids": [],
+            "evidence": {
+                "proof_kind": "positioned_zero_ink_delivery_v1",
+                "zero_ink_delivery": True,
+                "requested_representation": "raster",
+                "delivered_representation": "raster",
+            },
+        }],
+    }
+
+    failures = bl_import_engine._reverify_text_delivery_after_stack(
+        [record],
+        page_number=2,
+        stack_offset_m=-0.10,
+        provenance_opts=opts,
+    )
+
+    assert len(failures) == 1
+    assert "zero_ink_delivery_representation_not_convertible" in failures[0][
+        "failures"
+    ]
+    assert record["status"] == "failed"
+
+
+def test_post_stack_ordinary_delivery_still_requires_physical_entity_identity(
+    monkeypatch,
+):
+    monkeypatch.setattr(bl_import_engine, "bpy", _FakeBpy())
+    record = {
+        "item_id": "page:2:text:41",
+        "page": 2,
+        "source_span_id": 41,
+        "status": "delivered",
+        "requested_representation": "text",
+        "final_representation": "text",
+        "entity_ids": [],
+        "attempts": [{"status": "delivered", "evidence": {}}],
+    }
+
+    failures = bl_import_engine._reverify_text_delivery_after_stack(
+        [record],
+        page_number=2,
+        stack_offset_m=0.0,
+    )
+
+    assert failures[0]["failures"] == ["final_entity_identity_missing"]
+    assert record["status"] == "failed"
+
+
 def test_post_stack_failure_cleans_owned_delivery_and_repairs_runtime_truth(monkeypatch):
     class Registry:
         def __init__(self, values=()):

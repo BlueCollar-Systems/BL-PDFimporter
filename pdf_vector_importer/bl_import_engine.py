@@ -33,7 +33,11 @@ from .pdfcadcore.primitive_extractor import (
     _page_rotation_transform,
     _transform_pdf_point,
 )
-from .text_delivery import normalize_representation
+from .text_delivery import (
+    AttemptOutcome,
+    normalize_representation,
+    zero_ink_delivery_proof_failures,
+)
 
 _MM_PER_PT = 25.4 / 72.0
 _MM_TO_M = 0.001
@@ -1868,9 +1872,91 @@ def _reverify_text_delivery_after_stack(
         prior_evidence = dict(delivered_attempt.get("evidence") or {})
         expected_locations = _delivery_expected_locations(prior_evidence, entity_ids)
         representation = str(record.get("final_representation") or "")
+        requested_representation = str(
+            record.get("requested_representation") or ""
+        )
         expected_type = expected_types.get(representation)
         entity_proofs = []
         record_failures = []
+        logical_zero_ink_claimed = not entity_ids and (
+            record.get("zero_ink_delivery") is True
+            or prior_evidence.get("zero_ink_delivery") is True
+            or prior_evidence.get("proof_kind")
+            == "positioned_zero_ink_delivery_v1"
+        )
+        logical_zero_ink_verified = False
+        if logical_zero_ink_claimed:
+            item_id = str(record.get("item_id") or "")
+            manifests = getattr(
+                provenance_opts,
+                "_zero_ink_source_manifests",
+                None,
+            )
+            expected_manifest = (
+                manifests.get(item_id) if isinstance(manifests, dict) else None
+            )
+            runtime_outcomes = getattr(
+                provenance_opts,
+                "_text_delivery_outcomes",
+                None,
+            )
+            runtime_outcome = (
+                runtime_outcomes.get(item_id)
+                if isinstance(runtime_outcomes, dict)
+                else None
+            )
+            if not isinstance(runtime_outcome, AttemptOutcome):
+                record_failures.append("zero_ink_runtime_outcome_missing")
+            else:
+                if (
+                    runtime_outcome.entity is not None
+                    or tuple(runtime_outcome.entity_ids or ())
+                ):
+                    record_failures.append(
+                        "zero_ink_runtime_outcome_has_physical_entity"
+                    )
+                if (
+                    runtime_outcome.owned_artifacts
+                    or runtime_outcome.owned_objects
+                    or runtime_outcome.owned_datablocks
+                ):
+                    record_failures.append(
+                        "zero_ink_runtime_outcome_retains_owned_artifacts"
+                    )
+            record_failures.extend(
+                zero_ink_delivery_proof_failures(
+                    attempted_representation=representation,
+                    requested_representation=requested_representation,
+                    item_id=item_id,
+                    page_number=int(record.get("page", 0) or 0),
+                    source_span_id=int(record.get("source_span_id", 0) or 0),
+                    outcome=AttemptOutcome.delivered(
+                        None,
+                        entity_ids=(),
+                        evidence=prior_evidence,
+                    ),
+                    expected_zero_ink_manifest=expected_manifest,
+                )
+            )
+            expected_logical_id = f"{item_id}:zero-ink:{representation}"
+            if record.get("zero_ink_delivery") is not True:
+                record_failures.append("zero_ink_record_claim_missing")
+            if record.get("logical_delivery_id") != expected_logical_id:
+                record_failures.append("zero_ink_record_identity_unbound")
+            if record.get("physical_entity_count") != 0:
+                record_failures.append("zero_ink_record_physical_count_not_zero")
+            if requested_representation != representation:
+                record_failures.append("zero_ink_record_representation_mismatch")
+            if tuple(delivered_attempt.get("entity_ids") or ()):
+                record_failures.append("zero_ink_attempt_has_physical_entity_identity")
+            if delivered_attempt.get("attempted_representation") != representation:
+                record_failures.append("zero_ink_attempt_representation_unbound")
+            if record.get("source_manifest_sha256") != prior_evidence.get(
+                "source_manifest_sha256"
+            ):
+                record_failures.append("zero_ink_record_manifest_identity_unbound")
+            record_failures = list(dict.fromkeys(record_failures))
+            logical_zero_ink_verified = not record_failures
         for entity_id in entity_ids:
             obj = getter(entity_id) if callable(getter) else None
             if obj is None:
@@ -1906,7 +1992,7 @@ def _reverify_text_delivery_after_stack(
                 ):
                     record_failures.append(f"final_entity_location_mismatch:{entity_id}")
             entity_proofs.append(proof)
-        if not entity_ids:
+        if not entity_ids and not logical_zero_ink_claimed:
             record_failures.append("final_entity_identity_missing")
         final_proof = {
             "status": "failed" if record_failures else "verified",
@@ -1916,6 +2002,16 @@ def _reverify_text_delivery_after_stack(
             "entities": entity_proofs,
             "failures": record_failures,
         }
+        if logical_zero_ink_claimed:
+            final_proof.update({
+                "logical_zero_ink_delivery": logical_zero_ink_verified,
+                "logical_delivery_id": str(
+                    record.get("logical_delivery_id") or ""
+                ),
+                "source_manifest_sha256": str(
+                    record.get("source_manifest_sha256") or ""
+                ),
+            })
         record["final_state_verification"] = final_proof
         if delivered_attempt:
             delivered_attempt["final_state_verification"] = final_proof
@@ -1941,6 +2037,14 @@ def _reverify_text_delivery_after_stack(
                     }
                 if cleanup.get("status") == "complete" and isinstance(outcomes, dict):
                     outcomes.pop(item_id, None)
+            if cleanup.get("status") == "complete":
+                source_manifests = getattr(
+                    provenance_opts,
+                    "_zero_ink_source_manifests",
+                    None,
+                )
+                if isinstance(source_manifests, dict):
+                    source_manifests.pop(item_id, None)
             final_proof["cleanup"] = cleanup
             failure = {
                 "item_id": item_id,
