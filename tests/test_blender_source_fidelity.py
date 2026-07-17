@@ -291,10 +291,18 @@ class _TextDictPage:
                                     "size": 10.0,
                                     "font": "Helvetica",
                                 },
+                                # The slash sits ~17.6 model mm away from the
+                                # digits: far outside stacked-fraction merge
+                                # range. A slash OVERLAPPING "716" is the
+                                # Pattern-A stacked-fraction encoding and MUST
+                                # merge to "7/16" (RB-16 golden; worker-log
+                                # Ruling 1, 2026-07-17) — this fixture locks
+                                # that extraction stays inert for genuinely
+                                # separate spans, not that it never merges.
                                 {
                                     "text": " / ",
-                                    "origin": (11.0, 40.2),
-                                    "bbox": (11.0, 30.2, 17.0, 43.2),
+                                    "origin": (60.0, 40.2),
+                                    "bbox": (60.0, 30.2, 66.0, 43.2),
                                     "size": 10.0,
                                     "font": "Helvetica",
                                 },
@@ -314,6 +322,12 @@ class _TextDictPage:
 
 
 def test_extraction_preserves_edge_whitespace_and_does_not_invent_fraction_text():
+    """Edge whitespace survives extraction; distant spans never merge.
+
+    The semantic stacked-fraction merge (extraction-owned per Ruling 1,
+    2026-07-17) only fires on stacked/overlapping geometry; a slash far from
+    the digits stays a separate item with its source text intact.
+    """
     items = _extract_text(
         _TextDictPage(),
         page_h=100.0,
