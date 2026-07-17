@@ -9,8 +9,10 @@ optional recognition, and Blender geometry/text building.
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 import re
+import shutil
 import sys
 import tempfile
 import time
@@ -20,12 +22,14 @@ from typing import Any, Callable, Dict, List, Optional
 import bpy
 
 from .dependency_manager import check_pymupdf, ensure_lib_path
+from .packed_assets import pack_and_verify_bytes
 from .pdfcadcore import (
     ImportConfig, extract_page, iter_pages, recognition, reset_ids,
     classify_page_content, tag_hatch_primitives, cleanup_primitives,
 )
 from .bl_geometry_builder import build_page
 from .bl_text_builder import build_all_text
+from .text_delivery import normalize_representation
 
 _MM_PER_PT = 25.4 / 72.0
 _MM_TO_M = 0.001
@@ -176,9 +180,41 @@ def _merge_scale_into_stats(stats: Dict, page_data) -> None:
 
 
 def _text_fallback_from_provenance(provenance_opts: Any) -> Optional[Dict[str, Any]]:
-    """Return the first normalized builder fallback for the shared report."""
+    """Return an aggregate fallback while preserving item detail separately."""
     if provenance_opts is None:
         return None
+    delivery = _text_delivery_from_provenance(provenance_opts)
+    groups: Dict[tuple[str, str, str], int] = {}
+    for record in delivery["items"]:
+        if record.get("status") != "delivered" or not record.get("fallback_used"):
+            continue
+        requested = str(record.get("requested_representation") or "").strip().lower()
+        delivered = str(record.get("final_representation") or "").strip().lower()
+        if not requested or not delivered or requested == delivered:
+            continue
+        reason = "item_specific_impossibility"
+        for attempt in list(record.get("attempts") or []):
+            if not isinstance(attempt, dict):
+                continue
+            if attempt.get("status") == "impossible":
+                reason = str(attempt.get("reason") or reason)
+                break
+        key = (requested, delivered, reason)
+        groups[key] = int(groups.get(key, 0) or 0) + 1
+    if groups:
+        requested_values = sorted({key[0] for key in groups})
+        delivered_values = sorted({key[1] for key in groups})
+        reason_values = sorted({key[2] for key in groups})
+        return {
+            "requested": requested_values[0] if len(requested_values) == 1 else "mixed_requested",
+            "delivered": delivered_values[0] if len(delivered_values) == 1 else "mixed_item_specific",
+            "reason": (
+                reason_values[0]
+                if len(reason_values) == 1
+                else "multiple_item_specific_reasons; see extra.text_delivery.items"
+            ),
+            "count": sum(groups.values()),
+        }
     try:
         records = list(getattr(provenance_opts, "_text_mode_fallbacks", []) or [])
     except (AttributeError, TypeError):
@@ -204,6 +240,47 @@ def _text_fallback_from_provenance(provenance_opts: Any) -> Optional[Dict[str, A
     return None
 
 
+def _text_delivery_from_provenance(provenance_opts: Any) -> Dict[str, Any]:
+    """Build the complete, item-scoped text delivery report payload."""
+    try:
+        raw_records = list(getattr(provenance_opts, "_text_delivery_records", []) or [])
+    except (AttributeError, TypeError):
+        raw_records = []
+    records = [dict(record) for record in raw_records if isinstance(record, dict)]
+    requested_counts: Dict[str, int] = {}
+    final_counts: Dict[str, int] = {}
+    delivered = 0
+    fallback = 0
+    failed_ids = []
+    for record in records:
+        requested = str(record.get("requested_representation") or "").strip().lower()
+        final = str(record.get("final_representation") or "").strip().lower()
+        status = str(record.get("status") or "failed").strip().lower()
+        if requested:
+            requested_counts[requested] = int(requested_counts.get(requested, 0) or 0) + 1
+        if final:
+            final_counts[final] = int(final_counts.get(final, 0) or 0) + 1
+        if status == "delivered" and final:
+            delivered += 1
+            if bool(record.get("fallback_used")) and final != requested:
+                fallback += 1
+        else:
+            failed_ids.append(str(record.get("item_id") or "<unknown>"))
+    return {
+        "schema": "bcs.text_delivery/1.0",
+        "summary": {
+            "source_items": len(records),
+            "delivered_items": delivered,
+            "fallback_items": fallback,
+            "failed_items": len(failed_ids),
+            "requested_counts": dict(sorted(requested_counts.items())),
+            "final_counts": dict(sorted(final_counts.items())),
+            "failed_item_ids": failed_ids,
+        },
+        "items": records,
+    }
+
+
 def write_import_report(
     filepath: str,
     config: Dict,
@@ -223,6 +300,8 @@ def write_import_report(
         or _default_import_report_path(filepath)
     )
     elapsed = float(stats.get("elapsed", 0.0) or 0.0)
+    text_delivery = _text_delivery_from_provenance(provenance_opts)
+    text_delivery_summary = text_delivery["summary"]
     raster_delivery_failures = []
     for record in list(stats.get("raster_delivery_failures") or []):
         if not isinstance(record, dict):
@@ -239,17 +318,39 @@ def write_import_report(
                 "stage": stage,
                 "reason": reason,
             })
+    geometry_delivery_issues = [
+        dict(record)
+        for record in list(stats.get("geometry_delivery_issues") or [])
+        if isinstance(record, dict)
+    ]
+    geometry_delivery_failures = [
+        record
+        for record in geometry_delivery_issues
+        if str(record.get("status") or "").strip().lower() != "verified"
+    ]
+    raster_is_fallback = raster_pages > 0 and import_mode != "raster"
     fallback_used = (
-        raster_pages > 0
-        or import_mode == "raster"
+        raster_is_fallback
         or bool(raster_delivery_failures)
+        or bool(geometry_delivery_issues)
+        or int(text_delivery_summary["fallback_items"]) > 0
+        or int(text_delivery_summary["failed_items"]) > 0
     )
     if raster_delivery_failures:
         fallback_reason = "raster_delivery_failed"
-    elif import_mode == "raster":
-        fallback_reason = "forced_raster_mode"
-    elif raster_pages > 0:
+    elif geometry_delivery_failures:
+        count = len(geometry_delivery_failures)
+        fallback_reason = f"geometry_delivery_failed_{count}_primitive{'s' if count != 1 else ''}"
+    elif int(text_delivery_summary["failed_items"]) > 0:
+        fallback_reason = f"text_delivery_failed_{text_delivery_summary['failed_items']}_items"
+    elif raster_is_fallback:
         fallback_reason = f"raster_fallback_{raster_pages}_page{'s' if raster_pages != 1 else ''}"
+    elif int(text_delivery_summary["fallback_items"]) > 0:
+        count = int(text_delivery_summary["fallback_items"])
+        fallback_reason = f"text_fallback_{count}_item{'s' if count != 1 else ''}"
+    elif geometry_delivery_issues:
+        count = len(geometry_delivery_issues)
+        fallback_reason = f"geometry_approximation_{count}_primitive{'s' if count != 1 else ''}"
     else:
         fallback_reason = None
     from .pdfcadcore.fitz_loader import sample_process_mb
@@ -272,7 +373,7 @@ def write_import_report(
         try:
             font_rendered = any(
                 int(delivered_text_counts.get(bucket, 0) or 0) > 0
-                for bucket in ("native_label", "native_3d_text")
+                for bucket in ("native_label", "native_text", "native_3d_text")
             )
         except (TypeError, ValueError):
             font_rendered = None
@@ -287,9 +388,16 @@ def write_import_report(
         "resolved_scale": stats.get("resolved_scale"),
         "scale_hints": stats.get("scale_hints"),
     }
+    if int(text_delivery_summary["source_items"]) > 0:
+        extra["text_delivery"] = text_delivery
     if raster_delivery_failures:
         extra["raster_delivery_failures"] = raster_delivery_failures
         extra["raster_delivery_failure_count"] = len(raster_delivery_failures)
+    if geometry_delivery_issues:
+        extra["geometry_delivery_issues"] = geometry_delivery_issues
+        extra["geometry_delivery_issue_count"] = len(geometry_delivery_issues)
+    if stats.get("temp_cleanup_error"):
+        extra["temp_cleanup_error"] = str(stats.get("temp_cleanup_error"))
     if int(stats.get("recognition_skipped_pages", 0) or 0) > 0:
         extra["recognition_skipped_pages"] = int(stats.get("recognition_skipped_pages", 0) or 0)
     # TEXTMODE-1 item 12: unknown text_mode strings are normalized to the
@@ -330,6 +438,12 @@ def write_import_report(
         elapsed_ms=elapsed * 1000.0,
         performance_phases=phases or None,
         peak_mb=sample_process_mb(),
+        warnings=(
+            int(text_delivery_summary["failed_items"])
+            + len(raster_delivery_failures)
+            + len(geometry_delivery_issues)
+            + (1 if stats.get("temp_cleanup_error") else 0)
+        ),
         fallback_used=fallback_used,
         fallback_reason=fallback_reason,
         pdf_engine_version=_pymupdf_version(),
@@ -349,13 +463,36 @@ def write_import_report(
             diagnostics["signals"] = signals
             actions = list(diagnostics.get("recommended_actions") or [])
             action = (
-                "The terminal raster image could not be created in Blender; "
-                "retry the import or choose Vector/Hybrid mode, then inspect "
-                "extra.raster_delivery_failures."
+                "The terminal raster image could not be created in Blender; inspect "
+                "extra.raster_delivery_failures before trusting the import."
             )
             if action not in actions:
                 actions.append(action)
             diagnostics["recommended_actions"] = actions
+    diagnostics = report.extra.get("diagnostics")
+    if isinstance(diagnostics, dict) and int(text_delivery_summary["source_items"]) > 0:
+        signals = list(diagnostics.get("signals") or [])
+        actions = list(diagnostics.get("recommended_actions") or [])
+        if int(text_delivery_summary["fallback_items"]) > 0:
+            if "text_representation_fallback_used" not in signals:
+                signals.append("text_representation_fallback_used")
+            action = (
+                "Review extra.text_delivery.items for each requested representation, "
+                "impossibility proof, cleanup result, and final entity identity."
+            )
+            if action not in actions:
+                actions.append(action)
+        if int(text_delivery_summary["failed_items"]) > 0:
+            if "text_delivery_failed" not in signals:
+                signals.append("text_delivery_failed")
+            action = (
+                "One or more text items were not delivered; inspect "
+                "extra.text_delivery.summary.failed_item_ids before trusting the import."
+            )
+            if action not in actions:
+                actions.append(action)
+        diagnostics["signals"] = signals
+        diagnostics["recommended_actions"] = actions
 
     provenance_objects = list(getattr(provenance_opts, "_source_provenance_objects", []) or [])
     if provenance_objects:
@@ -958,8 +1095,15 @@ def _extract_image_placements(doc, page, page_num: int, import_cfg, image_dir: s
     return placements
 
 
-def _render_page_raster(page, page_num: int, import_cfg, image_dir: str) -> Optional[dict]:
-    """Render entire page to raster and place as one aligned image plane."""
+def _render_page_raster(
+    page,
+    page_num: int,
+    import_cfg,
+    image_dir: str,
+    *,
+    excluded_text_bboxes=(),
+) -> Optional[dict]:
+    """Render a page background, removing text delivered as separate entities."""
     if not image_dir:
         return None
 
@@ -972,12 +1116,47 @@ def _render_page_raster(page, page_num: int, import_cfg, image_dir: str) -> Opti
     zoom = dpi / 72.0
     matrix = fitz.Matrix(zoom, zoom)
 
+    render_doc = None
+    render_page = page
+    exclusions = tuple(excluded_text_bboxes or ())
     try:
-        pix = page.get_pixmap(matrix=matrix, alpha=False)
-        image_path = os.path.join(image_dir, f"page_{page_num:03d}_raster_{dpi}dpi.png")
+        if exclusions:
+            source_doc = getattr(page, "parent", None)
+            source_page_number = int(getattr(page, "number", page_num - 1))
+            if source_doc is None:
+                raise RuntimeError("source document unavailable for text-free page composition")
+            render_doc = fitz.open()
+            render_doc.insert_pdf(
+                source_doc,
+                from_page=source_page_number,
+                to_page=source_page_number,
+            )
+            render_page = render_doc[0]
+            page_rect = render_page.rect
+            for raw_bbox in exclusions:
+                if raw_bbox is None or len(raw_bbox) != 4:
+                    raise ValueError("delivered text has no finite four-value source bbox")
+                values = tuple(float(value) for value in raw_bbox)
+                if not all(math.isfinite(value) for value in values):
+                    raise ValueError("delivered text source bbox is non-finite")
+                rect = fitz.Rect(*values) & page_rect
+                if rect.is_empty or rect.is_infinite:
+                    raise ValueError("delivered text source bbox is outside the source page")
+                render_page.add_redact_annot(rect, fill=None, cross_out=False)
+            render_page.apply_redactions(images=0, graphics=0, text=0)
+
+        pix = render_page.get_pixmap(matrix=matrix, alpha=False)
+        suffix = "_background" if exclusions else ""
+        image_path = os.path.join(
+            image_dir,
+            f"page_{page_num:03d}_raster_{dpi}dpi{suffix}.png",
+        )
         pix.save(image_path)
-    except (RuntimeError, OSError, ValueError, TypeError):
+    except (AttributeError, RuntimeError, OSError, ValueError, TypeError):
         return None
+    finally:
+        if render_doc is not None:
+            render_doc.close()
 
     width_mm = float(page.rect.width) * _MM_PER_PT * import_cfg.user_scale
     height_mm = float(page.rect.height) * _MM_PER_PT * import_cfg.user_scale
@@ -989,7 +1168,223 @@ def _render_page_raster(page, page_num: int, import_cfg, image_dir: str) -> Opti
         "height_mm": height_mm,
         "xref": -1,
         "page_number": page_num,
+        "excluded_text_bbox_count": len(exclusions),
+        "composition": (
+            "page_background_without_delivered_text"
+            if exclusions
+            else "complete_page_raster"
+        ),
     }
+
+
+def _delivered_text_bboxes(text_items, delivery_records, page_number: int):
+    delivered_ids = {
+        int(record.get("source_span_id"))
+        for record in tuple(delivery_records or ())
+        if int(record.get("page", 0) or 0) == int(page_number)
+        and record.get("status") == "delivered"
+        and record.get("final_representation")
+        and record.get("entity_ids")
+    }
+    result = []
+    for item in tuple(text_items or ()):
+        try:
+            item_id = int(item.id)
+        except (AttributeError, TypeError, ValueError):
+            continue
+        bbox = getattr(item, "source_bbox_pdf", None)
+        if item_id in delivered_ids and bbox is not None:
+            result.append(tuple(float(value) for value in bbox))
+    return result
+
+
+def _remove_created_image_plane(obj, collection) -> Dict[str, Any]:
+    """Remove every attempt-owned datablock from one failed raster plane."""
+    removed: List[str] = []
+    try:
+        object_name = str(getattr(obj, "name", "") or "")
+        mesh = getattr(obj, "data", None)
+        mesh_name = str(getattr(mesh, "name", "") or "") if mesh is not None else ""
+        material_name = str(obj.get("pdf_image_material", "") or "")
+        material_owned = bool(obj.get("pdf_image_material_owned", False))
+        image_name = str(obj.get("pdf_image_datablock", "") or "")
+        image_owned = bool(obj.get("pdf_image_datablock_owned", False))
+    except ReferenceError:
+        return {"status": "complete", "removed": ["<already_removed_image_plane>"]}
+    try:
+        collection.objects.unlink(obj)
+    except Exception:
+        pass
+    try:
+        bpy.data.objects.remove(obj, do_unlink=True)
+        removed.append(object_name)
+    except Exception as exc:
+        return {
+            "status": "failed",
+            "removed": removed,
+            "exception_type": type(exc).__name__,
+            "detail": str(exc),
+        }
+    if mesh is not None:
+        try:
+            bpy.data.meshes.remove(mesh)
+            removed.append(mesh_name)
+        except Exception as exc:
+            return {
+                "status": "failed",
+                "removed": removed,
+                "exception_type": type(exc).__name__,
+                "detail": str(exc),
+            }
+    for registry_name, name, owned in (
+        ("materials", material_name, material_owned),
+        ("images", image_name, image_owned),
+    ):
+        if not owned or not name:
+            continue
+        registry = getattr(bpy.data, registry_name, None)
+        get = getattr(registry, "get", None)
+        remove = getattr(registry, "remove", None)
+        block = get(name) if callable(get) else None
+        if block is None:
+            continue
+        try:
+            if int(getattr(block, "users", 0) or 0) > 0:
+                raise RuntimeError(
+                    f"owned {registry_name} datablock still has users"
+                )
+            if not callable(remove):
+                raise RuntimeError(f"no {registry_name} datablock remover")
+            remove(block)
+            removed.append(name)
+        except Exception as exc:
+            return {
+                "status": "failed",
+                "removed": removed,
+                "exception_type": type(exc).__name__,
+                "detail": str(exc),
+            }
+    return {"status": "complete", "removed": removed}
+
+
+def _remove_owned_raster_file(path: str) -> Dict[str, Any]:
+    """Remove only the item clip written by the current raster attempt."""
+    if not path or not os.path.exists(path):
+        return {"status": "complete", "removed": []}
+    try:
+        os.remove(path)
+    except OSError as exc:
+        return {
+            "status": "failed",
+            "removed": [],
+            "exception_type": type(exc).__name__,
+            "detail": str(exc),
+        }
+    return {"status": "complete", "removed": [str(path)]}
+
+
+def _raise_for_incomplete_raster_cleanup(*results: Dict[str, Any]) -> None:
+    incomplete = [result for result in results if result.get("status") != "complete"]
+    if incomplete:
+        raise RuntimeError(f"terminal raster attempt cleanup failed: {incomplete!r}")
+
+
+def _render_text_item_raster(
+    page,
+    text_item,
+    collection: bpy.types.Collection,
+    *,
+    page_num: int,
+    item_id: str,
+    import_cfg,
+    image_dir: str,
+    z_offset_m: float = 0.0,
+) -> Optional[bpy.types.Object]:
+    """Render and verify one text span as the terminal item-scoped fallback."""
+    source_bbox = getattr(text_item, "source_bbox_pdf", None)
+    target_bbox = getattr(text_item, "bbox", None)
+    if not image_dir or not source_bbox or not target_bbox:
+        return None
+    try:
+        sx0, sy0, sx1, sy1 = (float(value) for value in source_bbox[:4])
+        tx0, ty0, tx1, ty1 = (float(value) for value in target_bbox[:4])
+    except (IndexError, TypeError, ValueError):
+        return None
+    values = (sx0, sy0, sx1, sy1, tx0, ty0, tx1, ty1)
+    if not all(math.isfinite(value) for value in values):
+        return None
+    sx0, sx1 = sorted((sx0, sx1))
+    sy0, sy1 = sorted((sy0, sy1))
+    tx0, tx1 = sorted((tx0, tx1))
+    ty0, ty1 = sorted((ty0, ty1))
+    if sx1 - sx0 <= 1.0e-9 or sy1 - sy0 <= 1.0e-9:
+        return None
+    if tx1 - tx0 <= 1.0e-9 or ty1 - ty0 <= 1.0e-9:
+        return None
+
+    try:
+        import pymupdf as fitz  # type: ignore
+    except ImportError:
+        import fitz  # type: ignore
+
+    dpi = int(max(36, getattr(import_cfg, "raster_dpi", 300) or 300))
+    matrix = fitz.Matrix(dpi / 72.0, dpi / 72.0)
+    clip = fitz.Rect(sx0, sy0, sx1, sy1)
+    safe_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(item_id)).strip("_")
+    if not safe_id:
+        return None
+    image_path = os.path.join(image_dir, f"{safe_id}_{dpi}dpi.png")
+    try:
+        pix = page.get_pixmap(matrix=matrix, clip=clip, alpha=True)
+        if int(getattr(pix, "width", 0) or 0) <= 0 or int(getattr(pix, "height", 0) or 0) <= 0:
+            return None
+        samples = bytes(getattr(pix, "samples", b"") or b"")
+        if not samples or not any(samples):
+            return None
+        pix.save(image_path)
+        if not os.path.isfile(image_path) or os.path.getsize(image_path) <= 0:
+            return None
+    except (RuntimeError, OSError, ValueError, TypeError):
+        cleanup = _remove_owned_raster_file(image_path)
+        _raise_for_incomplete_raster_cleanup(cleanup)
+        return None
+
+    source_id = int(getattr(text_item, "id", 0) or 0)
+    placement = {
+        "path": image_path,
+        "x_mm": tx0,
+        "y_mm": ty0,
+        "width_mm": tx1 - tx0,
+        "height_mm": ty1 - ty0,
+        "xref": -1_000_000 - source_id,
+        "page_number": int(page_num),
+        "source_bbox_pdf": [sx0, sy0, sx1, sy1],
+        "source_item_id": str(item_id),
+    }
+    try:
+        obj = _create_image_plane(placement, collection, z_offset_m=z_offset_m)
+    except Exception:
+        cleanup = _remove_owned_raster_file(image_path)
+        _raise_for_incomplete_raster_cleanup(cleanup)
+        return None
+    if obj is None:
+        cleanup = _remove_owned_raster_file(image_path)
+        _raise_for_incomplete_raster_cleanup(cleanup)
+        return None
+    try:
+        obj["pdf_raster_source_item_id"] = str(item_id)
+        obj["pdf_raster_source_bbox_pdf"] = list(placement["source_bbox_pdf"])
+        obj["pdf_raster_dpi"] = dpi
+    except Exception:
+        plane_cleanup = _remove_created_image_plane(obj, collection)
+        file_cleanup = (
+            _remove_owned_raster_file(image_path)
+            if plane_cleanup.get("status") == "complete"
+            else {"status": "not_attempted", "removed": []}
+        )
+        _raise_for_incomplete_raster_cleanup(plane_cleanup, file_cleanup)
+        return None
+    return obj
 
 
 def _record_raster_delivery_failure(
@@ -1019,6 +1414,14 @@ def _create_image_plane(
     if not path or not os.path.isfile(path):
         return None
 
+    try:
+        image_bytes = Path(path).read_bytes()
+    except OSError:
+        return None
+    if not image_bytes:
+        return None
+    image_sha256 = hashlib.sha256(image_bytes).hexdigest()
+
     x = float(placement.get("x_mm", 0.0)) * _MM_TO_M
     y = float(placement.get("y_mm", 0.0)) * _MM_TO_M
     width = max(float(placement.get("width_mm", 0.0)) * _MM_TO_M, 1e-9)
@@ -1026,18 +1429,26 @@ def _create_image_plane(
     page_num = int(placement.get("page_number", 0))
     xref = int(placement.get("xref", -1))
 
-    mesh = bpy.data.meshes.new(f"PDF_ImgMesh_{page_num}_{xref}")
-    verts = [
-        (x, y, z_offset_m),
-        (x + width, y, z_offset_m),
-        (x + width, y + height, z_offset_m),
-        (x, y + height, z_offset_m),
-    ]
-    mesh.from_pydata(verts, [], [(0, 1, 2, 3)])
-    mesh.update()
+    mesh = None
+    obj = None
+    material = None
+    image = None
+    material_created = False
+    image_created = False
     try:
-        uv_layer = mesh.uv_layers.new(name="UVMap")
-        if uv_layer is not None:
+        mesh = bpy.data.meshes.new(f"PDF_ImgMesh_{page_num}_{xref}")
+        verts = [
+            (0.0, 0.0, 0.0),
+            (width, 0.0, 0.0),
+            (width, height, 0.0),
+            (0.0, height, 0.0),
+        ]
+        mesh.from_pydata(verts, [], [(0, 1, 2, 3)])
+        mesh.update()
+        try:
+            uv_layer = mesh.uv_layers.new(name="UVMap")
+            if uv_layer is None:
+                raise RuntimeError("UVMap creation returned no layer")
             uv_by_vert = {
                 0: (0.0, 0.0),
                 1: (1.0, 0.0),
@@ -1048,38 +1459,82 @@ def _create_image_plane(
                 for loop_idx in poly.loop_indices:
                     v_idx = mesh.loops[loop_idx].vertex_index
                     uv_layer.data[loop_idx].uv = uv_by_vert.get(v_idx, (0.0, 0.0))
-    except Exception:
-        pass
+        except Exception as exc:
+            raise RuntimeError("raster UV construction failed") from exc
 
-    obj = bpy.data.objects.new(f"PDF_Image_{page_num}_{xref}", mesh)
-    collection.objects.link(obj)
+        obj = bpy.data.objects.new(f"PDF_Image_{page_num}_{xref}", mesh)
+        obj.location = (x, y, z_offset_m)
+        collection.objects.link(obj)
 
-    mat_name = f"PDF_Image_Mat_{page_num}_{xref}"
-    material = bpy.data.materials.get(mat_name) or bpy.data.materials.new(name=mat_name)
-    material.use_nodes = True
-    nodes = material.node_tree.nodes
-    links = material.node_tree.links
-    nodes.clear()
+        mat_name = f"PDF_Image_Mat_{page_num}_{xref}"
+        material = bpy.data.materials.new(name=mat_name)
+        material_created = True
+        material.use_nodes = True
+        nodes = material.node_tree.nodes
+        links = material.node_tree.links
+        nodes.clear()
 
-    tex = nodes.new(type="ShaderNodeTexImage")
-    bsdf = nodes.new(type="ShaderNodeBsdfPrincipled")
-    out = nodes.new(type="ShaderNodeOutputMaterial")
+        tex = nodes.new(type="ShaderNodeTexImage")
+        bsdf = nodes.new(type="ShaderNodeBsdfPrincipled")
+        out = nodes.new(type="ShaderNodeOutputMaterial")
 
-    image = bpy.data.images.load(path, check_existing=True)
-    tex.image = image
-    links.new(tex.outputs["Color"], bsdf.inputs["Base Color"])
-    links.new(tex.outputs["Alpha"], bsdf.inputs["Alpha"])
-    links.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
+        image = bpy.data.images.load(path, check_existing=False)
+        image_created = True
+        packed_image_sha256 = pack_and_verify_bytes(image, image_bytes)
+        if packed_image_sha256 != image_sha256:
+            raise RuntimeError("packed image digest changed after verification")
+        tex.image = image
+        links.new(tex.outputs["Color"], bsdf.inputs["Base Color"])
+        links.new(tex.outputs["Alpha"], bsdf.inputs["Alpha"])
+        links.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
 
-    material.blend_method = "HASHED"
-    if mesh.materials:
-        mesh.materials[0] = material
-    else:
-        mesh.materials.append(material)
+        material.blend_method = "HASHED"
+        if mesh.materials:
+            mesh.materials[0] = material
+        else:
+            mesh.materials.append(material)
 
-    obj["pdf_image_path"] = path
-    obj["pdf_xref"] = xref
-    return obj
+        obj["pdf_image_path"] = path
+        obj["pdf_xref"] = xref
+        obj["pdf_image_material"] = str(getattr(material, "name", "") or "")
+        obj["pdf_image_datablock"] = str(getattr(image, "name", "") or "")
+        obj["pdf_image_material_owned"] = bool(material_created)
+        obj["pdf_image_datablock_owned"] = bool(image_created)
+        obj["pdf_image_packed"] = True
+        obj["pdf_image_sha256"] = image_sha256
+        return obj
+    except Exception as exc:
+        cleanup_errors = []
+        if obj is not None:
+            try:
+                collection.objects.unlink(obj)
+            except Exception:
+                pass
+            try:
+                bpy.data.objects.remove(obj, do_unlink=True)
+            except Exception as cleanup_exc:
+                cleanup_errors.append(f"object:{type(cleanup_exc).__name__}:{cleanup_exc}")
+        if mesh is not None:
+            try:
+                bpy.data.meshes.remove(mesh)
+            except Exception as cleanup_exc:
+                cleanup_errors.append(f"mesh:{type(cleanup_exc).__name__}:{cleanup_exc}")
+        if material_created and material is not None:
+            try:
+                bpy.data.materials.remove(material)
+            except Exception as cleanup_exc:
+                cleanup_errors.append(f"material:{type(cleanup_exc).__name__}:{cleanup_exc}")
+        if image_created and image is not None:
+            try:
+                bpy.data.images.remove(image)
+            except Exception as cleanup_exc:
+                cleanup_errors.append(f"image:{type(cleanup_exc).__name__}:{cleanup_exc}")
+        if cleanup_errors:
+            raise RuntimeError(
+                "image plane construction and owned-artifact cleanup failed: "
+                f"creation={type(exc).__name__}:{exc}; cleanup={cleanup_errors!r}"
+            ) from exc
+        return None
 
 
 # ── Mode mapping (BCS-ARCH-001) ───────────────────────────────────────
@@ -1108,7 +1563,7 @@ def _apply_overrides(config: ImportConfig, ui_config: dict) -> ImportConfig:
     """Apply operator UI overrides onto an ImportConfig.
 
     BCS-ARCH-001 text rendering is orthogonal to mode. ``text_mode`` is
-    one of ``labels | 3d_text | glyphs | geometry``; the separate
+    one of ``labels | text | 3d_text | glyphs | geometry | raster``; the separate
     ``import_text`` toggle controls whether text is imported at all.
     """
     if "import_text" in ui_config:
@@ -1116,12 +1571,13 @@ def _apply_overrides(config: ImportConfig, ui_config: dict) -> ImportConfig:
     if "text_mode" in ui_config:
         text_mode = str(ui_config["text_mode"] or "3d_text").strip().lower()
         config.text_mode = text_mode
-        if "strict_text_fidelity" not in ui_config:
-            # Strict fidelity is always on for BCS-ARCH-001. Host adapter
-            # may relax only if operator explicitly passes the override.
-            config.strict_text_fidelity = True
+        config.strict_text_fidelity = True
     if "strict_text_fidelity" in ui_config:
-        config.strict_text_fidelity = bool(ui_config["strict_text_fidelity"])
+        if not bool(ui_config["strict_text_fidelity"]):
+            raise ValueError("strict_text_fidelity cannot be disabled")
+        config.strict_text_fidelity = True
+    if "ignore_images" in ui_config:
+        config.ignore_images = bool(ui_config["ignore_images"])
     if "detect_arcs" in ui_config:
         config.detect_arcs = ui_config["detect_arcs"]
     if "make_faces" in ui_config:
@@ -1198,6 +1654,162 @@ def _page_stack_step(page_height_m: float, arrangement: str, gap_ratio: float) -
     return h * 1.2
 
 
+def _stack_page_objects(objects, stack_offset_m: float) -> int:
+    """Move each page hierarchy once, leaving child-local transforms intact."""
+    page_objects = []
+    seen = set()
+    for obj in tuple(objects or ()):
+        if obj is None or id(obj) in seen:
+            continue
+        seen.add(id(obj))
+        page_objects.append(obj)
+    page_object_ids = {id(obj) for obj in page_objects}
+    moved = 0
+    for obj in page_objects:
+        try:
+            parent = obj.parent
+        except (AttributeError, ReferenceError):
+            parent = None
+        if parent is not None and id(parent) in page_object_ids:
+            continue
+        try:
+            location = obj.location
+            try:
+                location.y += float(stack_offset_m)
+            except AttributeError:
+                location[1] = float(location[1]) + float(stack_offset_m)
+            moved += 1
+        except (AttributeError, IndexError, ReferenceError, RuntimeError, TypeError, ValueError):
+            continue
+    return moved
+
+
+def _object_world_location(obj):
+    """Return evaluated world translation, falling back for host-test doubles."""
+    try:
+        translation = obj.matrix_world.translation
+        return [float(translation[index]) for index in range(3)]
+    except (AttributeError, IndexError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return [float(obj.location[index]) for index in range(3)]
+
+
+def _delivery_expected_locations(attempt_evidence, entity_ids):
+    expected = {}
+    for character in tuple(attempt_evidence.get("character_entities") or ()):
+        verification = dict(character.get("verification") or {})
+        location = verification.get("actual_location_m")
+        if not isinstance(location, (list, tuple)) or len(location) < 2:
+            continue
+        for entity_id in tuple(character.get("entity_ids") or ()):
+            expected[str(entity_id)] = (float(location[0]), float(location[1]))
+    top_location = attempt_evidence.get("actual_location_m")
+    if isinstance(top_location, (list, tuple)) and len(top_location) >= 2 and entity_ids:
+        expected.setdefault(
+            str(entity_ids[0]),
+            (float(top_location[0]), float(top_location[1])),
+        )
+    return expected
+
+
+def _reverify_text_delivery_after_stack(
+    delivery_records,
+    *,
+    page_number: int,
+    stack_offset_m: float,
+):
+    """Bind proof to final host state after every page-placement mutation."""
+    failures = []
+    expected_types = {
+        "labels": "FONT",
+        "text": "FONT",
+        "3d_text": "FONT",
+        "glyphs": "CURVE",
+        "geometry": "MESH",
+        "raster": "MESH",
+    }
+    try:
+        bpy.context.view_layer.update()
+    except (AttributeError, ReferenceError, RuntimeError):
+        pass
+    registry = getattr(getattr(bpy, "data", None), "objects", None)
+    getter = getattr(registry, "get", None)
+    for record in tuple(delivery_records or ()):
+        if (
+            int(record.get("page", 0) or 0) != int(page_number)
+            or record.get("status") != "delivered"
+        ):
+            continue
+        entity_ids = [str(value) for value in tuple(record.get("entity_ids") or ())]
+        attempts = tuple(record.get("attempts") or ())
+        delivered_attempt = next(
+            (attempt for attempt in reversed(attempts) if attempt.get("status") == "delivered"),
+            {},
+        )
+        prior_evidence = dict(delivered_attempt.get("evidence") or {})
+        expected_locations = _delivery_expected_locations(prior_evidence, entity_ids)
+        representation = str(record.get("final_representation") or "")
+        expected_type = expected_types.get(representation)
+        entity_proofs = []
+        record_failures = []
+        for entity_id in entity_ids:
+            obj = getter(entity_id) if callable(getter) else None
+            if obj is None:
+                record_failures.append(f"missing_final_entity:{entity_id}")
+                continue
+            try:
+                actual_type = str(getattr(obj, "type", "") or "")
+                location = _object_world_location(obj)
+            except (AttributeError, IndexError, ReferenceError, TypeError, ValueError):
+                record_failures.append(f"unreadable_final_entity:{entity_id}")
+                continue
+            proof = {
+                "entity_id": entity_id,
+                "actual_object_type": actual_type,
+                "actual_location_m": location,
+            }
+            if expected_type and actual_type != expected_type:
+                record_failures.append(f"final_entity_type_mismatch:{entity_id}")
+            if not all(math.isfinite(value) for value in location):
+                record_failures.append(f"nonfinite_final_entity_location:{entity_id}")
+            prior_location = expected_locations.get(entity_id)
+            if prior_location is not None:
+                expected_location = [
+                    prior_location[0],
+                    prior_location[1] + float(stack_offset_m),
+                ]
+                proof["expected_location_m"] = expected_location
+                if len(location) < 2 or any(
+                    abs(actual - expected) > 1e-7
+                    for actual, expected in zip(  # noqa: B905
+                        location[:2], expected_location
+                    )
+                ):
+                    record_failures.append(f"final_entity_location_mismatch:{entity_id}")
+            entity_proofs.append(proof)
+        if not entity_ids:
+            record_failures.append("final_entity_identity_missing")
+        final_proof = {
+            "status": "failed" if record_failures else "verified",
+            "page_number": int(page_number),
+            "stack_offset_m": float(stack_offset_m),
+            "representation": representation,
+            "entities": entity_proofs,
+            "failures": record_failures,
+        }
+        record["final_state_verification"] = final_proof
+        if delivered_attempt:
+            delivered_attempt["final_state_verification"] = final_proof
+        if record_failures:
+            failure = {
+                "item_id": str(record.get("item_id") or ""),
+                "page": int(page_number),
+                "failures": list(record_failures),
+            }
+            failures.append(failure)
+            record["status"] = "failed"
+    return failures
+
+
 # ── Main import entry point ──────────────────────────────────────────
 
 def import_pdf(
@@ -1228,6 +1840,8 @@ def import_pdf(
     """
     if config is None:
         config = {}
+    if "strict_text_fidelity" in config and not bool(config["strict_text_fidelity"]):
+        raise ValueError("strict_text_fidelity cannot be disabled")
 
     visual_style = str(config.get("visual_style", "source") or "source").strip().lower()
     if visual_style not in {"source", "blueprint", "high_contrast"}:
@@ -1263,6 +1877,9 @@ def import_pdf(
 
     t_start = time.perf_counter()
     phase_timings_ms: Dict[str, float] = {}
+    doc = None
+    image_dir = ""
+    image_dir_owned = False
 
     try:
         # 1. Verify PyMuPDF is available
@@ -1298,6 +1915,7 @@ def import_pdf(
         import_cfg = _config_from_mode(config.get("mode", "auto"))
         import_cfg = _apply_overrides(import_cfg, config)
         if import_cfg.import_text and str(import_cfg.text_mode or "3d_text") != "none":
+            import_cfg.text_mode = normalize_representation(import_cfg.text_mode)
             try:
                 from .pdfcadcore.source_provenance import ensure_import_session_id
 
@@ -1336,7 +1954,19 @@ def import_pdf(
         root_col = bpy.data.collections.new(f"PDF Import - {basename}")
         bpy.context.scene.collection.children.link(root_col)
         collections_created = 1  # root collection
-        image_dir = tempfile.mkdtemp(prefix="bc_bl_pdf_images_") if not import_cfg.ignore_images else ""
+        text_delivery_enabled = (
+            bool(import_cfg.import_text)
+            and str(import_cfg.text_mode or "3d_text").strip().lower() != "none"
+        )
+        image_dir = (
+            tempfile.mkdtemp(prefix="bc_bl_pdf_images_")
+            if (not import_cfg.ignore_images or text_delivery_enabled)
+            else ""
+        )
+        image_dir_owned = bool(
+            image_dir
+            and Path(image_dir).name.startswith("bc_bl_pdf_images_")
+        )
 
         # 8. Build config dict for geometry builder
         builder_config = {
@@ -1362,6 +1992,8 @@ def import_pdf(
             "parts_bootstrap_text_items": [],
             "model3d_solids": 0,
             "raster_delivery_failures": [],
+            "geometry_delivery_issues": [],
+            "text_final_state_failures": [],
         }
         raster_pages_imported = 0
         total_page_count = max(1, len(page_indices))
@@ -1561,7 +2193,7 @@ def import_pdf(
 
             # 9h. Build text objects
             text_count = 0
-            if import_mode != "raster" and import_cfg.import_text and import_cfg.text_mode != "none":
+            if import_cfg.import_text and import_cfg.text_mode != "none":
                 _progress(_page_progress(i, 0.82), f"Building text for page {page_num}...")
                 t_phase = time.perf_counter()
                 def _text_progress(frac, _i=i, _pn=page_num):
@@ -1580,18 +2212,44 @@ def import_pdf(
                     text_mode=import_cfg.text_mode,
                     progress_callback=_text_progress,
                     provenance_opts=import_cfg,
+                    terminal_raster_callback=(
+                        lambda text_item, collection, callback_page_number, item_id,
+                        _page=page, _cfg=import_cfg, _dir=image_dir, _z=text_z_offset_m:
+                        _render_text_item_raster(
+                            _page,
+                            text_item,
+                            collection,
+                            page_num=callback_page_number,
+                            item_id=item_id,
+                            import_cfg=_cfg,
+                            image_dir=_dir,
+                            z_offset_m=_z,
+                        )
+                    ),
                 )
                 _add_phase_ms("text_ms", t_phase)
 
             # 9i. Build image/raster planes
             image_count = 0
             raster_page_delivered = False
+            delivery_records = getattr(import_cfg, "_text_delivery_records", ())
+            excluded_text_bboxes = _delivered_text_bboxes(
+                page_data.text_items,
+                delivery_records,
+                page_num,
+            )
             if not import_cfg.ignore_images:
                 _progress(_page_progress(i, 0.92), f"Building images for page {page_num}...")
                 t_phase = time.perf_counter()
                 placements = []
                 if import_mode == "raster":
-                    rendered = _render_page_raster(page, page_num, import_cfg, image_dir)
+                    rendered = _render_page_raster(
+                        page,
+                        page_num,
+                        import_cfg,
+                        image_dir,
+                        excluded_text_bboxes=excluded_text_bboxes,
+                    )
                     if rendered:
                         placements.append(rendered)
                     else:
@@ -1616,7 +2274,13 @@ def import_pdf(
                             _page_progress(i, 0.93),
                             f"Auto-mode: sparse vector shell on page {page_num} — raster fallback",
                         )
-                        rendered = _render_page_raster(page, page_num, import_cfg, image_dir)
+                        rendered = _render_page_raster(
+                            page,
+                            page_num,
+                            import_cfg,
+                            image_dir,
+                            excluded_text_bboxes=excluded_text_bboxes,
+                        )
                         if rendered:
                             placements.append(rendered)
                         else:
@@ -1653,11 +2317,14 @@ def import_pdf(
 
             # 9j. Multi-page stacking: shift this page's collection downward
             if len(page_indices) > 1 and _page_stack_offset_m != 0.0:
-                for obj in page_col.all_objects:
-                    try:
-                        obj.location.y += _page_stack_offset_m
-                    except (AttributeError, RuntimeError):
-                        pass
+                _stack_page_objects(page_col.all_objects, _page_stack_offset_m)
+            total_stats["text_final_state_failures"].extend(
+                _reverify_text_delivery_after_stack(
+                    getattr(import_cfg, "_text_delivery_records", ()),
+                    page_number=page_num,
+                    stack_offset_m=_page_stack_offset_m,
+                )
+            )
             # Advance offset for the next page (page_data.height is in mm)
             page_height_m = page_data.height * _MM_TO_M
             _page_stack_offset_m -= _page_stack_step(
@@ -1677,6 +2344,9 @@ def import_pdf(
             total_stats["images"] += image_count
             total_stats["skipped_fill_only"] += page_stats.get("skipped_fill_only", 0)
             total_stats["model3d_solids"] += page_stats.get("model3d_solids", 0)
+            total_stats["geometry_delivery_issues"].extend(
+                list(page_stats.get("geometry_delivery_issues") or [])
+            )
             _progress(
                 _page_progress(i, 1.0),
                 f"Finished page {page_num}/{len(page_indices)} "
@@ -1746,6 +2416,20 @@ def import_pdf(
         phase_timings_ms["total_ms"] = elapsed * 1000.0
         total_stats["elapsed"] = elapsed
         total_stats["performance_phases"] = phase_timings_ms
+        if image_dir_owned and image_dir and os.path.isdir(image_dir):
+            try:
+                shutil.rmtree(image_dir)
+                image_dir_owned = False
+            except OSError as exc:
+                total_stats["temp_cleanup_error"] = (
+                    f"{type(exc).__name__}: {exc}"
+                )
+        delivery_summary = _text_delivery_from_provenance(import_cfg)["summary"]
+        total_stats["text_delivery_source_items"] = int(delivery_summary["source_items"])
+        total_stats["text_delivery_delivered_items"] = int(delivery_summary["delivered_items"])
+        total_stats["text_delivery_fallback_items"] = int(delivery_summary["fallback_items"])
+        total_stats["text_delivery_failed_items"] = int(delivery_summary["failed_items"])
+        total_stats["text_delivery_failed_item_ids"] = list(delivery_summary["failed_item_ids"])
         try:
             report_path = write_import_report(
                 filepath,
@@ -1761,6 +2445,16 @@ def import_pdf(
         return total_stats
 
     finally:
+        if doc is not None and not bool(getattr(doc, "is_closed", False)):
+            try:
+                doc.close()
+            except Exception:
+                pass
+        if image_dir_owned and image_dir and os.path.isdir(image_dir):
+            try:
+                shutil.rmtree(image_dir)
+            except OSError:
+                pass
         if wm is not None:
             try:
                 wm.progress_end()

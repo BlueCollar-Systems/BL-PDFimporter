@@ -19,3 +19,8 @@
 *.zip binary
 *.skp binary
 *.whl binary
+
+# Preserve third-party FontTools sources and package metadata byte-for-byte.
+# Upstream contains intentional/historical trailing whitespace in a few files.
+pdf_vector_importer/lib/fontTools/** whitespace=-blank-at-eol,-blank-at-eof
+pdf_vector_importer/lib/fonttools-*.dist-info/** whitespace=-blank-at-eol,-blank-at-eof

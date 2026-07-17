@@ -6,7 +6,7 @@ from .importer import run_import  # noqa: F401
 bl_info = {
     "name": "PDF Vector Importer for Blender",
     "author": "BlueCollar Systems",
-    "version": (1, 0, 65),
+    "version": (1, 0, 66),
     "blender": (3, 0, 0),
     "location": "File > Import > PDF Vector Drawing (.pdf)",
     "description": "Import vector geometry, text, and images from PDFs",
@@ -56,17 +56,18 @@ try:  # pragma: no cover - Blender runtime only
         text_mode: EnumProperty(
             name="Text Mode",
             items=[
-                ("labels", "Labels", "Import text as Blender text objects"),
-                ("3d_text", "3D Text", "Extruded geometric text"),
-                ("geometry", "Geometry", "Convert text fully to non-editable geometry"),
-                ("glyphs", "Glyphs", "Convert text runs to non-editable outline meshes"),
+                ("labels", "Labels", "Request persistent model labels with item-specific fallback evidence"),
+                ("text", "Text", "Flat editable exact-font text"),
+                ("3d_text", "3D Text", "Extruded editable exact-font text"),
+                ("glyphs", "Glyphs", "Exact-font CURVE glyph outlines"),
+                ("geometry", "Geometry", "Exact-font MESH geometry"),
+                ("raster", "Raster", "Aligned raster patch for each text item"),
             ],
             default="3d_text",
         )
 
         import_text: BoolProperty(name="Import Text", default=True)
         import_images: BoolProperty(name="Import Images", default=True)
-        group_by_layer: BoolProperty(name="Group By Layer", default=True)
         group_by_color: BoolProperty(name="Tag Color Groups", default=True)
 
         def execute(self, context):
@@ -75,15 +76,41 @@ try:  # pragma: no cover - Blender runtime only
                 import_text=self.import_text,
                 text_mode=self.text_mode,
                 import_images=self.import_images,
-                group_by_layer=self.group_by_layer,
                 group_by_color=self.group_by_color,
             )
 
             effective_mode = self.mode if self.show_advanced else "auto"
-            extraction = import_into_blender(
-                self.filepath, mode=effective_mode, options=options
-            )
-            summary = extraction.summary()
+            try:
+                result = import_into_blender(
+                    self.filepath,
+                    mode=effective_mode,
+                    options=options,
+                    context=context,
+                )
+            except Exception as exc:
+                self.report({"ERROR"}, f"PDF import failed: {exc}")
+                return {"CANCELLED"}
+
+            summary = result.summary()
+            failed_text = summary["text_delivery_failed_items"]
+            raster_failures = summary["raster_delivery_failures"]
+            report_path = summary["import_report_path"] or "the import report"
+            if failed_text or raster_failures:
+                self.report(
+                    {"ERROR"},
+                    f"Import incomplete: {failed_text} text item(s) and "
+                    f"{len(raster_failures)} raster attempt(s) failed. Review "
+                    f"{report_path}.",
+                )
+                return {"CANCELLED"}
+
+            fallback_text = summary["text_delivery_fallback_items"]
+            if fallback_text:
+                self.report(
+                    {"WARNING"},
+                    f"{fallback_text} text item(s) used proven item-specific "
+                    f"fallbacks recorded in {report_path}.",
+                )
             self.report(
                 {"INFO"},
                 f"Imported {summary['primitives']} primitives, "
@@ -103,7 +130,6 @@ try:  # pragma: no cover - Blender runtime only
             layout.prop(self, "import_text")
             layout.prop(self, "text_mode")
             layout.prop(self, "import_images")
-            layout.prop(self, "group_by_layer")
             layout.prop(self, "group_by_color")
 
 

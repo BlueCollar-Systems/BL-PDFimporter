@@ -215,17 +215,19 @@ def extract_document(pdf_path: str, options: Optional[ExtractionOptions] = None)
             if include_vectors:
                 if opts.min_segment_mm > 0:
                     _prune_micro_segments(page_data, opts.min_segment_mm)
-                if not opts.import_text:
-                    page_data.text_items = []
-                elif opts.max_text_items_per_page is not None:
-                    cap = int(max(0, opts.max_text_items_per_page))
-                    if len(page_data.text_items) > cap:
-                        page_data.text_items = page_data.text_items[:cap]
                 if opts.detect_arcs:
                     _promote_arcs(page_data, opts.arc_fit_tol_mm, opts.min_arc_span_deg)
             else:
                 page_data.primitives = []
+            # Page strategy controls page geometry, never the representation
+            # requested for structural text.  Preserve extracted spans even
+            # when Auto or the operator selects a raster page strategy.
+            if not opts.import_text:
                 page_data.text_items = []
+            elif opts.max_text_items_per_page is not None:
+                cap = int(max(0, opts.max_text_items_per_page))
+                if len(page_data.text_items) > cap:
+                    page_data.text_items = page_data.text_items[:cap]
 
             if mode == "auto" and effective_mode != "raster" and opts.raster_fallback:
                 if _looks_like_text_cloud_page(len(page_data.primitives), len(page_data.text_items)):
@@ -236,7 +238,6 @@ def extract_document(pdf_path: str, options: Optional[ExtractionOptions] = None)
                     resolved_reason = "Page frame only -- fallback to raster"
                 if effective_mode == "raster":
                     page_data.primitives = []
-                    page_data.text_items = []
 
             profile = profile_page(page_data)
             images = []

@@ -13,6 +13,7 @@ Modes are extraction **strategy** (Auto / Vector / Raster / Hybrid), not quality
 
 | Host | Status |
 |------|--------|
+| Blender 5.2 LTS | ✅ Requested-representation host acceptance (2026-07-16) |
 | Blender 5.0–5.1 | ✅ Smoke-tested (v1.0.42+ cp310-abi3 wheel) |
 | Blender 4.5 LTS / 4.0–4.2 | ⚠️ Expected |
 | Blender 3.6 LTS | ⚠️ Expected |
@@ -39,10 +40,14 @@ No system Python or pip required when release ZIP vendored wheel loads.
 
 ## Legacy hardware notes
 
-- Use **3D Text** first for Adobe-like visual review. **Glyphs/Geometry** text can create high curve/mesh counts; avoid those modes on **&lt; 8 GB RAM** PCs unless exact outline geometry is required.
-- Use **Labels** only when editable Blender text matters more than model-space PDF appearance.
+- **Text** and **3D Text** remain editable `FONT` objects. **Glyphs** and
+  **Geometry** can create high curve/mesh counts; on **&lt; 8 GB RAM** PCs,
+  import one page first when fixed outlines are required.
+- Blender has no persistent, model-scaled, renderable Label entity. A Labels
+  request records that item-specific host limitation before trying Text.
 - Headless import validated; interactive UI still needs human confirmation (T-01).
-- T-06 resolved: Blender Glyphs mode produces non-editable outline meshes from extracted text runs.
+- Glyphs produces real Blender `CURVE` outline data; Geometry produces real
+  Blender `MESH` data. They are not aliases.
 
 ## Preflight command
 
@@ -66,6 +71,7 @@ blender --background --python-expr "import addon_utils; addon_utils.enable('pdf_
 
 | Blender | Bundled Python | PyMuPDF | Status |
 |---------|----------------|---------|--------|
+| 5.2 LTS | 3.13 | >=1.24,<2.0 | ✅ Text/3D/Glyphs/Geometry/Raster host acceptance |
 | 5.0–5.1 | 3.12–3.13 | >=1.24,<2.0 | ✅ v1.0.42+ cp310-abi3 |
 | 4.5 LTS | 3.11 | >=1.24,<2.0 | ⚠️ Expected |
 | 4.0–4.2 | 3.11 | >=1.24,<2.0 | ⚠️ Expected |
@@ -82,10 +88,17 @@ blender --background --python-expr "import addon_utils; addon_utils.enable('pdf_
 
 | Option | Blender result |
 |--------|----------------|
-| **3D Text** | Default visual-parity text; extruded text where supported |
-| **Labels** | Editable font curve objects |
-| **Glyphs** | Text-run outline meshes; they do **not** create one separate object per character |
-| **Geometry** | Mesh/curve outlines |
+| **Labels** | Persistent model label when supported; currently item-specific impossible in Blender, then Text fallback |
+| **Text** | Flat editable `FONT` using the exact embedded PDF font program |
+| **3D Text** | Extruded editable `FONT` using the exact embedded PDF font program |
+| **Glyphs** | Non-editable real Blender `CURVE` outlines |
+| **Geometry** | Non-editable real Blender `MESH` geometry |
+| **Raster** | Aligned image patch clipped from the individual source text span |
+
+The structural modes do not search Windows/macOS/Linux fonts by name. When an
+exact embedded font cannot be used, only item-specific proven fallback is
+allowed. Every attempt and final entity is recorded under
+`extra.text_delivery`; an unverified terminal raster is a loud failure.
 
 ## CI coverage
 

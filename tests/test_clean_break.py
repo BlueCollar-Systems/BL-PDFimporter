@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import ast
-import os
 import subprocess
 import sys
 import tempfile
@@ -17,6 +16,7 @@ ADDON_CONFIG_PY = REPO_ROOT / "pdf_vector_importer" / "pdfcadcore" / "import_con
 IMPORT_ENGINE_PY = REPO_ROOT / "pdf_vector_importer" / "bl_import_engine.py"
 TEXT_BUILDER_PY = REPO_ROOT / "pdf_vector_importer" / "bl_text_builder.py"
 BUILD_RELEASE_PY = REPO_ROOT / "build_release.py"
+REPRESENTATION_FIDELITY_MD = REPO_ROOT / "REPRESENTATION_FIDELITY.md"
 
 
 def _run_cli(*args: str) -> subprocess.CompletedProcess:
@@ -105,9 +105,20 @@ class TestBlGuiProfessionalImport(unittest.TestCase):
         self.assertIn("if self.show_advanced:", self.source)
         self.assertNotIn('layout.prop(self, "mode")\n        layout.separator()', self.source)
 
-    def test_all_four_text_modes_in_ui(self) -> None:
-        for key in ("labels", "3d_text", "glyphs", "geometry"):
-            self.assertIn(f'("{key}"', self.source)
+    def test_all_six_text_modes_in_ui(self) -> None:
+        tree = ast.parse(self.source)
+        mode_items = None
+        for statement in tree.body:
+            if not isinstance(statement, ast.Assign):
+                continue
+            if any(isinstance(target, ast.Name) and target.id == "_TEXT_MODE_ITEMS" for target in statement.targets):
+                mode_items = ast.literal_eval(statement.value)
+                break
+        self.assertIsNotNone(mode_items)
+        self.assertEqual(
+            [item[0] for item in mode_items],
+            ["labels", "text", "3d_text", "glyphs", "geometry", "raster"],
+        )
 
 
 class TestRule5OperatorPropsRemoved(unittest.TestCase):
@@ -209,10 +220,12 @@ class TestTextDefaults(unittest.TestCase):
     def test_text_builder_modes_have_distinct_outputs(self) -> None:
         source = TEXT_BUILDER_PY.read_text(encoding="utf-8")
         self.assertIn('text_mode: str = "3d_text"', source)
-        self.assertIn('if mode == "3d_text":', source)
-        self.assertIn("font_data.extrude = _text_extrusion_depth(font_data.size)", source)
-        self.assertIn('if mode in {"glyphs", "geometry"}:', source)
-        self.assertIn("def _meshify_text_object(", source)
+        self.assertIn("def _attempt_native_font(", source)
+        self.assertIn("def _attempt_glyphs(", source)
+        self.assertIn("def _attempt_geometry(", source)
+        self.assertIn('expected_type="CURVE"', source)
+        self.assertIn('expected_type="MESH"', source)
+        self.assertIn("deliver_item(", source)
 
     def test_glyph_mode_copy_matches_current_builder_contract(self) -> None:
         operator_source = OPERATORS_PY.read_text(encoding="utf-8")
@@ -222,9 +235,9 @@ class TestTextDefaults(unittest.TestCase):
         for source in (operator_source, legacy_source, compat_source):
             self.assertNotIn("per-character vector glyphs", source)
             self.assertNotIn("Per-character vector curves", source)
-        self.assertIn("Convert text runs to non-editable outline meshes", operator_source)
-        self.assertIn("Convert text runs to non-editable outline meshes", legacy_source)
-        self.assertIn("do **not** create one separate object per character", compat_source)
+        self.assertIn("non-editable CURVE glyph outlines", operator_source)
+        self.assertIn("Exact-font CURVE glyph outlines", legacy_source)
+        self.assertIn("real Blender `CURVE`", compat_source)
 
     def test_legacy_addon_entrypoint_has_text_mode_not_arc_dial(self) -> None:
         source = LEGACY_ADDON_INIT_PY.read_text(encoding="utf-8")
@@ -232,6 +245,30 @@ class TestTextDefaults(unittest.TestCase):
         self.assertIn('default="3d_text"', source)
         self.assertNotIn('detect_arcs: BoolProperty', source)
         self.assertNotIn('layout.prop(self, "detect_arcs")', source)
+
+
+class TestRepresentationFidelityDocumentation(unittest.TestCase):
+    """The owner-required ladder contract must remain explicit and host-specific."""
+
+    def test_public_contract_documents_every_representation_and_required_oracle(self) -> None:
+        source = REPRESENTATION_FIDELITY_MD.read_text(encoding="utf-8")
+        for mode in ("Labels", "Text", "3D Text", "Glyphs", "Geometry", "Raster"):
+            self.assertIn(f"| **{mode}** |", source)
+        for required in (
+            "Impossibility evidence",
+            "Verification oracle",
+            "Rollback ownership",
+            "`extra.text_delivery`",
+            "tests/test_representation_fidelity_blender.py",
+            "tests/test_terminal_raster_delivery_blender.py",
+        ):
+            self.assertIn(required, source)
+
+    def test_readme_lists_all_six_options_and_links_the_contract(self) -> None:
+        source = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn("**6 Text Representation Options**", source)
+        self.assertIn("[REPRESENTATION_FIDELITY.md](REPRESENTATION_FIDELITY.md)", source)
+        self.assertNotIn("**4 Text Rendering Options**", source)
 
 
 class TestModel3DGeneration(unittest.TestCase):

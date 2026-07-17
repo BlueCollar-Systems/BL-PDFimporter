@@ -20,6 +20,7 @@ if "bmesh" not in sys.modules:
 
 from pdf_vector_importer.bl_import_engine import write_import_report  # noqa: E402
 from pdf_vector_importer import bl_info  # noqa: E402
+from pdf_vector_importer.pdfcadcore.import_report import ImportReport  # noqa: E402
 
 
 class TestImportReportWriter(unittest.TestCase):
@@ -48,6 +49,80 @@ class TestImportReportWriter(unittest.TestCase):
             data = json.loads(report_path.read_text(encoding="utf-8"))
             self.assertTrue(data["fallback"]["used"])
             self.assertEqual(data["fallback"]["reason"], "raster_fallback_2_pages")
+
+    def test_explicit_raster_is_the_requested_outcome_not_a_fallback(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="bl_import_report_") as tmp:
+            report_path = Path(tmp) / "import_report.json"
+            with patch(
+                "pdf_vector_importer.bl_import_engine._pymupdf_version",
+                return_value="",
+            ):
+                write_import_report(
+                    str(Path(tmp) / "sample.pdf"),
+                    {"import_text": False},
+                    {
+                        "pages_imported": 1,
+                        "primitives": 0,
+                        "text_items": 0,
+                        "collections": 1,
+                        "elapsed": 0.1,
+                    },
+                    import_mode="raster",
+                    raster_pages=1,
+                    output_path=str(report_path),
+                )
+            data = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual(data["fallback"], {"used": False, "reason": None})
+
+    def test_import_report_refuses_nonfinite_json_instead_of_emitting_nan(self) -> None:
+        report = ImportReport(performance={"peak_mb": float("nan")})
+
+        with self.assertRaisesRegex(
+            ValueError,
+            r"non-finite JSON number at performance\.peak_mb",
+        ):
+            report.to_json()
+
+    def test_write_import_report_exposes_geometry_approximation(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="bl_import_report_") as tmp:
+            report_path = Path(tmp) / "import_report.json"
+            issue = {
+                "page": 1,
+                "primitive_id": 17,
+                "requested_type": "geometry",
+                "source_primitive_type": "bezier",
+                "delivered_type": "polyline_geometry",
+                "status": "verified",
+                "reason": "unknown_normalized_primitive_type",
+                "verification": "source_points_preserved",
+            }
+            stats = {
+                "pages_imported": 1,
+                "primitives": 1,
+                "text_items": 0,
+                "collections": 1,
+                "elapsed": 0.1,
+                "geometry_delivery_issues": [issue],
+            }
+            with patch(
+                "pdf_vector_importer.bl_import_engine._pymupdf_version",
+                return_value="",
+            ):
+                write_import_report(
+                    str(Path(tmp) / "sample.pdf"),
+                    {},
+                    stats,
+                    import_mode="vector",
+                    output_path=str(report_path),
+                )
+            data = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertTrue(data["fallback"]["used"])
+            self.assertEqual(
+                data["fallback"]["reason"],
+                "geometry_approximation_1_primitive",
+            )
+            self.assertEqual(data["extra"]["geometry_delivery_issues"], [issue])
+            self.assertEqual(data["extra"]["geometry_delivery_issue_count"], 1)
 
     def test_write_import_report_uses_shared_schema(self) -> None:
         with tempfile.TemporaryDirectory(prefix="bl_import_report_") as tmp:
@@ -104,7 +179,12 @@ class TestImportReportWriter(unittest.TestCase):
             diagnostics = data["extra"]["diagnostics"]
             self.assertEqual(diagnostics["quality_level"], "low")
             self.assertIn("text_mode_glyphs", diagnostics["signals"])
-            self.assertTrue(diagnostics["recommended_actions"])
+            self.assertTrue(
+                any(
+                    "requested text representation" in action
+                    for action in diagnostics["recommended_actions"]
+                )
+            )
 
     def test_import_report_diagnostics_for_fallback_and_dense_text(self) -> None:
         with tempfile.TemporaryDirectory(prefix="bl_import_report_") as tmp:
@@ -136,9 +216,16 @@ class TestImportReportWriter(unittest.TestCase):
             self.assertIn("fallback_used", diagnostics["signals"])
             self.assertIn("source_text_seen_but_no_text_entities_created", diagnostics["signals"])
             self.assertIn("dense_text_glyph_workload", diagnostics["signals"])
-            self.assertTrue(
-                any("Vector or Hybrid" in action for action in diagnostics["recommended_actions"])
-            )
+            recommendations = " ".join(diagnostics["recommended_actions"]).lower()
+            for roadblock in (
+                "vector or hybrid",
+                "another text mode",
+                "use text",
+                "use glyphs",
+                "use outlines",
+                "retry",
+            ):
+                self.assertNotIn(roadblock, recommendations)
 
 
 if __name__ == "__main__":

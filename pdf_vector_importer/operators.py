@@ -35,10 +35,16 @@ _MODE_ITEMS = [
 # Text rendering is orthogonal to mode. A separate ``import_text``
 # boolean toggles whether text is imported at all.
 _TEXT_MODE_ITEMS = [
-    ("labels",   "Labels",   "Import text as Blender text objects"),
-    ("3d_text",  "3D Text",  "Extruded geometric text"),
-    ("glyphs",   "Glyphs",   "Convert text runs to non-editable outline meshes"),
-    ("geometry", "Geometry", "Convert text fully to non-editable geometry"),
+    (
+        "labels",
+        "Labels",
+        "Request persistent model labels; any host limitation and closest fallback are reported per item",
+    ),
+    ("text",     "Text",     "Flat editable Blender FONT text using the exact PDF font program"),
+    ("3d_text",  "3D Text",  "Extruded editable Blender FONT text using the exact PDF font program"),
+    ("glyphs",   "Glyphs",   "Convert exact-font text to non-editable CURVE glyph outlines"),
+    ("geometry", "Geometry", "Convert exact-font text to non-editable MESH geometry"),
+    ("raster",   "Raster",   "Render each source text item as an aligned raster patch"),
 ]
 
 _VISUAL_STYLE_ITEMS = [
@@ -293,6 +299,21 @@ class IMPORT_OT_pdf_vector(bpy.types.Operator, ImportHelper):
 
         _set_status(None)
 
+        report_error = str(stats.get("import_report_error") or "").strip()
+        if report_error:
+            self.report(
+                {"ERROR"},
+                "PDF objects were created, but the mandatory import report failed: "
+                f"{report_error}. Do not trust this import until reporting succeeds.",
+            )
+        temp_cleanup_error = str(stats.get("temp_cleanup_error") or "").strip()
+        if temp_cleanup_error:
+            self.report(
+                {"ERROR"},
+                "PDF delivery completed, but owned temporary files could not be "
+                f"cleaned: {temp_cleanup_error}. Review the import report.",
+            )
+
         prims = stats.get("primitives", 0)
         texts = stats.get("text_items", 0)
         images = stats.get("images", 0)
@@ -304,6 +325,43 @@ class IMPORT_OT_pdf_vector(bpy.types.Operator, ImportHelper):
             f"Imported {prims} primitives, {texts} text items, {images} images from {pages} page(s); "
             f"skipped {skipped_fill} fill-only shapes; hid {hidden_cube} default cube(s)",
         )
+        failed_text = int(stats.get("text_delivery_failed_items", 0) or 0)
+        fallback_text = int(stats.get("text_delivery_fallback_items", 0) or 0)
+        report_path = str(stats.get("import_report_path") or "")
+        if failed_text > 0:
+            self.report(
+                {"ERROR"},
+                f"{failed_text} text item(s) were not delivered. "
+                f"Do not trust this import until extra.text_delivery is reviewed in {report_path or 'the import report'}.",
+            )
+        elif fallback_text > 0:
+            self.report(
+                {"WARNING"},
+                f"{fallback_text} text item(s) used a proven item-specific fallback; "
+                f"requested/final types and evidence are in {report_path or 'the import report'}.",
+            )
+        raster_failures = list(stats.get("raster_delivery_failures") or [])
+        if raster_failures:
+            self.report(
+                {"ERROR"},
+                f"{len(raster_failures)} raster delivery attempt(s) failed. "
+                f"The import is incomplete; review extra.raster_delivery_failures in "
+                f"{report_path or 'the import report'}.",
+            )
+        geometry_issues = list(stats.get("geometry_delivery_issues") or [])
+        if geometry_issues:
+            geometry_failures = sum(
+                1
+                for issue in geometry_issues
+                if str(issue.get("status") or "").strip().lower() != "verified"
+            )
+            severity = {"ERROR"} if geometry_failures else {"WARNING"}
+            self.report(
+                severity,
+                f"{len(geometry_issues)} geometry primitive(s) required a reported "
+                f"source-point approximation; {geometry_failures} were not delivered. "
+                f"Review extra.geometry_delivery_issues in {report_path or 'the import report'}.",
+            )
 
         prefs = _addon_prefs(context)
         if prefs is not None and bool(getattr(prefs, "remember_last_directory", True)):

@@ -1,6 +1,6 @@
 # PDF Vector Importer for Blender
 
-[![Version](https://img.shields.io/badge/Version-1.0.65-blue.svg)]()
+[![Version](https://img.shields.io/badge/Version-1.0.66-blue.svg)]()
 
 **BUILT. NOT BOUGHT.** -- BlueCollar Systems
 
@@ -10,7 +10,7 @@ Powered by the pdfcadcore shared extraction library and PyMuPDF.
 ## Features
 
 - **4 Import Modes** (BCS-ARCH-001) -- Auto (default, picks strategy per page), Vector, Raster, Hybrid
-- **4 Text Rendering Options** -- 3D Text (default visual-parity path), Labels, Glyphs, Geometry (orthogonal to mode)
+- **6 Text Representation Options** -- Labels, Text, 3D Text (default), Glyphs, Geometry, and Raster (orthogonal to page strategy)
 - **Maximum fidelity by default** -- no quality tiers, no fast-mode compromises
 - **Arc & Circle Detection** -- Reconstruct true arcs and circles from polyline approximations
 - **OCG Layer Support** -- Map PDF Optional Content Groups to Blender sub-collections
@@ -62,10 +62,13 @@ After enabling the addon:
 
 Geometry is grouped into collections by page and (optionally) by source layer or color.
 
-For Adobe-like visual sign-off, start with **3D Text** at the same zoom/scale as
-the source PDF. Use **Labels** when editable Blender text matters more than
-model-space PDF appearance, and use **Glyphs/Geometry** when exact outline
-geometry is preferred over editability.
+Choose the representation you actually need: **Text** is flat editable Blender
+`FONT`, **3D Text** is extruded editable `FONT`, **Glyphs** is fixed `CURVE`
+outline data, **Geometry** is fixed `MESH` data, and **Raster** is one aligned
+image patch per source text item. **Labels** requests a persistent,
+model-scaled label entity; Blender currently has no such renderable entity, so
+that item-specific capability result is recorded before the closest fallback
+is attempted.
 
 ### Text-mode fallback ladder (TEXTMODE-1)
 
@@ -73,40 +76,44 @@ geometry is preferred over editability.
 or scaling defects are fixed *inside* the requested mode — never by
 substituting a different mode. Substitution is permitted only when the
 requested mode is genuinely impossible for this importer + option + PDF, must
-walk the documented ladder below (most closely related rung first), must
-always terminate in *some* delivered representation, and is always recorded
-in `import_report.json` (`fallback.text` = requested / delivered / reason /
-count, plus a `text_mode_fallback` diagnostics signal) — never silent.
+walk the documented ladder below (most closely related rung first), and is
+always recorded. If even the terminal raster patch cannot be verified, the
+item is reported as failed instead of being claimed as delivered.
 (Owner directive 2026-07-13.)
 
 FINAL Blender ladder (left rung first):
 
 | Requested | Ladder |
 |-----------|--------|
-| **3D Text** | Labels (flat font curve) → Glyphs/Geometry (meshified) → raster plane |
-| **Glyphs / Geometry** | peer family → 3D Text/Labels font curves → raster plane |
-| **Labels** | 3D Text → Glyphs/Geometry → raster plane |
-| **Raster** | terminal — always achievable |
+| **Labels** | Labels → Text → 3D Text → Glyphs → Geometry → Raster |
+| **Text** | Text → 3D Text → Glyphs → Geometry → Raster |
+| **3D Text** | 3D Text → Text → Glyphs → Geometry → Raster |
+| **Glyphs** | Glyphs → Geometry → Raster |
+| **Geometry** | Geometry → Glyphs → Raster |
+| **Raster** | Raster only |
 
 Notes:
-- **Glyphs and Geometry are one peer family** (identical meshify pipeline),
-  so a fallback between them is a no-op and the ladders treat them as a
-  single rung.
-- Font-curve creation is core Blender API — its failure is unobserved, which
-  is why the flat font curve (same object minus extrude) is the nearest
-  rung for 3D Text and the landing rung for a failed meshify.
-- A meshify failure for Glyphs/Geometry delivers the editable font curve
-  honestly: the object is retagged (`pdf_text_mode='labels'`, requested mode
-  and `reason: meshify_failed` preserved on the object), provenance records
-  the delivered entity type, and the report emits `fallback.text`.
-- Unknown `text_mode` strings deliver the 3D Text default loudly: a one-time
-  warning, a `fallback.text` entry (`reason: unknown_text_mode_normalized`),
-  and `extra.text_mode_normalized_from` in the report.
-- Labels-family rungs sit before the page raster plane per the audit's
-  interim ruling (no host has per-span raster patches today); every use is
-  loudly reported.
-- The invariant "requested == delivered OR reported fallback — never
-  neither" is locked by `tests/test_textmode1_invariant_blender.py`.
+- Text, 3D Text, Glyphs, and Geometry load only the exact embedded PDF font
+  program associated with the source span. The importer does not search the
+  operating system for a similarly named font.
+- Glyphs and Geometry are distinct host types and conversion paths: Glyphs
+  verifies a real Blender `CURVE`; Geometry verifies a real Blender `MESH`.
+- A generic exception is a failure, not proof that the requested type is
+  impossible. Fallback continues only after item-specific capability evidence
+  and complete cleanup of artifacts owned by that attempt.
+- Unknown `text_mode` values raise before scene mutation. They are never
+  silently normalized to another requested outcome.
+- Auto/Vector/Raster/Hybrid is a page strategy and does not override a text
+  representation request. A raster page can still contain requested native
+  Text, 3D Text, Glyphs, or Geometry objects.
+- `import_report.json` stores every source item, attempted rung, result,
+  evidence, cleanup record, final representation, and entity ID under
+  `extra.text_delivery`; failed item IDs are surfaced in diagnostics.
+- These invariants are locked by
+  `tests/test_representation_fidelity_blender.py` and
+  `tests/test_terminal_raster_delivery_blender.py`.
+- The proof, oracle, rollback, and reporting contract is maintained in
+  [REPRESENTATION_FIDELITY.md](REPRESENTATION_FIDELITY.md).
 
 ## Compatibility
 
@@ -114,6 +121,7 @@ See **[COMPATIBILITY.md](COMPATIBILITY.md)** for the full matrix. Summary:
 
 | Blender Version | Bundled Python | PyMuPDF | Status |
 |----------------|---------------|---------|--------|
+| 5.2 LTS | 3.13 | >=1.24,<2.0 | ✅ Requested-representation host acceptance |
 | 3.6 LTS | 3.10 | >=1.24,<2.0 | ⚠️ Expected |
 | 4.0–4.2 | 3.11 | >=1.24,<2.0 | ⚠️ Expected |
 | 4.5 LTS | 3.11 | >=1.24,<2.0 | ⚠️ Expected |
@@ -165,7 +173,7 @@ python -m blender_pdf_vector_importer.batch_cli "C:\path\to\pdfs" --recursive --
 | Raster-only scans | Pure raster PDFs produce no vector geometry |
 | Clipped/XObject-heavy PDFs | Complex clip stacks and deeply nested form XObjects can produce partial geometry |
 | Very large PDFs | Documents with >10,000 primitives may cause slow import due to per-object dependency graph updates |
-| Embedded subset fonts | Text using embedded subset fonts may not render correctly |
+| Missing or malformed exact font programs | The affected item walks the reported structural ladder to a verified raster patch; an unverified terminal patch is a loud item failure |
 | PyMuPDF required | Release ZIPs bundle PyMuPDF; source/dev installs can use the preferences-panel installer |
 | Legacy hosts | Blender/Python combinations outside the listed compatibility matrix are expected-only until verified |
 

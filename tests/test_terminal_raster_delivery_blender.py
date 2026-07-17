@@ -2,8 +2,11 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 import sys
 import types
+
+import pytest
 
 if "bpy" not in sys.modules:
     sys.modules["bpy"] = types.SimpleNamespace()
@@ -19,6 +22,11 @@ if "bmesh" not in sys.modules:
 
 from pdf_vector_importer import bl_import_engine
 from pdf_vector_importer.pdfcadcore import fitz_loader
+
+try:
+    import pymupdf as fitz
+except ImportError:  # pragma: no cover
+    import fitz  # type: ignore
 
 
 class _Children:
@@ -82,6 +90,38 @@ def _page_data():
         height=25.4,
         resolved_scale=None,
     )
+
+
+class _RasterObject(dict):
+    def __init__(self, name="PDF_Text_Raster"):
+        super().__init__()
+        self.name = name
+        self.type = "MESH"
+        self.data = types.SimpleNamespace(name=f"{name}_mesh", type="MESH")
+
+
+class _MetadataRejectingRasterObject(_RasterObject):
+    def __setitem__(self, key, value):
+        del key, value
+        raise RuntimeError("metadata write rejected after plane creation")
+
+
+class _TextPixmap:
+    width = 160
+    height = 40
+    samples = b"non-empty-raster"
+
+    def save(self, path):
+        Path(path).write_bytes(b"verified-png")
+
+
+class _TextRasterPage:
+    def __init__(self):
+        self.calls = []
+
+    def get_pixmap(self, **kwargs):
+        self.calls.append(kwargs)
+        return _TextPixmap()
 
 
 def _raster_placement():
@@ -163,6 +203,774 @@ def test_raster_plane_failure_is_recorded_in_returned_and_reported_stats(monkeyp
     assert reported_stats["raster_delivery_failures"] == expected
 
 
+def test_item_terminal_raster_is_clipped_and_placed_at_the_item_target_bbox(
+    monkeypatch,
+    tmp_path,
+):
+    page = _TextRasterPage()
+    text_item = types.SimpleNamespace(
+        id=41,
+        text="WELD",
+        source_bbox_pdf=(34.0, 50.0, 147.0, 68.0),
+        bbox=(12.0, 24.0, 52.0, 30.0),
+    )
+    captured = []
+    expected = _RasterObject()
+
+    def _capture_plane(placement, collection, z_offset_m=0.0):
+        captured.append((dict(placement), collection, z_offset_m))
+        return expected
+
+    monkeypatch.setattr(bl_import_engine, "_create_image_plane", _capture_plane)
+    config = types.SimpleNamespace(raster_dpi=288)
+    collection = object()
+
+    actual = bl_import_engine._render_text_item_raster(
+        page,
+        text_item,
+        collection,
+        page_num=2,
+        item_id="page:2:text:41",
+        import_cfg=config,
+        image_dir=str(tmp_path),
+        z_offset_m=0.00035,
+    )
+
+    assert actual is expected
+    assert len(page.calls) == 1
+    assert len(captured) == 1
+    placement, used_collection, used_z = captured[0]
+    assert used_collection is collection
+    assert used_z == 0.00035
+    assert placement["x_mm"] == 12.0
+    assert placement["y_mm"] == 24.0
+    assert placement["width_mm"] == 40.0
+    assert placement["height_mm"] == 6.0
+    assert placement["source_bbox_pdf"] == [34.0, 50.0, 147.0, 68.0]
+    assert placement["source_item_id"] == "page:2:text:41"
+    assert Path(placement["path"]).read_bytes() == b"verified-png"
+    assert expected["pdf_raster_source_item_id"] == "page:2:text:41"
+
+
+def test_item_terminal_raster_metadata_failure_cleans_created_plane(monkeypatch, tmp_path):
+    page = _TextRasterPage()
+    text_item = types.SimpleNamespace(
+        id=41,
+        text="WELD",
+        source_bbox_pdf=(34.0, 50.0, 147.0, 68.0),
+        bbox=(12.0, 24.0, 52.0, 30.0),
+    )
+    plane = _MetadataRejectingRasterObject()
+    cleanup_calls = []
+
+    monkeypatch.setattr(bl_import_engine, "_create_image_plane", lambda *_args, **_kwargs: plane)
+    monkeypatch.setattr(
+        bl_import_engine,
+        "_remove_created_image_plane",
+        lambda obj, collection: cleanup_calls.append((obj, collection)) or {
+            "status": "complete",
+            "removed": [obj.name, obj.data.name],
+        },
+    )
+    collection = object()
+
+    actual = bl_import_engine._render_text_item_raster(
+        page,
+        text_item,
+        collection,
+        page_num=2,
+        item_id="page:2:text:41",
+        import_cfg=types.SimpleNamespace(raster_dpi=288),
+        image_dir=str(tmp_path),
+    )
+
+    assert actual is None
+    assert cleanup_calls == [(plane, collection)]
+    assert list(tmp_path.glob("*.png")) == []
+
+
+def test_item_terminal_raster_plane_failure_removes_owned_clip(monkeypatch, tmp_path):
+    monkeypatch.setattr(bl_import_engine, "_create_image_plane", lambda *_args, **_kwargs: None)
+
+    actual = bl_import_engine._render_text_item_raster(
+        _TextRasterPage(),
+        types.SimpleNamespace(
+            id=41,
+            text="WELD",
+            source_bbox_pdf=(34.0, 50.0, 147.0, 68.0),
+            bbox=(12.0, 24.0, 52.0, 30.0),
+        ),
+        object(),
+        page_num=2,
+        item_id="page:2:text:41",
+        import_cfg=types.SimpleNamespace(raster_dpi=288),
+        image_dir=str(tmp_path),
+    )
+
+    assert actual is None
+    assert list(tmp_path.glob("*.png")) == []
+
+
+def test_image_plane_constructor_rolls_back_object_and_mesh_after_partial_mutation(
+    monkeypatch,
+    tmp_path,
+):
+    image_path = tmp_path / "clip.png"
+    image_path.write_bytes(b"png")
+
+    class _Mesh:
+        def __init__(self):
+            self.name = "partial_mesh"
+            self.uv_layers = types.SimpleNamespace(
+                new=lambda **_kwargs: types.SimpleNamespace(data=[])
+            )
+            self.polygons = []
+            self.loops = []
+            self.materials = []
+
+        def from_pydata(self, *_args):
+            pass
+
+        def update(self):
+            pass
+
+    class _Registry:
+        def __init__(self, factory):
+            self.factory = factory
+            self.removed = []
+
+        def new(self, *_args, **_kwargs):
+            return self.factory()
+
+        def remove(self, value, **_kwargs):
+            self.removed.append(value.name)
+
+    class _Object(dict):
+        def __init__(self, mesh):
+            super().__init__()
+            self.name = "partial_object"
+            self.data = mesh
+
+    class _LinkedObjects:
+        def __init__(self):
+            self.items = []
+
+        def link(self, value):
+            self.items.append(value)
+
+        def unlink(self, value):
+            if value in self.items:
+                self.items.remove(value)
+
+    meshes = _Registry(_Mesh)
+    objects = _Registry(lambda: None)
+    objects.new = lambda _name, mesh: _Object(mesh)
+    materials = types.SimpleNamespace(
+        get=lambda _name: None,
+        new=lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("material creation failed")),
+    )
+    fake_bpy = types.SimpleNamespace(
+        data=types.SimpleNamespace(meshes=meshes, objects=objects, materials=materials),
+    )
+    collection = types.SimpleNamespace(objects=_LinkedObjects())
+    monkeypatch.setattr(bl_import_engine, "bpy", fake_bpy)
+
+    result = bl_import_engine._create_image_plane(
+        {
+            "path": str(image_path),
+            "x_mm": 0.0,
+            "y_mm": 0.0,
+            "width_mm": 10.0,
+            "height_mm": 5.0,
+            "xref": -41,
+            "page_number": 2,
+        },
+        collection,
+    )
+
+    assert result is None
+    assert collection.objects.items == []
+    assert objects.removed == ["partial_object"]
+    assert meshes.removed == ["partial_mesh"]
+
+
+def test_image_plane_constructor_never_mutates_or_reuses_existing_resources(
+    monkeypatch,
+    tmp_path,
+):
+    image_path = tmp_path / "clip.png"
+    image_path.write_bytes(b"png-bytes")
+
+    class _Socket:
+        def __init__(self, node):
+            self.node = node
+
+    class _Node:
+        def __init__(self, node_type):
+            self.type = {
+                "ShaderNodeTexImage": "TEX_IMAGE",
+                "ShaderNodeBsdfPrincipled": "BSDF_PRINCIPLED",
+                "ShaderNodeOutputMaterial": "OUTPUT_MATERIAL",
+            }.get(node_type, node_type)
+            self.image = None
+            self.outputs = {"Color": _Socket(self), "Alpha": _Socket(self), "BSDF": _Socket(self)}
+            self.inputs = {"Base Color": _Socket(self), "Alpha": _Socket(self), "Surface": _Socket(self)}
+
+    class _Nodes(list):
+        def clear(self):
+            super().clear()
+
+        def new(self, *, type):
+            node = _Node(type)
+            self.append(node)
+            return node
+
+    class _Links(list):
+        def new(self, source, target):
+            self.append(types.SimpleNamespace(from_node=source.node, to_node=target.node))
+
+    class _Material:
+        def __init__(self, name, *, sentinel=False):
+            self.name = name
+            self.use_nodes = True
+            self.node_tree = types.SimpleNamespace(nodes=_Nodes(), links=_Links())
+            if sentinel:
+                self.node_tree.nodes.append(_Node("SENTINEL"))
+            self.users = 0
+
+    class _MaterialRegistry:
+        def __init__(self):
+            self.sentinel = _Material("PDF_Image_Mat_2_-41", sentinel=True)
+            self.created = []
+
+        def get(self, name):
+            return self.sentinel if name == self.sentinel.name else None
+
+        def new(self, *, name):
+            material = _Material(f"{name}.001")
+            self.created.append(material)
+            return material
+
+        def remove(self, _value):
+            pass
+
+    class _PackedImage:
+        def __init__(self, name, data):
+            self.name = name
+            self.packed_file = types.SimpleNamespace(data=data)
+            self.users = 0
+
+        def pack(self):
+            pass
+
+    class _ImageRegistry:
+        def __init__(self):
+            self.sentinel = _PackedImage("clip.png", b"png-bytes")
+            self.created = []
+            self.load_flags = []
+
+        def __iter__(self):
+            return iter([self.sentinel, *self.created])
+
+        def load(self, path, *, check_existing=True):
+            self.load_flags.append(check_existing)
+            if check_existing:
+                return self.sentinel
+            image = _PackedImage("clip.png.001", Path(path).read_bytes())
+            self.created.append(image)
+            return image
+
+        def remove(self, _value):
+            pass
+
+    class _UVEntry:
+        uv = None
+
+    class _Mesh:
+        def __init__(self):
+            self.name = "mesh"
+            self.materials = []
+            self.polygons = [types.SimpleNamespace(loop_indices=[0, 1, 2, 3])]
+            self.loops = [types.SimpleNamespace(vertex_index=i) for i in range(4)]
+            self.uv_layers = types.SimpleNamespace(
+                new=lambda **_kwargs: types.SimpleNamespace(
+                    data=[_UVEntry(), _UVEntry(), _UVEntry(), _UVEntry()]
+                )
+            )
+
+        def from_pydata(self, *_args):
+            pass
+
+        def update(self):
+            pass
+
+    class _Object(dict):
+        def __init__(self, name, mesh):
+            super().__init__()
+            self.name = name
+            self.data = mesh
+            self.location = (0.0, 0.0, 0.0)
+
+    class _Registry:
+        def __init__(self, new):
+            self._new = new
+
+        def new(self, *args, **kwargs):
+            return self._new(*args, **kwargs)
+
+        def remove(self, *_args, **_kwargs):
+            pass
+
+    materials = _MaterialRegistry()
+    images = _ImageRegistry()
+    fake_bpy = types.SimpleNamespace(
+        data=types.SimpleNamespace(
+            meshes=_Registry(lambda *_args, **_kwargs: _Mesh()),
+            objects=_Registry(lambda name, mesh: _Object(name, mesh)),
+            materials=materials,
+            images=images,
+        )
+    )
+    linked = []
+    collection = types.SimpleNamespace(
+        objects=types.SimpleNamespace(link=linked.append, unlink=lambda value: linked.remove(value))
+    )
+    monkeypatch.setattr(bl_import_engine, "bpy", fake_bpy)
+
+    result = bl_import_engine._create_image_plane(
+        {
+            "path": str(image_path),
+            "width_mm": 10.0,
+            "height_mm": 5.0,
+            "xref": -41,
+            "page_number": 2,
+        },
+        collection,
+    )
+
+    assert result is not None
+    assert images.load_flags == [False]
+    assert len(materials.created) == 1
+    assert len(images.created) == 1
+    assert result.data.materials[0] is materials.created[0]
+    assert result["pdf_image_material_owned"] is True
+    assert result["pdf_image_datablock_owned"] is True
+    assert [node.type for node in materials.sentinel.node_tree.nodes] == ["SENTINEL"]
+
+
+def test_remove_created_image_plane_removes_all_owned_datablocks(monkeypatch):
+    class _Registry:
+        def __init__(self, value):
+            self.value = value
+            self.removed = []
+
+        def get(self, name):
+            return self.value if name == self.value.name else None
+
+        def remove(self, value, **_kwargs):
+            self.removed.append(value.name)
+
+    mesh = types.SimpleNamespace(name="mesh", type="MESH")
+    material = types.SimpleNamespace(name="material", users=0)
+    image = types.SimpleNamespace(name="image", users=0)
+    obj = _RasterObject()
+    obj.data = mesh
+    obj["pdf_image_material"] = material.name
+    obj["pdf_image_material_owned"] = True
+    obj["pdf_image_datablock"] = image.name
+    obj["pdf_image_datablock_owned"] = True
+    objects = _Registry(obj)
+    meshes = _Registry(mesh)
+    materials = _Registry(material)
+    images = _Registry(image)
+    fake_bpy = types.SimpleNamespace(
+        data=types.SimpleNamespace(
+            objects=objects,
+            meshes=meshes,
+            materials=materials,
+            images=images,
+        )
+    )
+    unlinked = []
+    collection = types.SimpleNamespace(
+        objects=types.SimpleNamespace(unlink=lambda value: unlinked.append(value.name))
+    )
+    monkeypatch.setattr(bl_import_engine, "bpy", fake_bpy)
+
+    cleanup = bl_import_engine._remove_created_image_plane(obj, collection)
+
+    assert cleanup["status"] == "complete"
+    assert objects.removed == [obj.name]
+    assert meshes.removed == [mesh.name]
+    assert materials.removed == [material.name]
+    assert images.removed == [image.name]
+
+
+def test_page_raster_strategy_does_not_suppress_requested_structural_text(
+    monkeypatch,
+    tmp_path,
+):
+    input_pdf = tmp_path / "input.pdf"
+    input_pdf.write_bytes(b"%PDF-1.7\n")
+    page_data = _page_data()
+    page_data.text_items = [types.SimpleNamespace(id=9, text="WELD")]
+    build_calls = []
+
+    monkeypatch.setattr(bl_import_engine, "bpy", _FakeBpy())
+    monkeypatch.setattr(bl_import_engine, "check_pymupdf", lambda: True)
+    monkeypatch.setattr(bl_import_engine, "ensure_lib_path", lambda: None)
+    monkeypatch.setattr(fitz_loader, "import_fitz", lambda **_kwargs: object())
+    monkeypatch.setattr(fitz_loader, "safe_open", lambda _path: _Document())
+    monkeypatch.setattr(bl_import_engine, "extract_page", lambda *_args, **_kwargs: page_data)
+    monkeypatch.setattr(bl_import_engine, "_render_page_raster", lambda *_args, **_kwargs: _raster_placement())
+    monkeypatch.setattr(bl_import_engine, "_create_image_plane", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(bl_import_engine.tempfile, "mkdtemp", lambda **_kwargs: str(tmp_path))
+    monkeypatch.setattr(
+        bl_import_engine,
+        "write_import_report",
+        lambda *_args, **_kwargs: str(tmp_path / "import_report.json"),
+    )
+
+    def _capture_text(*args, **kwargs):
+        build_calls.append((args, kwargs))
+        return 1
+
+    monkeypatch.setattr(bl_import_engine, "build_all_text", _capture_text)
+    stats = bl_import_engine.import_pdf(
+        str(input_pdf),
+        config={
+            "mode": "raster",
+            "pages": "1",
+            "import_text": True,
+            "text_mode": "text",
+            "auto_focus_view": False,
+            "auto_hide_default_cube": False,
+        },
+    )
+
+    assert stats["text_items"] == 1
+    assert len(build_calls) == 1
+    assert build_calls[0][1]["text_mode"] == "text"
+    assert callable(build_calls[0][1]["terminal_raster_callback"])
+
+
+def test_page_raster_composition_excludes_only_text_that_was_delivered_separately(
+    monkeypatch,
+    tmp_path,
+):
+    input_pdf = tmp_path / "input.pdf"
+    input_pdf.write_bytes(b"%PDF-1.7\n")
+    delivered = types.SimpleNamespace(
+        id=9,
+        text="WELD",
+        source_bbox_pdf=(10.0, 12.0, 30.0, 24.0),
+    )
+    failed = types.SimpleNamespace(
+        id=10,
+        text="KEEP IN BACKGROUND",
+        source_bbox_pdf=(40.0, 12.0, 68.0, 24.0),
+    )
+    page_data = _page_data()
+    page_data.text_items = [delivered, failed]
+    captured = []
+
+    monkeypatch.setattr(bl_import_engine, "bpy", _FakeBpy())
+    monkeypatch.setattr(bl_import_engine, "check_pymupdf", lambda: True)
+    monkeypatch.setattr(bl_import_engine, "ensure_lib_path", lambda: None)
+    monkeypatch.setattr(fitz_loader, "import_fitz", lambda **_kwargs: object())
+    monkeypatch.setattr(fitz_loader, "safe_open", lambda _path: _Document())
+    monkeypatch.setattr(bl_import_engine, "extract_page", lambda *_args, **_kwargs: page_data)
+    monkeypatch.setattr(bl_import_engine, "_create_image_plane", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(bl_import_engine.tempfile, "mkdtemp", lambda **_kwargs: str(tmp_path))
+    monkeypatch.setattr(
+        bl_import_engine,
+        "write_import_report",
+        lambda *_args, **_kwargs: str(tmp_path / "import_report.json"),
+    )
+
+    def _build_text(_items, _collection, _page, **kwargs):
+        opts = kwargs["provenance_opts"]
+        opts._text_delivery_records = [
+            {
+                "page": 1,
+                "source_span_id": 9,
+                "status": "delivered",
+                "final_representation": "text",
+                "entity_ids": ["Text_9"],
+                "attempts": [],
+            },
+            {
+                "page": 1,
+                "source_span_id": 10,
+                "status": "failed",
+                "final_representation": None,
+                "entity_ids": [],
+                "attempts": [],
+            },
+        ]
+        return 1
+
+    def _capture_render(*_args, **kwargs):
+        captured.append(kwargs)
+        return _raster_placement()
+
+    monkeypatch.setattr(bl_import_engine, "build_all_text", _build_text)
+    monkeypatch.setattr(bl_import_engine, "_render_page_raster", _capture_render)
+
+    bl_import_engine.import_pdf(
+        str(input_pdf),
+        config={
+            "mode": "raster",
+            "pages": "1",
+            "import_text": True,
+            "text_mode": "text",
+            "auto_focus_view": False,
+            "auto_hide_default_cube": False,
+        },
+    )
+
+    assert captured[-1]["excluded_text_bboxes"] == [(10.0, 12.0, 30.0, 24.0)]
+
+
+def test_page_raster_redaction_removes_text_but_keeps_nontext_graphics(tmp_path):
+    document = fitz.open()
+    page = document.new_page(width=200.0, height=100.0)
+    page.insert_text((10.0, 30.0), "DUPLICATE", fontsize=18.0, color=(0, 0, 0))
+    text_bbox = tuple(page.search_for("DUPLICATE")[0])
+    page.draw_rect(fitz.Rect(150.0, 70.0, 180.0, 90.0), color=(0, 0, 0), fill=(0, 0, 0))
+    config = types.SimpleNamespace(raster_dpi=144, user_scale=1.0)
+
+    placement = bl_import_engine._render_page_raster(
+        page,
+        1,
+        config,
+        str(tmp_path),
+        excluded_text_bboxes=[text_bbox],
+    )
+
+    assert placement is not None
+    assert placement["excluded_text_bbox_count"] == 1
+    assert placement["composition"] == "page_background_without_delivered_text"
+    pixmap = fitz.Pixmap(placement["path"])
+
+    def dark_pixels(rect):
+        scale = 2
+        x0, y0, x1, y1 = (int(round(value * scale)) for value in rect)
+        count = 0
+        samples = pixmap.samples
+        channels = pixmap.n
+        for y in range(max(0, y0), min(pixmap.height, y1)):
+            for x in range(max(0, x0), min(pixmap.width, x1)):
+                offset = (y * pixmap.width + x) * channels
+                if min(samples[offset:offset + min(3, channels)]) < 80:
+                    count += 1
+        return count
+
+    assert dark_pixels(text_bbox) == 0
+    assert dark_pixels((150.0, 70.0, 180.0, 90.0)) > 500
+    document.close()
+
+
+def test_post_stack_reverification_binds_final_entity_locations(monkeypatch):
+    obj = types.SimpleNamespace(
+        name="Text_9",
+        type="FONT",
+        location=[0.01, -0.08, 0.0],
+    )
+    monkeypatch.setattr(
+        bl_import_engine,
+        "bpy",
+        types.SimpleNamespace(
+            data=types.SimpleNamespace(
+                objects=types.SimpleNamespace(get=lambda name: obj if name == obj.name else None)
+            )
+        ),
+    )
+    record = {
+        "page": 2,
+        "status": "delivered",
+        "final_representation": "text",
+        "entity_ids": ["Text_9"],
+        "attempts": [{
+            "status": "delivered",
+            "evidence": {"actual_location_m": [0.01, 0.02]},
+        }],
+    }
+
+    failures = bl_import_engine._reverify_text_delivery_after_stack(
+        [record],
+        page_number=2,
+        stack_offset_m=-0.10,
+    )
+
+    assert failures == []
+    proof = record["final_state_verification"]
+    assert proof["status"] == "verified"
+    assert proof["stack_offset_m"] == -0.10
+    assert proof["entities"][0]["actual_location_m"] == [0.01, -0.08, 0.0]
+
+
+def test_page_stacking_moves_only_roots_when_text_uses_affine_carrier():
+    carrier = types.SimpleNamespace(name="Text_9_Affine", parent=None, location=[0.0, 0.0, 0.0])
+    text = types.SimpleNamespace(
+        name="Text_9",
+        parent=carrier,
+        location=[0.01, 0.02, 0.0],
+    )
+    geometry = types.SimpleNamespace(
+        name="Line_1",
+        parent=None,
+        location=[0.03, 0.04, 0.0],
+    )
+
+    moved = bl_import_engine._stack_page_objects(
+        [carrier, text, geometry],
+        -0.10,
+    )
+
+    assert moved == 2
+    assert carrier.location == [0.0, -0.10, 0.0]
+    assert text.location == [0.01, 0.02, 0.0]
+    assert geometry.location[0] == 0.03
+    assert geometry.location[1] == pytest.approx(-0.06)
+    assert geometry.location[2] == 0.0
+
+
+def test_post_stack_reverification_reads_parented_entity_world_location(monkeypatch):
+    obj = types.SimpleNamespace(
+        name="Text_9",
+        type="FONT",
+        location=[0.01, 0.02, 0.0],
+        matrix_world=types.SimpleNamespace(translation=[0.01, -0.08, 0.0]),
+    )
+    monkeypatch.setattr(
+        bl_import_engine,
+        "bpy",
+        types.SimpleNamespace(
+            data=types.SimpleNamespace(
+                objects=types.SimpleNamespace(get=lambda name: obj if name == obj.name else None)
+            ),
+            context=types.SimpleNamespace(
+                view_layer=types.SimpleNamespace(update=lambda: None),
+            ),
+        ),
+    )
+    record = {
+        "page": 2,
+        "status": "delivered",
+        "final_representation": "text",
+        "entity_ids": ["Text_9"],
+        "attempts": [{
+            "status": "delivered",
+            "evidence": {"actual_location_m": [0.01, 0.02]},
+        }],
+    }
+
+    failures = bl_import_engine._reverify_text_delivery_after_stack(
+        [record],
+        page_number=2,
+        stack_offset_m=-0.10,
+    )
+
+    assert failures == []
+    proof = record["final_state_verification"]
+    assert proof["status"] == "verified"
+    assert proof["entities"][0]["actual_location_m"] == [0.01, -0.08, 0.0]
+
+
+def test_owned_import_image_temp_directory_is_removed_after_packed_delivery(
+    monkeypatch,
+    tmp_path,
+):
+    input_pdf = tmp_path / "input.pdf"
+    input_pdf.write_bytes(b"%PDF-1.7\n")
+    image_dir = tmp_path / "bc_bl_pdf_images_owned"
+    image_dir.mkdir()
+    (image_dir / "packed-source.png").write_bytes(b"temporary")
+
+    monkeypatch.setattr(bl_import_engine, "bpy", _FakeBpy())
+    monkeypatch.setattr(bl_import_engine, "check_pymupdf", lambda: True)
+    monkeypatch.setattr(bl_import_engine, "ensure_lib_path", lambda: None)
+    monkeypatch.setattr(fitz_loader, "import_fitz", lambda **_kwargs: object())
+    monkeypatch.setattr(fitz_loader, "safe_open", lambda _path: _Document())
+    monkeypatch.setattr(bl_import_engine, "extract_page", lambda *_args, **_kwargs: _page_data())
+    monkeypatch.setattr(bl_import_engine, "_render_page_raster", lambda *_args, **_kwargs: _raster_placement())
+    monkeypatch.setattr(bl_import_engine, "_create_image_plane", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(bl_import_engine.tempfile, "mkdtemp", lambda **_kwargs: str(image_dir))
+    monkeypatch.setattr(
+        bl_import_engine,
+        "write_import_report",
+        lambda *_args, **_kwargs: str(tmp_path / "import_report.json"),
+    )
+
+    bl_import_engine.import_pdf(
+        str(input_pdf),
+        config={
+            "mode": "raster",
+            "pages": "1",
+            "auto_focus_view": False,
+            "auto_hide_default_cube": False,
+        },
+    )
+
+    assert not image_dir.exists()
+
+
+def test_unknown_text_representation_fails_before_root_collection_creation(
+    monkeypatch,
+    tmp_path,
+):
+    input_pdf = tmp_path / "input.pdf"
+    input_pdf.write_bytes(b"%PDF-1.7\n")
+    fake_bpy = _FakeBpy()
+    monkeypatch.setattr(bl_import_engine, "bpy", fake_bpy)
+    monkeypatch.setattr(bl_import_engine, "check_pymupdf", lambda: True)
+    monkeypatch.setattr(bl_import_engine, "ensure_lib_path", lambda: None)
+    monkeypatch.setattr(fitz_loader, "import_fitz", lambda **_kwargs: object())
+    monkeypatch.setattr(
+        fitz_loader,
+        "safe_open",
+        lambda _path: (_ for _ in ()).throw(AssertionError("PDF opened after invalid mode")),
+    )
+
+    import pytest
+
+    with pytest.raises(ValueError, match="Unknown requested representation"):
+        bl_import_engine.import_pdf(
+            str(input_pdf),
+            config={
+                "mode": "vector",
+                "import_text": True,
+                "text_mode": "typo_mode",
+                "auto_hide_default_cube": False,
+            },
+        )
+
+    assert fake_bpy.data.collections.items == []
+
+
+def test_strict_text_fidelity_false_is_rejected_before_import_mutation(monkeypatch, tmp_path):
+    input_pdf = tmp_path / "input.pdf"
+    input_pdf.write_bytes(b"%PDF-1.7\n")
+    fake_bpy = _FakeBpy()
+    monkeypatch.setattr(bl_import_engine, "bpy", fake_bpy)
+    monkeypatch.setattr(bl_import_engine, "check_pymupdf", lambda: True)
+    monkeypatch.setattr(bl_import_engine, "ensure_lib_path", lambda: None)
+
+    import pytest
+
+    with pytest.raises(ValueError, match="strict_text_fidelity cannot be disabled"):
+        bl_import_engine.import_pdf(
+            str(input_pdf),
+            config={
+                "strict_text_fidelity": False,
+                "auto_hide_default_cube": False,
+            },
+        )
+
+    assert fake_bpy.data.collections.items == []
+
+
 def test_terminal_raster_failure_is_loud_in_report_without_clobbering_text_fallback(
     monkeypatch,
     tmp_path,
@@ -171,9 +979,9 @@ def test_terminal_raster_failure_is_loud_in_report_without_clobbering_text_fallb
     monkeypatch.setattr(bl_import_engine, "_pymupdf_version", lambda: "")
     provenance_opts = types.SimpleNamespace(
         _text_mode_fallbacks=[{
-            "requested": "glyphs",
-            "delivered": "labels",
-            "reason": "meshify_failed",
+            "requested": "text",
+            "delivered": "raster",
+            "reason": "exact_source_font_unavailable_for_item",
             "count": 1,
         }],
     )
@@ -192,7 +1000,7 @@ def test_terminal_raster_failure_is_loud_in_report_without_clobbering_text_fallb
 
     bl_import_engine.write_import_report(
         str(tmp_path / "input.pdf"),
-        {"import_text": True, "text_mode": "glyphs"},
+        {"import_text": True, "text_mode": "text"},
         stats,
         import_mode="raster",
         output_path=str(report_path),
@@ -202,13 +1010,142 @@ def test_terminal_raster_failure_is_loud_in_report_without_clobbering_text_fallb
     report = json.loads(report_path.read_text(encoding="utf-8"))
     assert report["fallback"]["reason"] == "raster_delivery_failed"
     assert report["fallback"]["text"] == {
-        "requested": "glyphs",
-        "delivered": "labels",
-        "reason": "meshify_failed",
+        "requested": "text",
+        "delivered": "raster",
+        "reason": "exact_source_font_unavailable_for_item",
         "count": 1,
     }
     assert report["extra"]["raster_delivery_failures"] == stats["raster_delivery_failures"]
     assert "raster_delivery_failed" in report["extra"]["diagnostics"]["signals"]
+    assert report["result"]["warnings"] == 1
+
+
+def test_report_preserves_every_item_attempt_and_summarizes_failures_loudly(
+    monkeypatch,
+    tmp_path,
+):
+    report_path = tmp_path / "import_report.json"
+    monkeypatch.setattr(bl_import_engine, "_pymupdf_version", lambda: "")
+    records = [
+        {
+            "item_id": "page:1:text:1",
+            "page": 1,
+            "source_span_id": 1,
+            "requested_representation": "text",
+            "final_representation": "text",
+            "status": "delivered",
+            "fallback_used": False,
+            "entity_ids": ["P1_text_1"],
+            "attempts": [{
+                "attempt_index": 0,
+                "attempted_representation": "text",
+                "status": "delivered",
+                "reason": "verified",
+                "evidence": {"actual_object_type": "FONT"},
+                "entity_ids": ["P1_text_1"],
+                "owned_artifacts": [],
+                "superseded": False,
+                "cleanup": {"status": "not_required", "removed": []},
+            }],
+        },
+        {
+            "item_id": "page:1:text:2",
+            "page": 1,
+            "source_span_id": 2,
+            "requested_representation": "text",
+            "final_representation": "raster",
+            "status": "delivered",
+            "fallback_used": True,
+            "entity_ids": ["P1_text_2_raster"],
+            "attempts": [
+                {
+                    "attempt_index": 0,
+                    "attempted_representation": "text",
+                    "status": "impossible",
+                    "reason": "exact_source_font_unavailable_for_item",
+                    "evidence": {"source_xref": 9},
+                    "entity_ids": [],
+                    "owned_artifacts": [],
+                    "superseded": True,
+                    "cleanup": {"status": "complete", "removed": []},
+                },
+                {
+                    "attempt_index": 4,
+                    "attempted_representation": "raster",
+                    "status": "delivered",
+                    "reason": "verified",
+                    "evidence": {"actual_object_type": "MESH"},
+                    "entity_ids": ["P1_text_2_raster"],
+                    "owned_artifacts": [],
+                    "superseded": False,
+                    "cleanup": {"status": "not_required", "removed": []},
+                },
+            ],
+        },
+        {
+            "item_id": "page:1:text:3",
+            "page": 1,
+            "source_span_id": 3,
+            "requested_representation": "text",
+            "final_representation": None,
+            "status": "failed",
+            "fallback_used": True,
+            "entity_ids": [],
+            "attempts": [{
+                "attempt_index": 0,
+                "attempted_representation": "text",
+                "status": "failed",
+                "reason": "font_object_creation_failed_not_impossibility_proof",
+                "evidence": {"exception_type": "RuntimeError"},
+                "entity_ids": [],
+                "owned_artifacts": [],
+                "superseded": True,
+                "cleanup": {"status": "complete", "removed": []},
+            }],
+        },
+    ]
+    provenance_opts = types.SimpleNamespace(_text_delivery_records=records)
+    stats = {
+        "pages_imported": 1,
+        "primitives": 5,
+        "text_items": 2,
+        "text_source_spans": 3,
+        "collections": 1,
+        "elapsed": 0.01,
+    }
+
+    bl_import_engine.write_import_report(
+        str(tmp_path / "input.pdf"),
+        {"import_text": True, "text_mode": "text"},
+        stats,
+        import_mode="vector",
+        output_path=str(report_path),
+        provenance_opts=provenance_opts,
+    )
+
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    delivery = report["extra"]["text_delivery"]
+    assert delivery["schema"] == "bcs.text_delivery/1.0"
+    assert delivery["summary"] == {
+        "source_items": 3,
+        "delivered_items": 2,
+        "fallback_items": 1,
+        "failed_items": 1,
+        "requested_counts": {"text": 3},
+        "final_counts": {"raster": 1, "text": 1},
+        "failed_item_ids": ["page:1:text:3"],
+    }
+    assert delivery["items"] == records
+    assert report["fallback"]["used"] is True
+    assert report["fallback"]["text"] == {
+        "requested": "text",
+        "delivered": "raster",
+        "reason": "exact_source_font_unavailable_for_item",
+        "count": 1,
+    }
+    signals = report["extra"]["diagnostics"]["signals"]
+    assert "text_representation_fallback_used" in signals
+    assert "text_delivery_failed" in signals
 
 
 def test_auto_raster_delivery_failure_marks_fallback_as_used(monkeypatch, tmp_path):

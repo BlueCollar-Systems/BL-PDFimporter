@@ -736,6 +736,7 @@ def build_page(
         "batched_curve_runs": 0,
         "batched_curve_objects": 0,
         "model3d_solids": 0,
+        "geometry_delivery_issues": [],
     }
     page_area = max(float(page_data.width or 0.0) * float(page_data.height or 0.0), 1e-9)
     prims = page_data.primitives or []
@@ -1041,23 +1042,38 @@ def build_page(
                         stats["model3d_solids"] += 1
 
         else:
-            # Unknown type — best effort as polyline
+            # Preserve the source point path as geometry, but never hide that
+            # the normalized primitive kind was not understood.  Unknown open
+            # paths are built immediately (instead of batched) so delivery can
+            # be verified for this exact primitive before it is reported.
+            issue = {
+                "page": int(page_data.page_number),
+                "primitive_id": int(prim.id),
+                "requested_type": "geometry",
+                "source_primitive_type": str(prim.type or ""),
+                "delivered_type": None,
+                "status": "failed",
+                "reason": "unknown_normalized_primitive_type",
+                "verification": "not_created",
+            }
             if prim.points and len(prim.points) >= 2:
-                if prim.closed:
-                    created = _draw_stroked_polyline(
-                        obj_name, prim.points, prim.closed, target_col,
-                        prim.line_width, mat,
-                        dash_pattern=prim.dash_pattern if map_dashes else None,
-                        z_offset_m=line_z_offset_m,
-                    )
-                else:
-                    created = _queue_open_curve(
-                        obj_name, prim.points, target_col,
-                        prim.line_width, mat,
-                        dash_pattern=prim.dash_pattern if map_dashes else None,
-                        dash_phase=prim.dash_phase if map_dashes else 0.0,
-                    )
+                created = _draw_stroked_polyline(
+                    obj_name, prim.points, bool(prim.closed), target_col,
+                    prim.line_width, mat,
+                    dash_pattern=prim.dash_pattern if map_dashes else None,
+                    dash_phase=prim.dash_phase if map_dashes else 0.0,
+                    z_offset_m=line_z_offset_m,
+                )
                 stats["curves"] += created
+                if created > 0:
+                    issue.update({
+                        "delivered_type": "polyline_geometry",
+                        "status": "verified",
+                        "verification": "source_points_preserved",
+                    })
+            else:
+                issue["reason"] = "unknown_primitive_without_polyline_points"
+            stats["geometry_delivery_issues"].append(issue)
 
     _flush_open_curve_batches()
 

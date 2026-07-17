@@ -50,6 +50,29 @@ class TestDependencyManager(unittest.TestCase):
         self.assertIn('_VENDORED_LIB / "pymupdf" / "extra.py"', source)
         self.assertIn('PKG / "_vendored_pymupdf_extra.py"', source)
 
+    def test_vendored_fonttools_runtime_is_pure_python_and_licensed(self) -> None:
+        lib_dir = Path(__file__).resolve().parents[1] / "pdf_vector_importer" / "lib"
+        self.assertTrue((lib_dir / "fontTools" / "ttLib" / "__init__.py").is_file())
+        self.assertTrue((lib_dir / "fontTools" / "cffLib" / "__init__.py").is_file())
+        dist_info = lib_dir / "fonttools-4.60.2.dist-info"
+        self.assertTrue((dist_info / "licenses" / "LICENSE").is_file())
+        metadata = (dist_info / "METADATA").read_text(encoding="utf-8")
+        wheel = (dist_info / "WHEEL").read_text(encoding="utf-8")
+        self.assertIn("Requires-Python: >=3.9", metadata)
+        self.assertIn("Root-Is-Purelib: true", wheel)
+        self.assertIn("Tag: py3-none-any", wheel)
+        self.assertEqual(list((lib_dir / "fontTools").rglob("*.pyd")), [])
+
+    def test_build_release_requires_fonttools_runtime_and_license(self) -> None:
+        source = Path(__file__).resolve().parents[1].joinpath("build_release.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('_VENDORED_LIB / "fontTools" / "ttLib" / "__init__.py"', source)
+        self.assertIn(
+            '_VENDORED_LIB / "fonttools-4.60.2.dist-info" / "licenses" / "LICENSE"',
+            source,
+        )
+
     def test_dependency_manager_uses_package_relative_pdfcadcore(self) -> None:
         source = Path(dependency_manager.__file__).read_text(encoding="utf-8")
         self.assertIn("from .pdfcadcore.fitz_loader import import_fitz", source)

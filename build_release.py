@@ -38,6 +38,12 @@ _REQUIRED_RUNTIME_FILES = (
     _VENDORED_LIB / "pymupdf" / "_mupdf.pyd",
     _VENDORED_LIB / "pymupdf" / "mupdfcpp64.dll",
     PKG / "_vendored_pymupdf_extra.py",
+    _VENDORED_LIB / "fontTools" / "ttLib" / "__init__.py",
+    _VENDORED_LIB / "fontTools" / "cffLib" / "__init__.py",
+    _VENDORED_LIB / "fonttools-4.60.2.dist-info" / "METADATA",
+    _VENDORED_LIB / "fonttools-4.60.2.dist-info" / "WHEEL",
+    _VENDORED_LIB / "fonttools-4.60.2.dist-info" / "licenses" / "LICENSE",
+    _VENDORED_LIB / "fonttools-4.60.2.dist-info" / "licenses" / "LICENSE.external",
 )
 
 
@@ -62,8 +68,27 @@ def _should_exclude(path: Path) -> bool:
 
 
 def _verify_vendored_pymupdf() -> None:
-    """Ensure release ZIPs include a private PyMuPDF runtime."""
+    """Ensure release ZIPs include their private offline runtimes."""
     _verify_vendored_runtime()
+    fonttools_code = (
+        "import sys; "
+        f"sys.path.insert(0, r'{LIB_DIR}'); "
+        "import fontTools; "
+        "from fontTools.cffLib import CFFFontSet; "
+        "from fontTools.ttLib import TTFont; "
+        "print(fontTools.__version__)"
+    )
+    fonttools_proc = subprocess.run(
+        [sys.executable, "-S", "-c", fonttools_code],
+        capture_output=True,
+        text=True,
+    )
+    if fonttools_proc.returncode != 0 or fonttools_proc.stdout.strip() != "4.60.2":
+        raise RuntimeError(
+            "Vendored FontTools 4.60.2 could not be imported from "
+            "pdf_vector_importer/lib. "
+            f"stderr: {fonttools_proc.stderr.strip()}"
+        )
     if sys.platform != "win32":
         print(
             "Vendored PyMuPDF Windows runtime files present; "
@@ -101,7 +126,7 @@ def _verify_vendored_runtime() -> None:
         if not dist_info:
             details.append("pdf_vector_importer/lib/pymupdf-*.dist-info/COPYING")
         raise RuntimeError(
-            "Release build requires bundled PyMuPDF runtime files. Missing: "
+            "Release build requires bundled offline runtime files. Missing: "
             + ", ".join(details)
         )
 
