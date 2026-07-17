@@ -875,6 +875,23 @@ def test_positioned_font_axis_metrics_use_upem_for_horizontal_glyph_domain():
     )
 
 
+def test_exact_glyph_design_bounds_rejects_cached_upem_mismatch(monkeypatch):
+    monkeypatch.setattr(bl_text_builder, "_EXACT_GLYPH_DESIGN_BOUNDS_CACHE", {})
+    asset = _metric_font_asset()
+
+    assert bl_text_builder._exact_glyph_design_bounds(asset, 1) == pytest.approx(
+        (100.0, -200.0, 500.0, 700.0)
+    )
+    mismatched_asset = types.SimpleNamespace(**vars(asset))
+    mismatched_asset.units_per_em = 2048
+
+    with pytest.raises(
+        RuntimeError,
+        match="embedded font metric metadata does not match glyph design units",
+    ):
+        bl_text_builder._exact_glyph_design_bounds(mismatched_asset, 1)
+
+
 def test_positioned_metric_affine_stores_exact_source_glyph_world_ink_bounds(monkeypatch):
     _install_mathutils(monkeypatch)
     layout = _character_layout()[0]
@@ -910,9 +927,27 @@ def test_positioned_metric_verification_rejects_evaluated_ink_bounds_outside_exa
     )
     data = _FontData("OverwideInk")
     obj = _Object("OverwideInk", data)
-    obj.matrix_world = identity
-    obj._base_dimensions = (0.75, 1.0, 0.0)
+    obj.matrix_world = _AffineMatrix((
+        (1.0, 0.0, 0.0, 4.0),
+        (0.0, 1.0, 0.0, 0.0),
+        (0.0, 0.0, 1.0, 0.0),
+        (0.0, 0.0, 0.0, 1.0),
+    ))
+    obj._base_dimensions = (0.5, 1.0, 0.0)
     obj.bound_box = (
+        (0.0, 0.0, 0.0),
+        (0.5, 0.0, 0.0),
+        (0.5, 1.0, 0.0),
+        (0.0, 1.0, 0.0),
+        (0.0, 0.0, 0.0),
+        (0.5, 0.0, 0.0),
+        (0.5, 1.0, 0.0),
+        (0.0, 1.0, 0.0),
+    )
+    evaluated = _Object("OverwideInkEvaluated", data)
+    evaluated.matrix_world = identity
+    evaluated._base_dimensions = (0.75, 1.0, 0.0)
+    evaluated.bound_box = (
         (0.0, 0.0, 0.0),
         (0.75, 0.0, 0.0),
         (0.75, 1.0, 0.0),
@@ -922,6 +957,7 @@ def test_positioned_metric_verification_rejects_evaluated_ink_bounds_outside_exa
         (0.75, 1.0, 0.0),
         (0.0, 1.0, 0.0),
     )
+    obj.evaluated_get = lambda _depsgraph: evaluated
     obj.update({
         "pdf_metric_local_advance": 1.0,
         "pdf_metric_local_line_height": 1.0,
@@ -933,12 +969,15 @@ def test_positioned_metric_verification_rejects_evaluated_ink_bounds_outside_exa
 
     failures, evidence = bl_text_builder._verify_metric_character_transform(obj, child)
 
-    assert "evaluated_ink_bounds_outside_exact_source_glyph_bounds" in failures
+    assert failures == ["evaluated_ink_bounds_outside_exact_source_glyph_bounds"]
     assert evidence["expected_world_ink_bounds_m"] == pytest.approx(
         (0.0, 0.0, 0.5, 1.0)
     )
     assert evidence["actual_world_ink_bounds_m"] == pytest.approx(
         (0.0, 0.0, 0.75, 1.0)
+    )
+    assert evidence["evaluated_affine_matrix"] == pytest.approx(
+        [value for row in identity for value in row]
     )
 
 
@@ -975,6 +1014,56 @@ def test_positioned_metric_verification_preserves_explicit_zero_ink_identity(mon
     assert evidence["zero_ink_identity"] is True
     assert evidence["expected_world_ink_bounds_m"] is None
     assert evidence["actual_world_ink_bounds_m"] is None
+
+
+def test_zero_ink_metric_verification_still_rejects_corrupt_evaluated_transform(
+    monkeypatch,
+):
+    _install(monkeypatch)
+    _install_mathutils(monkeypatch)
+    identity = _AffineMatrix.Identity(4)
+    layout = TextCharLayout(
+        text=" ",
+        glyph_id=None,
+        source_origin_pdf=(0.0, 0.0),
+        source_bbox_pdf=(0.0, 0.0, 1000.0, 1000.0),
+        source_quad_pdf=((0.0, 0.0), (1000.0, 0.0), (1000.0, 1000.0), (0.0, 1000.0)),
+        target_origin=(0.0, 0.0),
+        target_quad=((0.0, 1000.0), (1000.0, 1000.0), (1000.0, 0.0), (0.0, 0.0)),
+        advance_width=1000.0,
+        glyph_height=1000.0,
+    )
+    child = bl_text_builder._character_text_item(_item(), layout)
+    data = _FontData("CorruptZeroInk")
+    obj = _Object("CorruptZeroInk", data)
+    obj.matrix_world = identity
+    obj.update({
+        "pdf_metric_local_advance": 1.0,
+        "pdf_metric_local_line_height": 1.0,
+        "pdf_metric_local_baseline_y": 0.0,
+        "pdf_metric_zero_ink_identity": True,
+        "pdf_affine_matrix": [value for row in identity for value in row],
+    })
+    evaluated = _Object("CorruptZeroInkEvaluated", data)
+    evaluated.matrix_world = _AffineMatrix((
+        (1.0, 0.0, 0.0, 0.01),
+        (0.0, 1.0, 0.0, 0.0),
+        (0.0, 0.0, 1.0, 0.0),
+        (0.0, 0.0, 0.0, 1.0),
+    ))
+    obj.evaluated_get = lambda _depsgraph: evaluated
+
+    failures, evidence = bl_text_builder._verify_metric_character_transform(obj, child)
+
+    assert evidence["zero_ink_identity"] is True
+    assert evidence["expected_world_ink_bounds_m"] is None
+    assert evidence["actual_world_ink_bounds_m"] is None
+    assert {
+        "evaluated_baseline_anchor_mismatch",
+        "evaluated_font_advance_axis_mismatch",
+        "evaluated_font_line_axis_mismatch",
+        "evaluated_affine_matrix_mismatch",
+    }.issubset(failures)
 
 
 def test_affine_coefficients_preserve_shear_and_mirror():

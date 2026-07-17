@@ -29,7 +29,7 @@ MM_TO_M = 0.001
 _FONT_SIZE_SCALE = 1.0
 _FONT_CACHE: Dict[str, bpy.types.VectorFont] = {}
 _EXACT_GLYPH_DESIGN_BOUNDS_CACHE: Dict[
-    Tuple[str, int], Optional[Tuple[float, float, float, float]]
+    Tuple[str, int, int], Optional[Tuple[float, float, float, float]]
 ] = {}
 _TEXT_MODES = {"labels", "text", "3d_text", "glyphs", "geometry", "raster"}
 _METRIC_INK_BOUNDS_TOLERANCE_M = 5e-5
@@ -397,7 +397,7 @@ def _exact_glyph_design_bounds(asset, glyph_id: int):
         or glyph_id < 0
     ):
         raise RuntimeError("exact embedded glyph bound source is invalid")
-    cache_key = (digest, glyph_id)
+    cache_key = (digest, glyph_id, expected_upem)
     if cache_key in _EXACT_GLYPH_DESIGN_BOUNDS_CACHE:
         return _EXACT_GLYPH_DESIGN_BOUNDS_CACHE[cache_key]
 
