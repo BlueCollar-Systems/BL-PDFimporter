@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import builtins
+import copy
 import math
 from hashlib import sha256
 from io import BytesIO
@@ -590,6 +591,33 @@ def _mixed_zero_ink_character_layout():
     )
 
 
+def _whitespace_only_character_layout():
+    return (
+        TextCharLayout(
+            text=" ",
+            glyph_id=None,
+            source_origin_pdf=(10.0, 20.0),
+            source_bbox_pdf=(10.0, 10.0, 13.0, 22.0),
+            source_quad_pdf=((10.0, 10.0), (13.0, 10.0), (13.0, 22.0), (10.0, 22.0)),
+            target_origin=(12.0, 24.0),
+            target_quad=((12.0, 30.0), (15.0, 30.0), (15.0, 24.0), (12.0, 24.0)),
+            advance_width=3.0,
+            glyph_height=6.0,
+        ),
+        TextCharLayout(
+            text=" ",
+            glyph_id=None,
+            source_origin_pdf=(13.0, 20.0),
+            source_bbox_pdf=(13.0, 10.0, 16.0, 22.0),
+            source_quad_pdf=((13.0, 10.0), (16.0, 10.0), (16.0, 22.0), (13.0, 22.0)),
+            target_origin=(15.0, 24.0),
+            target_quad=((15.0, 30.0), (18.0, 30.0), (18.0, 24.0), (15.0, 24.0)),
+            advance_width=3.0,
+            glyph_height=6.0,
+        ),
+    )
+
+
 def _install_positioned_empty_conversion_host(
     monkeypatch,
     fake,
@@ -967,6 +995,153 @@ def test_positioned_conversion_preserves_zero_ink_space_and_delivers_visible_sib
     expected_removed_curves = 4 if mode == "glyphs" else 3
     assert len(fake.data.curves.removed) >= expected_removed_curves
     assert len(fake.data.meshes.removed) == (1 if mode == "geometry" else 0)
+
+
+@pytest.mark.parametrize("mode", ["glyphs", "geometry"])
+def test_positioned_whitespace_only_delivers_verified_zero_ink_without_host_entity(
+    monkeypatch,
+    mode,
+):
+    fake, collection = _install(monkeypatch)
+    _install_positioned_empty_conversion_host(monkeypatch, fake)
+    opts = types.SimpleNamespace(import_mode="vector", text_mode=mode)
+    item = _item()
+    item.text = "  "
+    item.normalized = ""
+    item.source_char_layout = _whitespace_only_character_layout()
+    item.requires_individual_positioning = True
+
+    obj = bl_text_builder.build_text(
+        item,
+        collection,
+        page_number=2,
+        text_mode=mode,
+        provenance_opts=opts,
+    )
+
+    assert obj is None
+    assert collection.objects.items == []
+    record = opts._text_delivery_records[-1]
+    assert record["status"] == "delivered"
+    assert record["requested_representation"] == mode
+    assert record["final_representation"] == mode
+    assert record["fallback_attempted"] is False
+    assert record["fallback_used"] is False
+    assert record["entity_ids"] == []
+    assert record["zero_ink_delivery"] is True
+    attempt = record["attempts"][0]
+    assert attempt["status"] == "delivered"
+    assert attempt["cleanup"]["status"] == "complete"
+    evidence = attempt["evidence"]
+    assert evidence["proof_kind"] == "positioned_zero_ink_delivery_v1"
+    assert evidence["logical_delivery_id"] == f"page:2:text:41:zero-ink:{mode}"
+    assert evidence["requested_representation"] == mode
+    assert evidence["delivered_representation"] == mode
+    assert evidence["zero_ink_identity_verified"] is True
+    assert evidence["no_visible_ink_expected"] is True
+    assert evidence["physical_entity_count"] == 0
+    assert evidence["visible_character_count"] == 0
+    assert evidence["zero_ink_character_count"] == 2
+    assert evidence["source_character_count"] == 2
+    assert evidence["cleanup_verified"] is True
+    characters = evidence["character_entities"]
+    assert [entry["character_item_id"] for entry in characters] == [
+        "page:2:text:41:char:0",
+        "page:2:text:41:char:1",
+    ]
+    assert all(entry["entity_ids"] == [] for entry in characters)
+    assert all(entry["verification"]["zero_ink_identity"] is True for entry in characters)
+    assert all(
+        entry["verification"]["cleanup"]["status"] == "complete"
+        for entry in characters
+    )
+    assert getattr(opts, "_text_delivered_entity_counts", {}) == {}
+    provenance = opts._source_provenance_objects[-1]
+    assert provenance.created_entity_type == f"blender_zero_ink_{mode}_identity"
+    assert provenance.parent_handle == evidence["logical_delivery_id"]
+    assert fake.data.materials.items == {}
+
+
+@pytest.mark.parametrize("mode", ["glyphs", "geometry"])
+def test_zero_ink_material_cleanup_failure_remains_owned_for_outer_retry(
+    monkeypatch,
+    mode,
+):
+    fake, collection = _install(monkeypatch)
+    _install_positioned_empty_conversion_host(monkeypatch, fake)
+    removed_object_refs = set()
+    removed_curve_refs = set()
+    removed_mesh_refs = set()
+    original_object_remove = fake.data.objects.remove
+    original_curve_remove = fake.data.curves.remove
+    original_mesh_remove = fake.data.meshes.remove
+
+    def track_object_removal(obj, do_unlink=True):
+        removed_object_refs.add(id(obj))
+        original_object_remove(obj, do_unlink=do_unlink)
+
+    def track_curve_removal(data):
+        removed_curve_refs.add(id(data))
+        original_curve_remove(data)
+
+    def track_mesh_removal(data):
+        removed_mesh_refs.add(id(data))
+        original_mesh_remove(data)
+
+    monkeypatch.setattr(fake.data.objects, "remove", track_object_removal)
+    monkeypatch.setattr(fake.data.curves, "remove", track_curve_removal)
+    monkeypatch.setattr(fake.data.meshes, "remove", track_mesh_removal)
+    original_material_remove = fake.data.materials.remove
+    material_remove_calls = []
+
+    def fail_first_material_removal(material):
+        material_remove_calls.append(material.name)
+        if len(material_remove_calls) == 1:
+            raise RuntimeError("injected zero-ink material removal failure")
+        original_material_remove(material)
+
+    monkeypatch.setattr(fake.data.materials, "remove", fail_first_material_removal)
+    original_valid_owned_ref = bl_text_builder._valid_owned_ref
+
+    def host_liveness_owned_ref(value):
+        if isinstance(value, _Object) and id(value) in removed_object_refs:
+            return False
+        if isinstance(value, (_FontData, _CurveData)) and id(value) in removed_curve_refs:
+            return False
+        if isinstance(value, _MeshData) and id(value) in removed_mesh_refs:
+            return False
+        return original_valid_owned_ref(value)
+
+    monkeypatch.setattr(
+        bl_text_builder,
+        "_valid_owned_ref",
+        host_liveness_owned_ref,
+    )
+    opts = types.SimpleNamespace(import_mode="vector", text_mode=mode)
+    item = _item()
+    item.text = "A B"
+    item.normalized = "A B"
+    item.source_char_layout = _mixed_zero_ink_character_layout()
+    item.requires_individual_positioning = True
+
+    obj = bl_text_builder.build_text(
+        item,
+        collection,
+        page_number=2,
+        text_mode=mode,
+        provenance_opts=opts,
+    )
+
+    assert obj is None
+    assert collection.objects.items == []
+    record = opts._text_delivery_records[-1]
+    assert record["status"] == "failed"
+    assert len(record["attempts"]) == 1
+    attempt = record["attempts"][0]
+    assert attempt["reason"] == "verified_zero_ink_candidate_cleanup_failed"
+    assert attempt["cleanup"]["status"] == "complete"
+    assert len(material_remove_calls) >= 2
+    assert fake.data.materials.items == {}
 
 
 @pytest.mark.parametrize(
@@ -2291,3 +2466,294 @@ def test_missing_delivered_identity_retains_owned_refs_for_cleanup():
     assert len(cleanup_calls) == 1
     assert cleanup_calls[0].owned_objects == (owned_object,)
     assert cleanup_calls[0].owned_datablocks == (owned_data,)
+
+
+def _verified_zero_ink_delivery_evidence(
+    *,
+    requested="glyphs",
+    delivered="glyphs",
+):
+    item_id = "page:2:text:41"
+    characters = []
+    for index, origin_x in enumerate((12.0, 15.0)):
+        characters.append({
+            "item_id": item_id,
+            "character_item_id": f"{item_id}:char:{index}",
+            "character_index": index,
+            "text": " ",
+            "glyph_id": None,
+            "advance_width_model": 3.0,
+            "source_origin_pdf": [10.0 + index * 3.0, 20.0],
+            "source_bbox_pdf": [
+                10.0 + index * 3.0,
+                10.0,
+                13.0 + index * 3.0,
+                22.0,
+            ],
+            "source_quad_pdf": [
+                [10.0 + index * 3.0, 10.0],
+                [13.0 + index * 3.0, 10.0],
+                [13.0 + index * 3.0, 22.0],
+                [10.0 + index * 3.0, 22.0],
+            ],
+            "target_origin_model": [origin_x, 24.0],
+            "target_quad_model": [
+                [origin_x, 30.0],
+                [origin_x + 3.0, 30.0],
+                [origin_x + 3.0, 24.0],
+                [origin_x, 24.0],
+            ],
+            "requested_representation": requested,
+            "delivered_representation": delivered,
+            "positioned_character": True,
+            "entity_ids": [],
+            "verification": {
+                "item_id": item_id,
+                "zero_ink_identity": True,
+                "evaluated_ink_bounds_verified": True,
+                "conversion_outcome": "verified_zero_ink_no_physical_entity",
+                "cleanup": {
+                    "status": "complete",
+                    "removed": [f"source-{index}", f"empty-conversion-{index}"],
+                },
+                "zero_ink_source_font_cleaned": True,
+                "empty_conversion_datablock_cleaned": True,
+            },
+        })
+    removed = [
+        removed_id
+        for character in characters
+        for removed_id in character["verification"]["cleanup"]["removed"]
+    ]
+    return {
+        "proof_kind": "positioned_zero_ink_delivery_v1",
+        "logical_delivery_id": f"{item_id}:zero-ink:{delivered}",
+        "importer_id": "bc_pdf_vector_importer.blender",
+        "item_id": item_id,
+        "page_number": 2,
+        "source_span_id": 41,
+        "requested_representation": requested,
+        "delivered_representation": delivered,
+        "zero_ink_delivery": True,
+        "zero_ink_identity_verified": True,
+        "no_visible_ink_expected": True,
+        "physical_entity_count": 0,
+        "source_character_count": 2,
+        "character_count": 2,
+        "attempted_character_count": 2,
+        "visible_character_count": 0,
+        "zero_ink_character_count": 2,
+        "character_entities": characters,
+        "cleanup_verified": True,
+        "cleanup": {"status": "complete", "removed": removed},
+    }
+
+
+def test_entityless_zero_ink_delivery_requires_complete_bound_proof_and_stays_requested():
+    evidence = _verified_zero_ink_delivery_evidence()
+
+    entity, record = deliver_item(
+        item_id="page:2:text:41",
+        page_number=2,
+        source_span_id=41,
+        requested="glyphs",
+        attempt=lambda _representation: AttemptOutcome.delivered(
+            None,
+            entity_ids=(),
+            evidence=evidence,
+        ),
+        cleanup=lambda _outcome: pytest.fail(
+            "a verified zero-ink delivery is already completely cleaned"
+        ),
+    )
+
+    assert entity is None
+    assert record["status"] == "delivered"
+    assert record["final_representation"] == "glyphs"
+    assert record["fallback_attempted"] is False
+    assert record["fallback_used"] is False
+    assert record["entity_ids"] == []
+    assert record["zero_ink_delivery"] is True
+    assert record["attempts"][0]["status"] == "delivered"
+    assert record["attempts"][0]["cleanup"] == evidence["cleanup"]
+
+
+@pytest.mark.parametrize(
+    ("corruption", "expected_failure"),
+    [
+        ("cleanup_missing", "zero_ink_cleanup_not_verified"),
+        ("cleanup_failed", "zero_ink_cleanup_incomplete"),
+        ("physical_entity", "zero_ink_physical_entity_count_not_zero"),
+        ("visible_character", "zero_ink_visible_character_count_not_zero"),
+        ("visible_ink_expected", "zero_ink_visible_ink_absence_unverified"),
+        ("wrong_logical_id", "zero_ink_logical_delivery_identity_unbound"),
+        ("fractional_page", "zero_ink_page_identity_unbound"),
+        ("source_count", "zero_ink_source_character_coverage_mismatch"),
+        ("fractional_count", "zero_ink_source_character_count_invalid"),
+        ("fractional_character_index", "zero_ink_character_index_unbound"),
+        ("visible_text", "zero_ink_character_has_visible_text"),
+        ("character_entity", "zero_ink_character_has_physical_entity_identity"),
+        ("character_proof", "zero_ink_character_identity_unverified"),
+        ("character_cleanup", "zero_ink_character_cleanup_incomplete"),
+    ],
+)
+def test_entityless_zero_ink_delivery_rejects_partial_or_forged_evidence(
+    corruption,
+    expected_failure,
+):
+    evidence = copy.deepcopy(_verified_zero_ink_delivery_evidence())
+    if corruption == "cleanup_missing":
+        evidence.pop("cleanup_verified")
+    elif corruption == "cleanup_failed":
+        evidence["cleanup"]["status"] = "failed"
+    elif corruption == "physical_entity":
+        evidence["physical_entity_count"] = 1
+    elif corruption == "visible_character":
+        evidence["visible_character_count"] = 1
+    elif corruption == "visible_ink_expected":
+        evidence["no_visible_ink_expected"] = False
+    elif corruption == "wrong_logical_id":
+        evidence["logical_delivery_id"] = "forged-zero-ink-id"
+    elif corruption == "fractional_page":
+        evidence["page_number"] = 2.5
+    elif corruption == "source_count":
+        evidence["source_character_count"] = 3
+    elif corruption == "fractional_count":
+        evidence["source_character_count"] = 2.5
+    elif corruption == "fractional_character_index":
+        evidence["character_entities"][0]["character_index"] = 0.5
+    elif corruption == "visible_text":
+        evidence["character_entities"][0]["text"] = "A"
+    elif corruption == "character_entity":
+        evidence["character_entities"][0]["entity_ids"] = ["forged-host-entity"]
+    elif corruption == "character_proof":
+        evidence["character_entities"][0]["verification"][
+            "zero_ink_identity"
+        ] = False
+    elif corruption == "character_cleanup":
+        evidence["character_entities"][0]["verification"]["cleanup"][
+            "status"
+        ] = "failed"
+
+    entity, record = deliver_item(
+        item_id="page:2:text:41",
+        page_number=2,
+        source_span_id=41,
+        requested="glyphs",
+        attempt=lambda _representation: AttemptOutcome.delivered(
+            None,
+            entity_ids=(),
+            evidence=evidence,
+        ),
+        cleanup=lambda _outcome: {"status": "complete", "removed": []},
+    )
+
+    assert entity is None
+    assert record["status"] == "failed"
+    attempt = record["attempts"][0]
+    assert attempt["reason"] == "delivered_attempt_zero_ink_evidence_not_verified"
+    assert expected_failure in attempt["evidence"]["proof_failures"]
+
+
+def test_entityless_zero_ink_delivery_cannot_be_used_as_a_fallback_rung():
+    attempts = []
+
+    def attempt(representation):
+        attempts.append(representation)
+        if representation == "glyphs":
+            return AttemptOutcome.impossible(
+                "evaluated_font_to_curve_capability_absent_for_item",
+                evidence={
+                    "importer_id": "bc_pdf_vector_importer.blender",
+                    "item_id": "page:2:text:41",
+                    "page_number": 2,
+                    "source_span_id": 41,
+                    "host": "blender",
+                    "host_version": [5, 2, 0],
+                    "capability": "Object.to_curve",
+                    "capability_present": False,
+                },
+            )
+        return AttemptOutcome.delivered(
+            None,
+            entity_ids=(),
+            evidence=_verified_zero_ink_delivery_evidence(
+                requested="glyphs",
+                delivered="geometry",
+            ),
+        )
+
+    entity, record = deliver_item(
+        item_id="page:2:text:41",
+        page_number=2,
+        source_span_id=41,
+        requested="glyphs",
+        attempt=attempt,
+        cleanup=lambda _outcome: {"status": "complete", "removed": []},
+    )
+
+    assert entity is None
+    assert attempts == ["glyphs", "geometry"]
+    assert record["status"] == "failed"
+    assert record["fallback_used"] is False
+    assert record["attempts"][1]["reason"] == (
+        "delivered_attempt_zero_ink_evidence_not_verified"
+    )
+    assert "zero_ink_delivery_not_requested_rung" in record["attempts"][1][
+        "evidence"
+    ]["proof_failures"]
+
+
+def test_entityless_zero_ink_conversion_proof_cannot_authorize_raster_delivery():
+    evidence = _verified_zero_ink_delivery_evidence(
+        requested="raster",
+        delivered="raster",
+    )
+
+    entity, record = deliver_item(
+        item_id="page:2:text:41",
+        page_number=2,
+        source_span_id=41,
+        requested="raster",
+        attempt=lambda _representation: AttemptOutcome.delivered(
+            None,
+            entity_ids=(),
+            evidence=evidence,
+        ),
+        cleanup=lambda _outcome: {"status": "complete", "removed": []},
+    )
+
+    assert entity is None
+    assert record["status"] == "failed"
+    attempt = record["attempts"][0]
+    assert attempt["reason"] == "delivered_attempt_zero_ink_evidence_not_verified"
+    assert "zero_ink_delivery_representation_not_convertible" in attempt["evidence"][
+        "proof_failures"
+    ]
+
+
+def test_entityless_zero_ink_delivery_cannot_retain_live_owned_artifacts():
+    owned_object = object()
+
+    entity, record = deliver_item(
+        item_id="page:2:text:41",
+        page_number=2,
+        source_span_id=41,
+        requested="glyphs",
+        attempt=lambda _representation: AttemptOutcome.delivered(
+            None,
+            entity_ids=(),
+            evidence=_verified_zero_ink_delivery_evidence(),
+            owned_artifacts=({"object_id": "live-zero-ink-artifact"},),
+            owned_objects=(owned_object,),
+        ),
+        cleanup=lambda _outcome: {"status": "complete", "removed": []},
+    )
+
+    assert entity is None
+    assert record["status"] == "failed"
+    attempt = record["attempts"][0]
+    assert attempt["reason"] == "delivered_attempt_zero_ink_evidence_not_verified"
+    assert "zero_ink_delivery_retains_owned_artifacts" in attempt["evidence"][
+        "proof_failures"
+    ]

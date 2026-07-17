@@ -761,18 +761,24 @@ def _record_text_provenance(
     requested_text_mode: str,
     delivered_text_mode: str,
     parent_handle: str = "",
+    zero_ink_delivery: bool = False,
 ) -> None:
     if provenance_opts is None:
         return
     try:
         from .pdfcadcore.source_provenance import record_text_span_provenance
 
+        created_entity_type = (
+            f"blender_zero_ink_{_normalize_text_mode(delivered_text_mode)}_identity"
+            if zero_ink_delivery
+            else _provenance_entity_type(delivered_text_mode)
+        )
         record_text_span_provenance(
             provenance_opts,
             page=int(page_number),
             span=_text_span_dict(text_item),
             text=str(text_item.text or ""),
-            created_entity_type=_provenance_entity_type(delivered_text_mode),
+            created_entity_type=created_entity_type,
             parent_handle=str(parent_handle or ""),
             import_mode=str(getattr(provenance_opts, "import_mode", "") or ""),
             text_mode=str(requested_text_mode or ""),
@@ -3066,6 +3072,7 @@ def _attempt_positioned_converted_characters(
         child = candidate["child"]
         return {
             "item_id": item_id,
+            "character_item_id": f"{item_id}:char:{candidate['index']}",
             "character_index": candidate["index"],
             "text": str(layout.text),
             "glyph_id": getattr(layout, "glyph_id", None),
@@ -3239,6 +3246,23 @@ def _attempt_positioned_converted_characters(
 
     for candidate in candidates:
         if candidate["zero_ink_evidence"] is not None:
+            try:
+                material_name = str(
+                    candidate["source"].get("pdf_text_material", "") or ""
+                )
+                zero_ink_material = bpy.data.materials.get(material_name)
+            except (AttributeError, ReferenceError, TypeError):
+                zero_ink_material = None
+            if not _valid_owned_ref(zero_ink_material):
+                failure = AttemptOutcome.failed(
+                    "verified_zero_ink_material_ownership_unavailable",
+                    evidence={"item_id": item_id},
+                )
+                return aggregate_failure(
+                    failure,
+                    candidate["index"],
+                    source_records,
+                )
             cleanup_outcome = AttemptOutcome.delivered(
                 candidate["source"],
                 entity_ids=(candidate["source"].name,),
@@ -3248,11 +3272,13 @@ def _attempt_positioned_converted_characters(
                         candidate["source"], candidate["source_data"]
                     ),
                     _artifact(None, candidate["final_data"]),
+                    _artifact(None, zero_ink_material),
                 ),
                 owned_objects=_owned_objects_for_text_entity(candidate["source"]),
                 owned_datablocks=(
                     candidate["source_data"],
                     candidate["final_data"],
+                    zero_ink_material,
                 ),
             )
             cleanup = _cleanup_attempt(cleanup_outcome, collection)
@@ -3373,15 +3399,40 @@ def _attempt_positioned_converted_characters(
             pass
 
     if not outcomes:
-        failure = AttemptOutcome.failed(
-            "positioned_conversion_has_no_visible_entities",
-            evidence={
-                "item_id": item_id,
-                "character_entities": character_evidence,
-                "zero_ink_character_count": len(character_evidence),
-            },
+        removed = []
+        for character in character_evidence:
+            cleanup = character.get("verification", {}).get("cleanup", {})
+            for removed_id in cleanup.get("removed", ()):
+                value = str(removed_id)
+                if value and value not in removed:
+                    removed.append(value)
+        zero_ink_evidence = {
+            **_font_asset_evidence(text_item),
+            **_proof_identity(item_id, page_number, int(text_item.id)),
+            "proof_kind": "positioned_zero_ink_delivery_v1",
+            "logical_delivery_id": f"{item_id}:zero-ink:{delivered}",
+            "requested_representation": requested,
+            "delivered_representation": delivered,
+            "zero_ink_delivery": True,
+            "zero_ink_identity_verified": True,
+            "no_visible_ink_expected": True,
+            "physical_entity_count": 0,
+            "source_character_count": len(candidates),
+            "character_count": len(candidates),
+            "attempted_character_count": len(candidates),
+            "visible_character_count": 0,
+            "zero_ink_character_count": len(character_evidence),
+            "character_positioning_preserved": True,
+            "character_entities": character_evidence,
+            "cleanup_verified": True,
+            "cleanup": {"status": "complete", "removed": removed},
+            "dependency_graph_updates": 2,
+        }
+        return AttemptOutcome.delivered(
+            None,
+            entity_ids=(),
+            evidence=zero_ink_evidence,
         )
-        return aggregate_failure(failure, records=character_evidence)
 
     first = outcomes[0]
     zero_ink_count = sum(
@@ -3576,7 +3627,13 @@ def build_text(
     )
     delivered_outcome = record.pop("_delivered_outcome", None)
     _append_delivery_record(provenance_opts, record)
-    if obj is None:
+    zero_ink_delivery = (
+        obj is None
+        and record.get("status") == "delivered"
+        and record.get("zero_ink_delivery") is True
+        and record.get("physical_entity_count") == 0
+    )
+    if obj is None and not zero_ink_delivery:
         LOGGER.error(
             "Blender text delivery failed for %s requested=%s attempts=%s",
             item_id,
@@ -3605,14 +3662,20 @@ def build_text(
             obj["pdf_text_fallback_reason"] = reason
         except Exception:
             pass
-    _record_delivered_text_entity(provenance_opts, delivered)
+    if not zero_ink_delivery:
+        _record_delivered_text_entity(provenance_opts, delivered)
     _record_text_provenance(
         provenance_opts,
         page_number=effective_page,
         text_item=text_item,
         requested_text_mode=requested,
         delivered_text_mode=delivered,
-        parent_handle=str(getattr(obj, "name", "") or ""),
+        parent_handle=(
+            str(record.get("logical_delivery_id") or "")
+            if zero_ink_delivery
+            else str(getattr(obj, "name", "") or "")
+        ),
+        zero_ink_delivery=zero_ink_delivery,
     )
     return obj
 
