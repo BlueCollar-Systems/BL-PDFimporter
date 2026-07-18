@@ -41,6 +41,8 @@ _EXACT_GLYPH_DESIGN_BOUNDS_CACHE: Dict[
     Tuple[str, int, int], Optional[Tuple[float, float, float, float]]
 ] = {}
 _EXACT_GLYPH_CUBIC_CONTOURS_CACHE: Dict[Tuple[str, int, int], tuple] = {}
+_EXACT_FONT_BBOX_METRICS_CACHE: Dict[Tuple[str, int], Tuple[int, int, int]] = {}
+_EVALUATED_FONT_LOCAL_INK_CACHE: Dict[tuple, tuple] = {}
 _TEXT_MODES = {"labels", "text", "3d_text", "glyphs", "geometry", "raster"}
 _METRIC_INK_BOUNDS_TOLERANCE_M = 5e-5
 LOGGER = logging.getLogger(__name__)
@@ -398,6 +400,63 @@ def _quad_requires_full_affine(quad) -> bool:
     dot = (x_axis[0] * y_axis[0] + x_axis[1] * y_axis[1]) / (x_len * y_len)
     determinant = x_axis[0] * y_axis[1] - x_axis[1] * y_axis[0]
     return abs(dot) > 1e-6 or determinant < 0.0
+
+
+def _exact_font_bbox_metrics(asset) -> Tuple[int, int, int]:
+    """Return the exact global font bounds Blender uses to normalize FONT size."""
+    try:
+        data = bytes(asset.usable_bytes)
+        digest = str(asset.usable_sha256 or "")
+        expected_upem = int(asset.units_per_em)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise RuntimeError("exact embedded font global bounds are unavailable") from exc
+    if (
+        not data
+        or not digest
+        or sha256(data).hexdigest() != digest
+        or expected_upem <= 0
+    ):
+        raise RuntimeError("exact embedded font global bounds are invalid")
+    cache_key = (digest, expected_upem)
+    if cache_key in _EXACT_FONT_BBOX_METRICS_CACHE:
+        return _EXACT_FONT_BBOX_METRICS_CACHE[cache_key]
+
+    try:
+        from fontTools.ttLib import TTFont, TTLibError
+    except ImportError as exc:
+        raise RuntimeError("fontTools is unavailable for exact font bounds") from exc
+
+    font = None
+    try:
+        font = TTFont(BytesIO(data), lazy=False, recalcTimestamp=False)
+        head = font["head"]
+        units_per_em = int(head.unitsPerEm)
+        y_min = int(head.yMin)
+        y_max = int(head.yMax)
+        if units_per_em != expected_upem:
+            raise RuntimeError(
+                "embedded font metric metadata does not match global design units"
+            )
+        normalization_units = y_max - y_min
+        if normalization_units <= 0:
+            raise RuntimeError("embedded font global bounds have no positive height")
+    except RuntimeError:
+        raise
+    except (
+        AttributeError,
+        KeyError,
+        OSError,
+        TTLibError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        raise RuntimeError("exact embedded font global bounds are unavailable") from exc
+    finally:
+        if font is not None:
+            font.close()
+    result = (y_min, y_max, normalization_units)
+    _EXACT_FONT_BBOX_METRICS_CACHE[cache_key] = result
+    return result
 
 
 def _exact_glyph_design_bounds(asset, glyph_id: int):
@@ -759,6 +818,9 @@ def _positioned_font_axis_metrics_values(
             "descender": 0,
             "advance_units": 0,
             "line_height_units": 0,
+            "host_font_bbox_y_min_units": 0,
+            "host_font_bbox_y_max_units": 0,
+            "host_font_normalization_units": 0,
             "design_unit_scale": 0.0,
             "local_advance": local_advance,
             "local_matrix_horizontal_extent": local_advance,
@@ -766,6 +828,7 @@ def _positioned_font_axis_metrics_values(
             "local_line_height": local_line_height,
             "local_baseline_y": local_baseline_y,
             "source_ink_bounds_design_units": None,
+            "source_ink_contours_design_units": None,
             "metric_source": "source_layout_zero_ink",
             "zero_ink_identity": True,
             "zero_advance_logical_proof": local_advance <= 1e-12,
@@ -793,11 +856,19 @@ def _positioned_font_axis_metrics_values(
     ):
         raise RuntimeError("exact embedded font metrics are invalid for positioned character")
     design_unit_scale = size / float(units_per_em)
+    (
+        host_font_bbox_y_min,
+        host_font_bbox_y_max,
+        host_font_normalization_units,
+    ) = _exact_font_bbox_metrics(asset)
     source_ink_bounds = (
         None if zero_ink_identity else _exact_glyph_design_bounds(asset, glyph_id)
     )
     if source_ink_bounds is None and not zero_ink_identity:
         raise RuntimeError("visible positioned character has no exact source glyph ink bounds")
+    source_ink_contours = (
+        None if zero_ink_identity else _exact_glyph_cubic_contours(asset, glyph_id)
+    )
     local_advance = float(advance_units) * design_unit_scale
     local_matrix_horizontal_extent = local_advance
     matrix_horizontal_extent_source = "embedded_font_glyph_advance"
@@ -826,6 +897,9 @@ def _positioned_font_axis_metrics_values(
         "descender": descender,
         "advance_units": advance_units,
         "line_height_units": line_height_units,
+        "host_font_bbox_y_min_units": host_font_bbox_y_min,
+        "host_font_bbox_y_max_units": host_font_bbox_y_max,
+        "host_font_normalization_units": host_font_normalization_units,
         "design_unit_scale": design_unit_scale,
         "local_advance": local_advance,
         "local_matrix_horizontal_extent": local_matrix_horizontal_extent,
@@ -833,6 +907,7 @@ def _positioned_font_axis_metrics_values(
         "local_line_height": float(line_height_units) * design_unit_scale,
         "local_baseline_y": local_baseline_y,
         "source_ink_bounds_design_units": source_ink_bounds,
+        "source_ink_contours_design_units": source_ink_contours,
         "metric_source": "embedded_font_glyph_metrics",
         "zero_ink_identity": zero_ink_identity,
         "zero_advance_logical_proof": (
@@ -841,10 +916,105 @@ def _positioned_font_axis_metrics_values(
     }
 
 
+def _blender_positioned_font_size_calibration(
+    metric_evidence: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Translate source em size into Blender's native FONT size convention.
+
+    Blender normalizes an imported vector font by its exact global font bounding
+    box, while PDF font size is expressed in units-per-em. Placement metrics
+    remain in the source em and hhea line-height domains.
+    """
+    try:
+        units_per_em = int(metric_evidence["units_per_em"])
+        line_height_units = int(metric_evidence["line_height_units"])
+        host_normalization_units = int(
+            metric_evidence["host_font_normalization_units"]
+        )
+        design_unit_scale = float(metric_evidence["design_unit_scale"])
+        local_line_height = float(metric_evidence["local_line_height"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError("native FONT size calibration evidence is unavailable") from exc
+    if (
+        units_per_em <= 0
+        or line_height_units <= 0
+        or host_normalization_units <= 0
+        or not math.isfinite(design_unit_scale)
+        or design_unit_scale <= 0.0
+        or not math.isfinite(local_line_height)
+        or local_line_height <= 0.0
+    ):
+        raise RuntimeError("native FONT size calibration evidence is invalid")
+    source_em_size_m = design_unit_scale * float(units_per_em)
+    calibration_ratio = float(host_normalization_units) / float(units_per_em)
+    host_font_size_m = source_em_size_m * calibration_ratio
+    values = (source_em_size_m, calibration_ratio, host_font_size_m)
+    if not all(math.isfinite(value) and value > 0.0 for value in values):
+        raise RuntimeError("native FONT size calibration is non-finite")
+    return {
+        "source_em_size_m": source_em_size_m,
+        "host_font_size_m": host_font_size_m,
+        "host_font_size_calibration_ratio": calibration_ratio,
+        "host_font_size_calibration": "blender_font_bbox_normalization_v1",
+    }
+
+
+def _blender_positioned_font_size_calibration_for_item(
+    text_item,
+    *,
+    source_em_size_m: float,
+) -> Optional[Dict[str, Any]]:
+    """Return host-size calibration without constructing glyph contours."""
+    source_text = str(getattr(text_item, "text", "") or "")
+    glyph_id = getattr(text_item, "source_glyph_id", None)
+    zero_ink_identity = classify_text_ink(source_text) == "zero_ink"
+    if zero_ink_identity and (
+        glyph_id is None or not text_is_unicode_whitespace(source_text)
+    ):
+        return None
+    try:
+        asset = text_item.font_asset
+        units_per_em = int(asset.units_per_em)
+        line_height_units = int(asset.ascender) - int(asset.descender)
+        (
+            host_font_bbox_y_min,
+            host_font_bbox_y_max,
+            host_font_normalization_units,
+        ) = _exact_font_bbox_metrics(asset)
+        source_em_size_m = float(source_em_size_m)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise RuntimeError("native FONT calibration source metrics are unavailable") from exc
+    if (
+        units_per_em <= 0
+        or line_height_units <= 0
+        or host_font_normalization_units <= 0
+        or not math.isfinite(source_em_size_m)
+        or source_em_size_m <= 0.0
+    ):
+        raise RuntimeError("native FONT calibration source metrics are invalid")
+    design_unit_scale = source_em_size_m / float(units_per_em)
+    return _blender_positioned_font_size_calibration({
+        "units_per_em": units_per_em,
+        "line_height_units": line_height_units,
+        "host_font_bbox_y_min_units": host_font_bbox_y_min,
+        "host_font_bbox_y_max_units": host_font_bbox_y_max,
+        "host_font_normalization_units": host_font_normalization_units,
+        "design_unit_scale": design_unit_scale,
+        "local_line_height": float(line_height_units) * design_unit_scale,
+    })
+
+
 def _positioned_font_axis_metrics(obj, text_item) -> Dict[str, Any]:
+    source_size = None
+    try:
+        stored_source_size = obj.get("pdf_metric_source_em_size_m")
+        if stored_source_size is not None:
+            source_size = float(stored_source_size)
+    except (AttributeError, TypeError, ValueError):
+        source_size = None
     return _positioned_font_axis_metrics_values(
         text_item,
-        size=float(obj.data.size),
+        size=float(obj.data.size) if source_size is None else source_size,
         baseline_alignment=str(obj.get("pdf_baseline_alignment", "") or ""),
     )
 
@@ -920,6 +1090,10 @@ def _apply_target_quad_affine(
             if positioned_metric_evidence is not None
             else _positioned_font_axis_metrics(obj, text_item)
         )
+        if int(metric_evidence.get("units_per_em", 0) or 0) > 0:
+            metric_evidence.update(
+                _blender_positioned_font_size_calibration(metric_evidence)
+            )
         matrix_values = _metric_character_matrix_values(
             local_advance=metric_evidence.get(
                 "local_matrix_horizontal_extent",
@@ -1531,11 +1705,21 @@ def _create_font_candidate(
             if positioned_character
             else float(_calibrated_text_size_mm(text_item))
         )
-        data.size = max(requested_size_mm * MM_TO_M, 0.0001)
+        source_text_size_m = requested_size_mm * MM_TO_M
+        if positioned_character and (
+            not math.isfinite(source_text_size_m) or source_text_size_m <= 0.0
+        ):
+            raise RuntimeError("positioned source FONT size is invalid")
+        data.size = (
+            source_text_size_m
+            if positioned_character
+            else max(source_text_size_m, 0.0001)
+        )
         data.font = font
         data.align_x = "LEFT"
         sealed_baseline_alignment = baseline_alignment
         baseline_compensation_m = 0.0
+        positioned_size_calibration = None
         if positioned_character:
             if sealed_baseline_alignment not in {"BOTTOM_BASELINE", "BOTTOM"}:
                 raise RuntimeError(
@@ -1551,6 +1735,28 @@ def _create_font_candidate(
                 raise RuntimeError(
                     "positioned FONT baseline alignment changed after sealing"
                 )
+            positioned_size_calibration = (
+                _blender_positioned_font_size_calibration_for_item(
+                    text_item,
+                    source_em_size_m=source_text_size_m,
+                )
+            )
+            if positioned_size_calibration is not None:
+                data.size = float(
+                    positioned_size_calibration["host_font_size_m"]
+                )
+                if not math.isclose(
+                    float(data.size),
+                    float(positioned_size_calibration["host_font_size_m"]),
+                    rel_tol=1e-6,
+                    abs_tol=1e-10,
+                ):
+                    raise RuntimeError(
+                        "Blender native FONT size calibration did not round-trip: "
+                        f"actual={float(data.size):.17g}, "
+                        "expected="
+                        f"{float(positioned_size_calibration['host_font_size_m']):.17g}"
+                    )
         else:
             sealed_baseline_alignment = "BOTTOM_BASELINE"
             try:
@@ -1571,7 +1777,11 @@ def _create_font_candidate(
                     "BOTTOM_BASELINE unavailable and source baseline descent is not "
                     "available for measured compensation"
                 )
-        data.extrude = _text_extrusion_depth(data.size) if delivered == "3d_text" else 0.0
+        data.extrude = (
+            _text_extrusion_depth(source_text_size_m)
+            if delivered == "3d_text"
+            else 0.0
+        )
         data.resolution_u = max(int(getattr(data, "resolution_u", 12) or 12), 24)
         obj = bpy.data.objects.new(name, data)
         _set_object_metadata(
@@ -1583,6 +1793,11 @@ def _create_font_candidate(
         )
         obj["pdf_baseline_alignment"] = sealed_baseline_alignment
         obj["pdf_baseline_compensation_m"] = baseline_compensation_m
+        if positioned_character:
+            obj["pdf_metric_source_em_size_m"] = source_text_size_m
+            if positioned_size_calibration is not None:
+                for key, value in positioned_size_calibration.items():
+                    obj[f"pdf_metric_{key}"] = value
         x, y = text_item.insertion
         angle_rad = math.radians(float(getattr(text_item, "rotation", 0.0) or 0.0))
         obj.location = (
@@ -1663,6 +1878,75 @@ def _create_font_candidate(
         )
 
 
+def _evaluated_font_local_ink_cache_key(obj, evaluated) -> Optional[tuple]:
+    """Fingerprint every importer-controlled state that can change FONT ink."""
+    try:
+        if tuple(getattr(obj, "modifiers", ()) or ()):
+            return None
+        data = evaluated.data
+        if getattr(data, "follow_curve", None) is not None:
+            return None
+        body_format = tuple(
+            (
+                bool(getattr(item, "use_bold", False)),
+                bool(getattr(item, "use_italic", False)),
+                bool(getattr(item, "use_underline", False)),
+                bool(getattr(item, "use_small_caps", False)),
+                float(getattr(item, "kerning", 0.0) or 0.0),
+            )
+            for item in tuple(getattr(data, "body_format", ()) or ())
+        )
+        text_boxes = tuple(
+            (
+                float(getattr(box, "x", 0.0) or 0.0),
+                float(getattr(box, "y", 0.0) or 0.0),
+                float(getattr(box, "width", 0.0) or 0.0),
+                float(getattr(box, "height", 0.0) or 0.0),
+            )
+            for box in tuple(getattr(data, "text_boxes", ()) or ())
+        )
+        scalar_state = tuple(
+            float(getattr(data, name, 0.0) or 0.0)
+            for name in (
+                "size",
+                "extrude",
+                "offset",
+                "bevel_depth",
+                "shear",
+                "space_character",
+                "space_word",
+                "space_line",
+                "offset_x",
+            )
+        )
+        integer_state = tuple(
+            int(getattr(data, name, 0) or 0)
+            for name in (
+                "resolution_u",
+                "render_resolution_u",
+                "resolution_v",
+                "bevel_resolution",
+            )
+        )
+        return (
+            tuple(getattr(getattr(bpy, "app", None), "version", ()) or ()),
+            str(obj.get("pdf_exact_font_sha256", "") or ""),
+            int(obj.get("pdf_metric_glyph_id", -1)),
+            str(getattr(data, "body", "") or ""),
+            str(getattr(data, "align_x", "") or ""),
+            str(getattr(data, "align_y", "") or ""),
+            str(getattr(data, "dimensions", "") or ""),
+            str(getattr(data, "fill_mode", "") or ""),
+            str(getattr(data, "overflow", "") or ""),
+            scalar_state,
+            integer_state,
+            body_format,
+            text_boxes,
+        )
+    except (AttributeError, ReferenceError, TypeError, ValueError):
+        return None
+
+
 def _evaluated_world_ink_bounds(
     obj,
     evaluated,
@@ -1670,7 +1954,7 @@ def _evaluated_world_ink_bounds(
     depsgraph,
     vector_factory,
 ) -> tuple[tuple[float, float, float, float] | None, Dict[str, Any]]:
-    """Measure physical ink without certifying a CURVE's Bezier control hull."""
+    """Measure physical ink without certifying host/control-hull bound boxes."""
     try:
         object_type = str(getattr(obj, "type", "") or "")
         exact_contour = (
@@ -1678,12 +1962,18 @@ def _evaluated_world_ink_bounds(
             and str(obj.get("pdf_exact_contour_source", "") or "")
             == "embedded_font_glyph_outline"
         )
+        exact_packed_font = (
+            object_type in {"FONT", "CURVE", "MESH"}
+            and bool(str(obj.get("pdf_exact_font_sha256", "") or ""))
+        )
     except (AttributeError, ReferenceError, TypeError):
         object_type = ""
         exact_contour = False
+        exact_packed_font = False
 
     evidence: Dict[str, Any] = {}
-    if exact_contour and object_type == "MESH":
+    exact_renderable = exact_contour or exact_packed_font
+    if exact_renderable and object_type == "MESH":
         evidence["evaluated_ink_bounds_source"] = "evaluated_mesh_vertices"
         try:
             vertices = tuple(getattr(evaluated.data, "vertices", ()) or ())
@@ -1705,37 +1995,83 @@ def _evaluated_world_ink_bounds(
         except (AttributeError, IndexError, TypeError, ValueError):
             return None, evidence
 
-    if exact_contour and object_type == "CURVE":
+    if exact_renderable and object_type in {"FONT", "CURVE"}:
         render_source = f"evaluated_{object_type.lower()}_render_mesh"
         cleared_key = f"{render_source}_cleared"
         error_key = f"{render_source}_error"
         cleanup_error_key = f"{render_source}_cleanup_error"
         evidence["evaluated_ink_bounds_source"] = render_source
         evidence[cleared_key] = False
-        to_mesh = getattr(evaluated, "to_mesh", None)
-        clear_mesh = getattr(evaluated, "to_mesh_clear", None)
-        if not callable(to_mesh) or not callable(clear_mesh):
-            evidence[error_key] = (
-                "temporary render-mesh capability unavailable"
-            )
-            return None, evidence
-
-        bounds = None
-        measurement_error = None
-        try:
-            render_mesh = to_mesh(
-                preserve_all_data_layers=False,
-                depsgraph=depsgraph,
-            )
-            vertices = tuple(getattr(render_mesh, "vertices", ()) or ())
-            if not vertices:
-                raise ValueError("evaluated render mesh has no vertices")
-            world_points = tuple(
-                matrix
-                @ vector_factory(
-                    tuple(float(value) for value in tuple(vertex.co)[:3])
+        cache_key = (
+            _evaluated_font_local_ink_cache_key(obj, evaluated)
+            if object_type == "FONT"
+            else None
+        )
+        local_points = (
+            _EVALUATED_FONT_LOCAL_INK_CACHE.get(cache_key)
+            if cache_key is not None
+            else None
+        )
+        if object_type == "FONT":
+            evidence[f"{render_source}_cache_hit"] = local_points is not None
+        if local_points is not None:
+            evidence[cleared_key] = True
+        else:
+            to_mesh = getattr(evaluated, "to_mesh", None)
+            clear_mesh = getattr(evaluated, "to_mesh_clear", None)
+            if not callable(to_mesh) or not callable(clear_mesh):
+                evidence[error_key] = (
+                    "temporary render-mesh capability unavailable"
                 )
-                for vertex in vertices
+                return None, evidence
+
+            measurement_error = None
+            try:
+                render_mesh = to_mesh(
+                    preserve_all_data_layers=False,
+                    depsgraph=depsgraph,
+                )
+                vertices = tuple(getattr(render_mesh, "vertices", ()) or ())
+                if not vertices:
+                    raise ValueError("evaluated render mesh has no vertices")
+                local_points = tuple(
+                    tuple(float(value) for value in tuple(vertex.co)[:3])
+                    for vertex in vertices
+                )
+                if not all(
+                    len(point) == 3
+                    and all(math.isfinite(value) for value in point)
+                    for point in local_points
+                ):
+                    raise ValueError("evaluated render-mesh vertices are non-finite")
+            except Exception as exc:
+                measurement_error = exc
+                local_points = None
+            finally:
+                try:
+                    clear_mesh()
+                    evidence[cleared_key] = True
+                except Exception as exc:
+                    local_points = None
+                    evidence[cleanup_error_key] = {
+                        "exception_type": type(exc).__name__,
+                        "detail": str(exc),
+                    }
+            if measurement_error is not None:
+                evidence[error_key] = {
+                    "exception_type": type(measurement_error).__name__,
+                    "detail": str(measurement_error),
+                }
+            if local_points is not None and cache_key is not None:
+                if len(_EVALUATED_FONT_LOCAL_INK_CACHE) >= 4096:
+                    _EVALUATED_FONT_LOCAL_INK_CACHE.clear()
+                _EVALUATED_FONT_LOCAL_INK_CACHE[cache_key] = local_points
+
+        if local_points is None:
+            return None, evidence
+        try:
+            world_points = tuple(
+                matrix @ vector_factory(point) for point in local_points
             )
             xs = tuple(float(point[0]) for point in world_points)
             ys = tuple(float(point[1]) for point in world_points)
@@ -1743,23 +2079,11 @@ def _evaluated_world_ink_bounds(
             if not all(math.isfinite(value) for value in bounds):
                 raise ValueError("evaluated render-mesh bounds are non-finite")
         except Exception as exc:
-            measurement_error = exc
-            bounds = None
-        finally:
-            try:
-                clear_mesh()
-                evidence[cleared_key] = True
-            except Exception as exc:
-                bounds = None
-                evidence[cleanup_error_key] = {
-                    "exception_type": type(exc).__name__,
-                    "detail": str(exc),
-                }
-        if measurement_error is not None:
             evidence[error_key] = {
-                "exception_type": type(measurement_error).__name__,
-                "detail": str(measurement_error),
+                "exception_type": type(exc).__name__,
+                "detail": str(exc),
             }
+            return None, evidence
         return bounds, evidence
 
     evidence["evaluated_ink_bounds_source"] = "evaluated_object_bound_box"
@@ -1780,6 +2104,102 @@ def _evaluated_world_ink_bounds(
         return bounds, evidence
     except (AttributeError, IndexError, TypeError, ValueError):
         return None, evidence
+
+
+def _verify_native_font_size_calibration(
+    obj,
+    text_item,
+    *,
+    zero_ink_identity: bool,
+) -> tuple[list[str], Dict[str, Any]]:
+    failures: list[str] = []
+    evidence: Dict[str, Any] = {"native_font_size_calibration_required": False}
+    try:
+        calibration_required = (
+            not zero_ink_identity
+            and str(getattr(obj, "type", "") or "") == "FONT"
+            and bool(str(obj.get("pdf_exact_font_sha256", "") or ""))
+        )
+    except (AttributeError, ReferenceError, TypeError):
+        calibration_required = False
+    evidence["native_font_size_calibration_required"] = calibration_required
+    if not calibration_required:
+        return failures, evidence
+
+    try:
+        source_em_size_m = float(text_item.font_size) * MM_TO_M
+        baseline_alignment = str(obj.get("pdf_baseline_alignment", "") or "")
+        source_metrics = _positioned_font_axis_metrics_values(
+            text_item,
+            size=source_em_size_m,
+            baseline_alignment=baseline_alignment,
+        )
+        expected = _blender_positioned_font_size_calibration(source_metrics)
+        actual_host_size_m = float(obj.data.size)
+        stored_source_em_size_m = float(obj.get("pdf_metric_source_em_size_m"))
+        stored_host_size_m = float(obj.get("pdf_metric_host_font_size_m"))
+        stored_ratio = float(obj.get("pdf_metric_host_font_size_calibration_ratio"))
+        stored_normalization_units = int(
+            obj.get("pdf_metric_host_font_normalization_units")
+        )
+        stored_bbox_y_min = int(obj.get("pdf_metric_host_font_bbox_y_min_units"))
+        stored_bbox_y_max = int(obj.get("pdf_metric_host_font_bbox_y_max_units"))
+        stored_method = str(
+            obj.get("pdf_metric_host_font_size_calibration", "") or ""
+        )
+    except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+        evidence["native_font_size_calibration_verified"] = False
+        failures.append("native_font_size_calibration_unverifiable")
+        return failures, evidence
+
+    expected_host_size_m = float(expected["host_font_size_m"])
+    expected_source_em_size_m = float(expected["source_em_size_m"])
+    expected_ratio = float(expected["host_font_size_calibration_ratio"])
+    expected_method = str(expected["host_font_size_calibration"])
+    expected_normalization_units = int(
+        source_metrics["host_font_normalization_units"]
+    )
+    expected_bbox_y_min = int(source_metrics["host_font_bbox_y_min_units"])
+    expected_bbox_y_max = int(source_metrics["host_font_bbox_y_max_units"])
+    evidence.update(
+        actual_host_font_size_m=actual_host_size_m,
+        expected_host_font_size_m=expected_host_size_m,
+        source_em_size_m=expected_source_em_size_m,
+        host_font_size_calibration_ratio=expected_ratio,
+        host_font_size_calibration=expected_method,
+        host_font_normalization_units=expected_normalization_units,
+        host_font_bbox_y_min_units=expected_bbox_y_min,
+        host_font_bbox_y_max_units=expected_bbox_y_max,
+    )
+    finite_positive = (
+        actual_host_size_m,
+        stored_source_em_size_m,
+        stored_host_size_m,
+        stored_ratio,
+        expected_host_size_m,
+        expected_source_em_size_m,
+        expected_ratio,
+    )
+    matches = all(
+        math.isfinite(value) and value > 0.0 for value in finite_positive
+    ) and all(
+        math.isclose(actual, wanted, rel_tol=1e-6, abs_tol=1e-10)
+        for actual, wanted in (
+            (actual_host_size_m, expected_host_size_m),
+            (stored_source_em_size_m, expected_source_em_size_m),
+            (stored_host_size_m, expected_host_size_m),
+            (stored_ratio, expected_ratio),
+        )
+    ) and (
+        stored_method == expected_method
+        and stored_normalization_units == expected_normalization_units
+        and stored_bbox_y_min == expected_bbox_y_min
+        and stored_bbox_y_max == expected_bbox_y_max
+    )
+    evidence["native_font_size_calibration_verified"] = matches
+    if not matches:
+        failures.append("native_font_size_calibration_mismatch")
+    return failures, evidence
 
 
 def _verify_metric_character_transform(obj, text_item) -> tuple[list[str], Dict[str, Any]]:
@@ -1837,6 +2257,15 @@ def _verify_metric_character_transform(obj, text_item) -> tuple[list[str], Dict[
         evaluated_matrix = [float(value) for row in matrix for value in row]
         intended_matrix = [float(value) for value in obj.get("pdf_affine_matrix", [])]
         zero_ink_identity = bool(obj.get("pdf_metric_zero_ink_identity", False))
+        calibration_failures, calibration_evidence = (
+            _verify_native_font_size_calibration(
+                obj,
+                text_item,
+                zero_ink_identity=zero_ink_identity,
+            )
+        )
+        failures.extend(calibration_failures)
+        evidence.update(calibration_evidence)
         zero_advance_logical_proof = bool(
             obj.get("pdf_metric_zero_advance_logical_proof", False)
         )
@@ -2362,7 +2791,14 @@ def _copy_object_transform(source, target) -> None:
         "pdf_metric_descender",
         "pdf_metric_advance_units",
         "pdf_metric_line_height_units",
+        "pdf_metric_host_font_bbox_y_min_units",
+        "pdf_metric_host_font_bbox_y_max_units",
+        "pdf_metric_host_font_normalization_units",
         "pdf_metric_design_unit_scale",
+        "pdf_metric_source_em_size_m",
+        "pdf_metric_host_font_size_m",
+        "pdf_metric_host_font_size_calibration_ratio",
+        "pdf_metric_host_font_size_calibration",
         "pdf_metric_local_advance",
         "pdf_metric_local_matrix_horizontal_extent",
         "pdf_metric_matrix_horizontal_extent_source",

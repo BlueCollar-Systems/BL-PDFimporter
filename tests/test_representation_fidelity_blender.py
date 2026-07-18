@@ -459,8 +459,15 @@ class _FakeBpy:
         )
 
 
+_DEFAULT_TEST_FONT_BYTES = None
+
+
 def _font_asset():
-    font_bytes = b"exact-pdf-font"
+    global _DEFAULT_TEST_FONT_BYTES
+    if _DEFAULT_TEST_FONT_BYTES is None:
+        metric_asset = _metric_font_asset()
+        _DEFAULT_TEST_FONT_BYTES = bytes(metric_asset.usable_bytes)
+    font_bytes = _DEFAULT_TEST_FONT_BYTES
     return types.SimpleNamespace(
         asset_id="sha256:abcdef",
         usable_sha256=sha256(font_bytes).hexdigest(),
@@ -472,8 +479,8 @@ def _font_asset():
         page_number=2,
         span_font_name="ExactPDF",
         units_per_em=1000,
-        ascender=800,
-        descender=-200,
+        ascender=1200,
+        descender=-300,
         glyph_advances=tuple(500 for _index in range(128)),
     )
 
@@ -835,6 +842,8 @@ def _install(monkeypatch, **kwargs):
     fake = _FakeBpy(**kwargs)
     monkeypatch.setattr(bl_text_builder, "bpy", fake)
     bl_text_builder._FONT_CACHE.clear()
+    bl_text_builder._EXACT_FONT_BBOX_METRICS_CACHE.clear()
+    bl_text_builder._EVALUATED_FONT_LOCAL_INK_CACHE.clear()
     return fake, _Collection()
 
 
@@ -2947,6 +2956,119 @@ def test_positioned_font_axis_metrics_use_upem_for_horizontal_glyph_domain():
     )
 
 
+def test_blender_native_font_size_calibration_uses_exact_font_bbox():
+    layout = _character_layout()[0]
+    layout.glyph_id = 1
+    parent = _item()
+    parent.font_asset = _metric_font_asset()
+    child = bl_text_builder._character_text_item(parent, layout)
+
+    metrics = bl_text_builder._positioned_font_axis_metrics_values(
+        child,
+        size=0.006,
+        baseline_alignment="BOTTOM_BASELINE",
+    )
+    calibration = bl_text_builder._blender_positioned_font_size_calibration(metrics)
+
+    assert calibration == {
+        "source_em_size_m": pytest.approx(0.006),
+        "host_font_size_m": pytest.approx(0.0054),
+        "host_font_size_calibration_ratio": pytest.approx(0.9),
+        "host_font_size_calibration": "blender_font_bbox_normalization_v1",
+    }
+
+
+@pytest.mark.parametrize(
+    ("delivered", "expected_extrusion_m"),
+    (("text", 0.0), ("3d_text", 0.00072)),
+)
+def test_positioned_native_font_creation_separates_source_metrics_from_host_size(
+    monkeypatch,
+    delivered,
+    expected_extrusion_m,
+):
+    _install(monkeypatch)
+    _install_mathutils(monkeypatch)
+    layout = _character_layout()[0]
+    layout.glyph_id = 1
+    parent = _item()
+    parent.font_asset = _metric_font_asset()
+    child = bl_text_builder._character_text_item(parent, layout)
+    packed_font = types.SimpleNamespace(name="PackedMetricFixture")
+    monkeypatch.setattr(
+        bl_text_builder,
+        "_load_exact_font",
+        lambda *_args, **_kwargs: (packed_font, None),
+    )
+
+    obj, data, outcome = bl_text_builder._create_font_candidate(
+        child,
+        _Collection(),
+        page_number=2,
+        requested=delivered,
+        delivered=delivered,
+        item_id="page:2:text:41:char:0",
+        visual_style="source",
+        z_offset_m=0.0,
+        baseline_alignment="BOTTOM_BASELINE",
+    )
+
+    assert outcome is None
+    assert obj is not None
+    assert obj.type == "FONT"
+    assert data.type == "FONT"
+    assert data.size == pytest.approx(0.0054)
+    assert data.extrude == pytest.approx(expected_extrusion_m)
+    assert obj.get("pdf_metric_source_em_size_m") == pytest.approx(0.006)
+    assert obj.get("pdf_metric_host_font_size_m") == pytest.approx(0.0054)
+    assert obj.get("pdf_metric_host_font_size_calibration_ratio") == pytest.approx(0.9)
+    assert obj.get("pdf_metric_host_font_size_calibration") == (
+        "blender_font_bbox_normalization_v1"
+    )
+    assert obj.get("pdf_metric_host_font_normalization_units") == 900
+    assert obj.get("pdf_metric_host_font_bbox_y_min_units") == -200
+    assert obj.get("pdf_metric_host_font_bbox_y_max_units") == 700
+    assert obj.get("pdf_metric_design_unit_scale") == pytest.approx(0.006 / 1000.0)
+    assert obj.get("pdf_metric_local_line_height") == pytest.approx(0.009)
+
+
+def test_positioned_zero_ink_native_font_bypasses_physical_size_calibration(
+    monkeypatch,
+):
+    _install(monkeypatch)
+    _install_mathutils(monkeypatch)
+    layout = _whitespace_only_character_layout()[0]
+    parent = _item()
+    parent.font_asset = _metric_font_asset()
+    child = bl_text_builder._character_text_item(parent, layout)
+    packed_font = types.SimpleNamespace(name="PackedMetricFixture")
+    monkeypatch.setattr(
+        bl_text_builder,
+        "_load_exact_font",
+        lambda *_args, **_kwargs: (packed_font, None),
+    )
+
+    obj, data, outcome = bl_text_builder._create_font_candidate(
+        child,
+        _Collection(),
+        page_number=2,
+        requested="text",
+        delivered="text",
+        item_id="page:2:text:41:char:space",
+        visual_style="source",
+        z_offset_m=0.0,
+        baseline_alignment="BOTTOM_BASELINE",
+    )
+
+    assert outcome is None
+    assert obj is not None
+    assert obj.type == "FONT"
+    assert data.size == pytest.approx(0.006)
+    assert obj.get("pdf_metric_zero_ink_identity") is True
+    assert obj.get("pdf_metric_units_per_em") == 0
+    assert obj.get("pdf_metric_host_font_size_calibration") is None
+
+
 def test_exact_glyph_design_bounds_rejects_cached_upem_mismatch(monkeypatch):
     monkeypatch.setattr(bl_text_builder, "_EXACT_GLYPH_DESIGN_BOUNDS_CACHE", {})
     asset = _metric_font_asset()
@@ -2962,6 +3084,21 @@ def test_exact_glyph_design_bounds_rejects_cached_upem_mismatch(monkeypatch):
         match="embedded font metric metadata does not match glyph design units",
     ):
         bl_text_builder._exact_glyph_design_bounds(mismatched_asset, 1)
+
+
+def test_exact_font_bbox_metrics_rejects_cached_upem_mismatch(monkeypatch):
+    monkeypatch.setattr(bl_text_builder, "_EXACT_FONT_BBOX_METRICS_CACHE", {})
+    asset = _metric_font_asset()
+
+    assert bl_text_builder._exact_font_bbox_metrics(asset) == (-200, 700, 900)
+    mismatched_asset = types.SimpleNamespace(**vars(asset))
+    mismatched_asset.units_per_em = 2048
+
+    with pytest.raises(
+        RuntimeError,
+        match="metric metadata does not match global design units",
+    ):
+        bl_text_builder._exact_font_bbox_metrics(mismatched_asset)
 
 
 def test_positioned_metric_affine_stores_exact_source_glyph_world_ink_bounds(monkeypatch):
@@ -3076,6 +3213,163 @@ def test_positioned_metric_verification_rejects_evaluated_ink_bounds_outside_exa
     assert evidence["evaluated_affine_matrix"] == pytest.approx(
         [value for row in identity for value in row]
     )
+
+
+def _native_font_metric_verification_fixture(*, data_size=0.0054, rendered_xmax=0.5):
+    identity = _AffineMatrix.Identity(4)
+    layout = _character_layout()[0]
+    layout.glyph_id = 1
+    parent = _item()
+    parent.font_asset = _metric_font_asset()
+    child = bl_text_builder._character_text_item(parent, layout)
+    child.insertion = (0.0, 0.0)
+    child.target_quad_model = (
+        (0.0, 1000.0),
+        (1000.0, 1000.0),
+        (1000.0, 0.0),
+        (0.0, 0.0),
+    )
+    data = _FontData("ExactNativeFont")
+    data.size = data_size
+    obj = _Object("ExactNativeFont", data)
+    obj.matrix_world = identity
+    obj._base_dimensions = (0.5, 1.0, 0.0)
+    obj.update({
+        "pdf_exact_font_sha256": "packed-exact-font",
+        "pdf_metric_units_per_em": 1000,
+        "pdf_metric_line_height_units": 1500,
+        "pdf_metric_host_font_bbox_y_min_units": -200,
+        "pdf_metric_host_font_bbox_y_max_units": 700,
+        "pdf_metric_host_font_normalization_units": 900,
+        "pdf_metric_source_em_size_m": 0.006,
+        "pdf_metric_host_font_size_m": 0.0054,
+        "pdf_metric_host_font_size_calibration_ratio": 0.9,
+        "pdf_metric_host_font_size_calibration": (
+            "blender_font_bbox_normalization_v1"
+        ),
+        "pdf_metric_local_advance": 1.0,
+        "pdf_metric_local_line_height": 1.0,
+        "pdf_metric_local_baseline_y": 0.0,
+        "pdf_metric_zero_ink_identity": False,
+        "pdf_metric_expected_world_ink_bounds_m": [0.0, 0.0, 0.5, 1.0],
+        "pdf_affine_matrix": [value for row in identity for value in row],
+    })
+    evaluated = _Object("ExactNativeFontEvaluated", data)
+    evaluated.matrix_world = identity
+    evaluated._base_dimensions = (0.5, 1.0, 0.0)
+    # A FONT bound box is not accepted as physical ink evidence.
+    evaluated.bound_box = (
+        (-0.1, -0.2, 0.0),
+        (0.75, -0.2, 0.0),
+        (0.75, 1.3, 0.0),
+        (-0.1, 1.3, 0.0),
+        (-0.1, -0.2, 0.0),
+        (0.75, -0.2, 0.0),
+        (0.75, 1.3, 0.0),
+        (-0.1, 1.3, 0.0),
+    )
+    rendered_mesh = types.SimpleNamespace(vertices=[
+        types.SimpleNamespace(co=(0.0, 0.0, 0.0)),
+        types.SimpleNamespace(co=(rendered_xmax, 0.0, 0.0)),
+        types.SimpleNamespace(co=(rendered_xmax, 1.0, 0.0)),
+        types.SimpleNamespace(co=(0.0, 1.0, 0.0)),
+    ])
+    cleared = []
+    evaluated.to_mesh = lambda *args, **kwargs: rendered_mesh
+    evaluated.to_mesh_clear = lambda: cleared.append(True)
+    obj.evaluated_get = lambda _depsgraph: evaluated
+    return obj, child, cleared
+
+
+def test_exact_native_font_verification_uses_rendered_ink_and_preserves_font(
+    monkeypatch,
+):
+    _install(monkeypatch)
+    _install_mathutils(monkeypatch)
+    obj, child, cleared = _native_font_metric_verification_fixture()
+
+    failures, evidence = bl_text_builder._verify_metric_character_transform(obj, child)
+
+    assert failures == []
+    assert evidence["evaluated_ink_bounds_verified"] is True
+    assert evidence["actual_world_ink_bounds_m"] == pytest.approx(
+        (0.0, 0.0, 0.5, 1.0)
+    )
+    assert evidence["evaluated_ink_bounds_source"] == "evaluated_font_render_mesh"
+    assert evidence["evaluated_font_render_mesh_cleared"] is True
+    assert cleared == [True]
+    assert obj.type == "FONT"
+
+
+def test_exact_native_font_verification_reuses_identical_render_proof(monkeypatch):
+    _install(monkeypatch)
+    _install_mathutils(monkeypatch)
+    first, first_child, first_cleared = _native_font_metric_verification_fixture()
+
+    first_failures, first_evidence = (
+        bl_text_builder._verify_metric_character_transform(first, first_child)
+    )
+
+    assert first_failures == []
+    assert first_evidence["evaluated_font_render_mesh_cache_hit"] is False
+    assert first_cleared == [True]
+
+    second, second_child, second_cleared = _native_font_metric_verification_fixture()
+    second_evaluated = second.evaluated_get(object())
+    unexpected_mesh_calls = []
+
+    def reject_redundant_render_mesh(*_args, **_kwargs):
+        unexpected_mesh_calls.append(True)
+        raise AssertionError("identical native FONT render proof was recomputed")
+
+    second_evaluated.to_mesh = reject_redundant_render_mesh
+
+    second_failures, second_evidence = (
+        bl_text_builder._verify_metric_character_transform(second, second_child)
+    )
+
+    assert second_failures == []
+    assert second_evidence["evaluated_font_render_mesh_cache_hit"] is True
+    assert second_evidence["evaluated_font_render_mesh_cleared"] is True
+    assert unexpected_mesh_calls == []
+    assert second_cleared == []
+    assert second.type == "FONT"
+
+
+def test_exact_native_font_verification_rejects_widened_rendered_ink(monkeypatch):
+    _install(monkeypatch)
+    _install_mathutils(monkeypatch)
+    obj, child, cleared = _native_font_metric_verification_fixture(
+        rendered_xmax=0.75
+    )
+
+    failures, evidence = bl_text_builder._verify_metric_character_transform(obj, child)
+
+    assert failures == ["evaluated_ink_bounds_outside_exact_source_glyph_bounds"]
+    assert evidence["actual_world_ink_bounds_m"] == pytest.approx(
+        (0.0, 0.0, 0.75, 1.0)
+    )
+    assert evidence["evaluated_ink_bounds_source"] == "evaluated_font_render_mesh"
+    assert evidence["evaluated_font_render_mesh_cleared"] is True
+    assert cleared == [True]
+    assert obj.type == "FONT"
+
+
+def test_exact_native_font_verification_rejects_host_size_calibration_mismatch(
+    monkeypatch,
+):
+    _install(monkeypatch)
+    _install_mathutils(monkeypatch)
+    obj, child, cleared = _native_font_metric_verification_fixture(data_size=0.012)
+
+    failures, evidence = bl_text_builder._verify_metric_character_transform(obj, child)
+
+    assert failures == ["native_font_size_calibration_mismatch"]
+    assert evidence["native_font_size_calibration_verified"] is False
+    assert evidence["actual_host_font_size_m"] == pytest.approx(0.012)
+    assert evidence["expected_host_font_size_m"] == pytest.approx(0.0054)
+    assert cleared == [True]
+    assert obj.type == "FONT"
 
 
 def test_exact_direct_curve_verification_uses_rendered_ink_not_bezier_control_hull(

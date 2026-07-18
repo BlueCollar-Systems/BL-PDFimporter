@@ -83,7 +83,7 @@ def _assert_points_close(actual, expected, tolerance: float = 1.0e-6) -> None:
     ), (list(actual), list(expected))
 
 
-def _assert_metric_entity(obj) -> None:
+def _assert_metric_entity(obj, *, verify_rendered_ink: bool = False) -> None:
     """Prove the evaluated host transform still honors the PDF font axes."""
     assert bool(obj.get("pdf_metric_affine_applied", False)), obj.name
     evaluated = obj.evaluated_get(bpy.context.evaluated_depsgraph_get())
@@ -121,6 +121,59 @@ def _assert_metric_entity(obj) -> None:
     if carrier_name:
         assert obj.parent is not None
         assert obj.parent.name == carrier_name
+
+    zero_ink = bool(obj.get("pdf_metric_zero_ink_identity", False))
+    if obj.type != "FONT" or zero_ink:
+        return
+    source_em_size = float(obj["pdf_metric_source_em_size_m"])
+    expected_host_size = float(obj["pdf_metric_host_font_size_m"])
+    calibration_ratio = float(obj["pdf_metric_host_font_size_calibration_ratio"])
+    units_per_em = int(obj["pdf_metric_units_per_em"])
+    bbox_y_min = int(obj["pdf_metric_host_font_bbox_y_min_units"])
+    bbox_y_max = int(obj["pdf_metric_host_font_bbox_y_max_units"])
+    normalization_units = int(obj["pdf_metric_host_font_normalization_units"])
+    assert str(obj["pdf_metric_host_font_size_calibration"]) == (
+        "blender_font_bbox_normalization_v1"
+    )
+    assert units_per_em > 0 and normalization_units == bbox_y_max - bbox_y_min > 0
+    derived_ratio = float(normalization_units) / float(units_per_em)
+    derived_host_size = source_em_size * derived_ratio
+    _assert_points_close(
+        [calibration_ratio, expected_host_size, float(obj.data.size)],
+        [derived_ratio, derived_host_size, derived_host_size],
+        tolerance=max(1.0e-10, derived_host_size * 1.0e-6),
+    )
+
+    if not verify_rendered_ink:
+        return
+    expected_ink_bounds = tuple(
+        float(value) for value in obj["pdf_metric_expected_world_ink_bounds_m"]
+    )
+    assert len(expected_ink_bounds) == 4
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    evaluated = obj.evaluated_get(depsgraph)
+    render_mesh = None
+    try:
+        render_mesh = evaluated.to_mesh(
+            preserve_all_data_layers=False,
+            depsgraph=depsgraph,
+        )
+        vertices = tuple(render_mesh.vertices)
+        assert vertices
+        points = tuple(evaluated.matrix_world @ vertex.co for vertex in vertices)
+        actual_ink_bounds = (
+            min(float(point[0]) for point in points),
+            min(float(point[1]) for point in points),
+            max(float(point[0]) for point in points),
+            max(float(point[1]) for point in points),
+        )
+    finally:
+        evaluated.to_mesh_clear()
+    _assert_points_close(
+        actual_ink_bounds,
+        expected_ink_bounds,
+        tolerance=5.0e-5,
+    )
 
 
 def _assert_character_delivery(record, expected_type: str, source_text: str):
@@ -273,6 +326,7 @@ def main() -> None:
             "attempt_count": len(record["attempts"]),
             "dependency_graph_updates": dependency_graph_updates,
         }
+        print(f"BC_BL_ACCEPTANCE_STAGE=mode:{mode}", flush=True)
         _remove_collection(collection)
 
     label_collection = _new_collection("Acceptance_labels")
@@ -297,6 +351,7 @@ def main() -> None:
         "final": "text",
         "reason": label_record["attempts"][0]["reason"],
     }
+    print("BC_BL_ACCEPTANCE_STAGE=mode:labels", flush=True)
     _remove_collection(label_collection)
 
     fallback_collection = _new_collection("Acceptance_missing_font")
@@ -354,6 +409,7 @@ def main() -> None:
 
     full_dir = Path(tempfile.mkdtemp(prefix="bc_bl_acceptance_full_"))
     report_path = full_dir / "welding-import-report.json"
+    print("BC_BL_ACCEPTANCE_STAGE=full_import:start", flush=True)
     full_stats = bl_import_engine.import_pdf(
         str(welding_path),
         config={
@@ -369,6 +425,7 @@ def main() -> None:
         },
     )
     assert full_stats["text_source_spans"] == len(page_data.text_items)
+    print("BC_BL_ACCEPTANCE_STAGE=full_import:complete", flush=True)
     assert full_stats["text_delivery_source_items"] == len(page_data.text_items)
     assert full_stats["text_delivery_delivered_items"] == len(page_data.text_items)
     assert full_stats["text_delivery_failed_items"] == 0
@@ -419,13 +476,26 @@ def main() -> None:
     reopen_result = bpy.ops.wm.open_mainfile(filepath=str(blend_path))
     assert "FINISHED" in reopen_result
     bpy.context.view_layer.update()
+    print("BC_BL_ACCEPTANCE_STAGE=reopen:loaded", flush=True)
     reopened_entity_count = 0
+    reopened_rendered_font_shas = set()
+    reopened_rendered_ink_entities = 0
     for record in full_records:
         entities = _delivery_entities(record, "FONT")
         reopened_entity_count += len(entities)
         for entity in entities:
-            _assert_metric_entity(entity)
             expected_font_sha = str(entity["pdf_exact_font_sha256"])
+            verify_rendered_ink = (
+                not bool(entity.get("pdf_metric_zero_ink_identity", False))
+                and expected_font_sha not in reopened_rendered_font_shas
+            )
+            _assert_metric_entity(
+                entity,
+                verify_rendered_ink=verify_rendered_ink,
+            )
+            if verify_rendered_ink:
+                reopened_rendered_font_shas.add(expected_font_sha)
+                reopened_rendered_ink_entities += 1
             assert verify_packed_sha256(entity.data.font, expected_font_sha) == expected_font_sha
     assert reopened_entity_count == len(full_entity_names)
 
@@ -448,6 +518,8 @@ def main() -> None:
     results["persistence"] = {
         "blend": str(blend_path),
         "reopened_text_entities": reopened_entity_count,
+        "reopened_rendered_ink_entities": reopened_rendered_ink_entities,
+        "reopened_rendered_font_assets": len(reopened_rendered_font_shas),
         "packed_font_cache_files_deleted": len(font_cache_files),
         "packed_rotated_raster_verified": True,
         "owned_temp_directories_deleted": 2,
