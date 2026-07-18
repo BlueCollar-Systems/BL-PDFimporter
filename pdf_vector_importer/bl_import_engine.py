@@ -2164,6 +2164,7 @@ def _reverify_text_delivery_after_stack(
                 and record.get("zero_ink_character_count") > 0
             )
             or bool(str(record.get("zero_ink_delivery_manifest_sha256") or ""))
+            or bool(str(record.get("source_manifest_sha256") or ""))
             or _evidence_has_positioned_zero_ink(prior_evidence)
             or _evidence_has_positioned_zero_ink(runtime_evidence)
         )
@@ -2181,6 +2182,7 @@ def _reverify_text_delivery_after_stack(
             record_failures.extend(canonical_failures)
 
         canonical_count_contribution = None
+        canonical_count_receipt_bound = False
         canonical_zero_count = None
         if isinstance(canonical_delivery, dict):
             entity_ids = list(canonical_delivery.get("entity_ids") or ())
@@ -2221,6 +2223,21 @@ def _reverify_text_delivery_after_stack(
             canonical_count_contribution = (
                 0 if canonical_logical_zero_ink else 1
             )
+            canonical_count_receipt_bound = bool(
+                isinstance(authority, ZeroInkReconciliationAuthority)
+                and record.get("source_manifest_sha256")
+                == authority.source_manifest_sha256
+                and record.get("zero_ink_delivery_manifest_sha256")
+                == authority.delivery_manifest_sha256
+            )
+            if (
+                canonical_count_receipt_bound
+                and isinstance(runtime_outcome, AttemptOutcome)
+                and runtime_delivery_representation != representation
+            ):
+                record_failures.append(
+                    "zero_ink_runtime_delivery_representation_unbound"
+                )
             if not record_entity_ids_exact or record_entity_ids != entity_ids:
                 record_failures.append("zero_ink_record_entity_identity_unbound")
             if record_representation != representation:
@@ -2585,12 +2602,16 @@ def _reverify_text_delivery_after_stack(
                     )
             final_proof["cleanup"] = cleanup
             if canonical_state_present:
-                count_contribution = (
-                    runtime_delivery_count_contribution
-                    if runtime_delivery_count_contribution is not None
-                    else 0
-                )
-                count_representation = runtime_delivery_representation
+                if canonical_count_receipt_bound:
+                    count_contribution = canonical_count_contribution
+                    count_representation = representation
+                else:
+                    count_contribution = (
+                        runtime_delivery_count_contribution
+                        if runtime_delivery_count_contribution is not None
+                        else 0
+                    )
+                    count_representation = runtime_delivery_representation
             else:
                 count_contribution = record.get("delivered_count_contribution")
                 if not (

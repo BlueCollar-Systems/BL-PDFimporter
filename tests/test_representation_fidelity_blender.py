@@ -1226,6 +1226,59 @@ def test_post_stack_authority_removal_cannot_be_hidden_by_record_flags(monkeypat
     assert "zero_ink_reconciliation_authority_missing" in failures[0]["failures"]
 
 
+def test_post_stack_source_digest_still_exposes_deleted_zero_ink_authority(monkeypatch):
+    fake, collection = _install(monkeypatch)
+    _install_positioned_empty_conversion_host(monkeypatch, fake)
+    opts = types.SimpleNamespace(import_mode="vector", text_mode="glyphs")
+    item = _item()
+    item.text = "A B"
+    item.normalized = "A B"
+    item.source_char_layout = _mixed_zero_ink_character_layout()
+    item.requires_individual_positioning = True
+
+    assert bl_text_builder.build_text(
+        item,
+        collection,
+        page_number=2,
+        text_mode="glyphs",
+        provenance_opts=opts,
+    ) is not None
+    record = opts._text_delivery_records[-1]
+    item_id = record["item_id"]
+    assert record["source_manifest_sha256"]
+
+    # Simulate a lossy handoff that drops both registries and the mutable evidence
+    # fields, but retains the record's objective source-manifest identity.
+    opts._zero_ink_reconciliation_authorities = ()
+    opts._zero_ink_source_manifests.pop(item_id)
+    opts._zero_ink_delivery_manifests.pop(item_id)
+    record["zero_ink_delivery"] = False
+    record["zero_ink_character_count"] = 0
+    record["zero_ink_delivery_manifest_sha256"] = ""
+    for evidence in (
+        record["attempts"][0]["evidence"],
+        opts._text_delivery_outcomes[item_id].evidence,
+    ):
+        evidence["proof_kind"] = ""
+        evidence["zero_ink_delivery"] = False
+        evidence["zero_ink_character_count"] = 0
+        evidence["character_entities"] = []
+
+    objects_by_name = {candidate.name: candidate for candidate in collection.objects.items}
+    fake.data.objects.get = objects_by_name.get
+    monkeypatch.setattr(bl_import_engine, "bpy", fake)
+    failures = bl_import_engine._reverify_text_delivery_after_stack(
+        [record],
+        page_number=2,
+        stack_offset_m=0.0,
+        provenance_opts=opts,
+    )
+
+    assert len(failures) == 1
+    assert record["status"] == "failed"
+    assert "zero_ink_reconciliation_authority_missing" in failures[0]["failures"]
+
+
 def test_post_stack_all_zero_proof_cannot_be_bypassed_by_ghost_record_retyping(
     monkeypatch,
 ):
@@ -1369,6 +1422,52 @@ def test_post_stack_forged_authority_cannot_redirect_delivery_bucket(monkeypatch
         "glyph_curve": 5,
         "geometry_mesh": 7,
     }
+
+
+def test_post_stack_runtime_outcome_retyping_cannot_redirect_delivery_bucket(
+    monkeypatch,
+):
+    fake, collection = _install(monkeypatch)
+    _install_positioned_empty_conversion_host(monkeypatch, fake)
+    opts = types.SimpleNamespace(
+        import_mode="vector",
+        text_mode="glyphs",
+        _text_delivered_entity_counts={"glyph_curve": 5, "geometry_mesh": 7},
+    )
+    item = _item()
+    item.text = "A B"
+    item.normalized = "A B"
+    item.source_char_layout = _mixed_zero_ink_character_layout()
+    item.requires_individual_positioning = True
+
+    assert bl_text_builder.build_text(
+        item,
+        collection,
+        page_number=2,
+        text_mode="glyphs",
+        provenance_opts=opts,
+    ) is not None
+    record = opts._text_delivery_records[-1]
+    outcome = opts._text_delivery_outcomes[record["item_id"]]
+    outcome.evidence["delivered_representation"] = "geometry"
+    record["physical_entity_count"] = 99
+
+    objects_by_name = {candidate.name: candidate for candidate in collection.objects.items}
+    fake.data.objects.get = objects_by_name.get
+    monkeypatch.setattr(bl_import_engine, "bpy", fake)
+    failures = bl_import_engine._reverify_text_delivery_after_stack(
+        [record],
+        page_number=2,
+        stack_offset_m=0.0,
+        provenance_opts=opts,
+    )
+
+    assert len(failures) == 1
+    assert opts._text_delivered_entity_counts == {
+        "glyph_curve": 5,
+        "geometry_mesh": 7,
+    }
+    assert "zero_ink_runtime_delivery_representation_unbound" in failures[0]["failures"]
 
 
 @pytest.mark.parametrize("mode", ["glyphs", "geometry"])
