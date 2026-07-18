@@ -27,10 +27,10 @@ from .text_delivery import (
     freeze_zero_ink_source_manifest,
     make_zero_ink_character_manifest,
     normalize_representation,
+    source_unicode_cmap_binding_sha256,
     text_has_visible_ink,
     text_is_unicode_default_ignorable,
     text_is_unicode_whitespace,
-    text_is_zero_ink,
 )
 
 
@@ -42,6 +42,9 @@ _EXACT_GLYPH_DESIGN_BOUNDS_CACHE: Dict[
 ] = {}
 _EXACT_GLYPH_CUBIC_CONTOURS_CACHE: Dict[Tuple[str, int, int], tuple] = {}
 _EXACT_FONT_BBOX_METRICS_CACHE: Dict[Tuple[str, int], Tuple[int, int, int]] = {}
+_EXACT_SOURCE_UNICODE_GLYPH_ID_CACHE: Dict[
+    Tuple[str, int, int], Optional[int]
+] = {}
 _EVALUATED_FONT_LOCAL_INK_CACHE: Dict[tuple, tuple] = {}
 _TEXT_MODES = {"labels", "text", "3d_text", "glyphs", "geometry", "raster"}
 _METRIC_INK_BOUNDS_TOLERANCE_M = 6e-5
@@ -461,6 +464,80 @@ def _exact_font_bbox_metrics(asset) -> Tuple[int, int, int]:
     return result
 
 
+def _exact_source_unicode_glyph_id(asset, source_text: str):
+    """Resolve one code point through a source-installed cmap in exact font bytes.
+
+    Unicode supplies only the lookup key. The returned identity is accepted only
+    after the packed bytes match their SHA-256 digest, the font design units match
+    importer metadata, and the mapped physical glyph has exact metric coverage.
+    """
+    if getattr(asset, "unicode_map_installed", None) is not True:
+        return None
+    if not isinstance(source_text, str) or len(source_text) != 1:
+        return None
+    try:
+        data = bytes(asset.usable_bytes)
+        digest = str(asset.usable_sha256 or "")
+        expected_upem = asset.units_per_em
+        advances = tuple(asset.glyph_advances)
+    except (AttributeError, TypeError, ValueError):
+        return None
+    if (
+        not data
+        or not isinstance(expected_upem, int)
+        or isinstance(expected_upem, bool)
+        or expected_upem <= 0
+        or sha256(data).hexdigest() != digest
+    ):
+        return None
+    code_point = ord(source_text)
+    cache_key = (digest, expected_upem, code_point)
+    if cache_key in _EXACT_SOURCE_UNICODE_GLYPH_ID_CACHE:
+        return _EXACT_SOURCE_UNICODE_GLYPH_ID_CACHE[cache_key]
+
+    try:
+        from fontTools.ttLib import TTFont, TTLibError
+    except ImportError:
+        return None
+
+    font = None
+    glyph_id = None
+    try:
+        font = TTFont(BytesIO(data), lazy=False, recalcTimestamp=False)
+        if int(font["head"].unitsPerEm) != expected_upem:
+            return None
+        cmap = font.getBestCmap()
+        if not isinstance(cmap, dict):
+            return None
+        glyph_name = cmap.get(code_point)
+        if not isinstance(glyph_name, str) or not glyph_name:
+            return None
+        resolved = font.getGlyphID(glyph_name)
+        if (
+            not isinstance(resolved, int)
+            or isinstance(resolved, bool)
+            or resolved < 0
+            or resolved >= len(advances)
+        ):
+            return None
+        glyph_id = resolved
+    except (
+        AttributeError,
+        IndexError,
+        KeyError,
+        OSError,
+        TTLibError,
+        TypeError,
+        ValueError,
+    ):
+        return None
+    finally:
+        if font is not None:
+            font.close()
+    _EXACT_SOURCE_UNICODE_GLYPH_ID_CACHE[cache_key] = glyph_id
+    return glyph_id
+
+
 def _exact_glyph_design_bounds(asset, glyph_id: int):
     """Return source-font design bounds for one glyph, never host-derived bounds."""
     try:
@@ -784,15 +861,56 @@ def _positioned_source_ink_evidence(
     """Classify one positioned character from immutable source glyph evidence."""
     source_text = str(getattr(text_item, "text", "") or "")
     asset = getattr(text_item, "font_asset", None)
-    glyph_id = getattr(text_item, "source_glyph_id", None)
+    raw_glyph_id = getattr(text_item, "source_glyph_id", None)
+    glyph_identity = None
+    code_point = None
+    mapping_sha256 = None
+    if raw_glyph_id is not None:
+        if (
+            not isinstance(raw_glyph_id, int)
+            or isinstance(raw_glyph_id, bool)
+            or raw_glyph_id < 0
+        ):
+            return {
+                "zero_ink_identity": False,
+                "source_ink_classification": "visible",
+                "source_ink_evidence": "invalid_source_glyph_identity",
+                "source_ink_glyph_id": None,
+                "source_ink_font_sha256": None,
+                "source_ink_glyph_identity": None,
+                "source_ink_code_point": None,
+                "source_ink_mapping_sha256": None,
+                "source_ink_bounds_design_units": None,
+                "source_ink_contours_design_units": None,
+            }
+        glyph_id = raw_glyph_id
+        glyph_identity = "source_trace_glyph_id"
+    else:
+        glyph_id = None
+        if require_exact_glyph:
+            glyph_id = _exact_source_unicode_glyph_id(asset, source_text)
+            if glyph_id is not None:
+                glyph_identity = "exact_source_unicode_cmap"
+                code_point = ord(source_text)
+                font_sha256 = str(getattr(asset, "usable_sha256", "") or "")
+                mapping_sha256 = source_unicode_cmap_binding_sha256(
+                    font_sha256,
+                    code_point,
+                    glyph_id,
+                )
     if glyph_id is not None and require_exact_glyph:
-        glyph_id = int(glyph_id)
         source_bounds = _exact_glyph_design_bounds(asset, glyph_id)
+        font_sha256 = str(getattr(asset, "usable_sha256", "") or "")
         if source_bounds is None:
             return {
                 "zero_ink_identity": True,
                 "source_ink_classification": "zero_ink",
                 "source_ink_evidence": "exact_source_glyph_empty",
+                "source_ink_glyph_id": glyph_id,
+                "source_ink_font_sha256": font_sha256,
+                "source_ink_glyph_identity": glyph_identity,
+                "source_ink_code_point": code_point,
+                "source_ink_mapping_sha256": mapping_sha256,
                 "source_ink_bounds_design_units": None,
                 "source_ink_contours_design_units": None,
             }
@@ -801,6 +919,11 @@ def _positioned_source_ink_evidence(
             "zero_ink_identity": False,
             "source_ink_classification": "visible",
             "source_ink_evidence": "exact_source_glyph_contours",
+            "source_ink_glyph_id": glyph_id,
+            "source_ink_font_sha256": font_sha256,
+            "source_ink_glyph_identity": glyph_identity,
+            "source_ink_code_point": code_point,
+            "source_ink_mapping_sha256": mapping_sha256,
             "source_ink_bounds_design_units": source_bounds,
             "source_ink_contours_design_units": source_contours,
         }
@@ -809,14 +932,24 @@ def _positioned_source_ink_evidence(
             "zero_ink_identity": False,
             "source_ink_classification": "visible",
             "source_ink_evidence": "unicode_visible_without_source_ink_probe",
+            "source_ink_glyph_id": int(glyph_id),
+            "source_ink_font_sha256": None,
+            "source_ink_glyph_identity": glyph_identity,
+            "source_ink_code_point": None,
+            "source_ink_mapping_sha256": None,
             "source_ink_bounds_design_units": None,
             "source_ink_contours_design_units": None,
         }
     if text_is_unicode_whitespace(source_text):
         return {
-            "zero_ink_identity": True,
-            "source_ink_classification": "zero_ink",
-            "source_ink_evidence": "unicode_whitespace_without_resolved_glyph",
+            "zero_ink_identity": False,
+            "source_ink_classification": "visible",
+            "source_ink_evidence": "unicode_whitespace_without_source_glyph_authority",
+            "source_ink_glyph_id": None,
+            "source_ink_font_sha256": None,
+            "source_ink_glyph_identity": None,
+            "source_ink_code_point": None,
+            "source_ink_mapping_sha256": None,
             "source_ink_bounds_design_units": None,
             "source_ink_contours_design_units": None,
         }
@@ -828,6 +961,11 @@ def _positioned_source_ink_evidence(
             if text_is_unicode_default_ignorable(source_text)
             else "source_character_without_resolved_glyph"
         ),
+        "source_ink_glyph_id": None,
+        "source_ink_font_sha256": None,
+        "source_ink_glyph_identity": None,
+        "source_ink_code_point": None,
+        "source_ink_mapping_sha256": None,
         "source_ink_bounds_design_units": None,
         "source_ink_contours_design_units": None,
     }
@@ -841,59 +979,9 @@ def _positioned_font_axis_metrics_values(
 ) -> Dict[str, Any]:
     """Return the exact local axes used by both source proof and runtime."""
     asset = getattr(text_item, "font_asset", None)
-    glyph_id = getattr(text_item, "source_glyph_id", None)
     source_ink_evidence = _positioned_source_ink_evidence(text_item)
     zero_ink_identity = bool(source_ink_evidence["zero_ink_identity"])
-    if zero_ink_identity and glyph_id is None:
-        try:
-            local_advance = abs(float(text_item.advance_width)) * MM_TO_M
-            local_line_height = abs(float(text_item.glyph_height)) * MM_TO_M
-            local_baseline_y = (
-                abs(float(getattr(text_item, "baseline_descent", 0.0) or 0.0))
-                * MM_TO_M
-                if baseline_alignment == "BOTTOM"
-                else 0.0
-            )
-        except (AttributeError, TypeError, ValueError) as exc:
-            raise RuntimeError(
-                "source-layout metrics are unavailable for positioned zero-ink character"
-            ) from exc
-        if (
-            not math.isfinite(local_advance)
-            or not math.isfinite(local_line_height)
-            or not math.isfinite(local_baseline_y)
-            or local_advance < 0.0
-            or local_line_height <= 0.0
-        ):
-            raise RuntimeError(
-                "source-layout metrics are invalid for positioned zero-ink character"
-            )
-        return {
-            "glyph_id": int(glyph_id) if glyph_id is not None else -1,
-            "units_per_em": 0,
-            "ascender": 0,
-            "descender": 0,
-            "advance_units": 0,
-            "line_height_units": 0,
-            "host_font_bbox_y_min_units": 0,
-            "host_font_bbox_y_max_units": 0,
-            "host_font_normalization_units": 0,
-            "design_unit_scale": 0.0,
-            "local_advance": local_advance,
-            "local_matrix_horizontal_extent": local_advance,
-            "matrix_horizontal_extent_source": "source_layout_advance",
-            "local_line_height": local_line_height,
-            "local_baseline_y": local_baseline_y,
-            "source_ink_bounds_design_units": None,
-            "source_ink_contours_design_units": None,
-            "metric_source": "source_layout_zero_ink",
-            "zero_ink_identity": True,
-            "source_ink_classification": source_ink_evidence[
-                "source_ink_classification"
-            ],
-            "source_ink_evidence": source_ink_evidence["source_ink_evidence"],
-            "zero_advance_logical_proof": local_advance <= 1e-12,
-        }
+    glyph_id = source_ink_evidence.get("source_ink_glyph_id")
     try:
         glyph_id = int(glyph_id)
         ascender = int(asset.ascender)
@@ -971,6 +1059,15 @@ def _positioned_font_axis_metrics_values(
             "source_ink_classification"
         ],
         "source_ink_evidence": source_ink_evidence["source_ink_evidence"],
+        "source_ink_glyph_id": source_ink_evidence["source_ink_glyph_id"],
+        "source_ink_font_sha256": source_ink_evidence["source_ink_font_sha256"],
+        "source_ink_glyph_identity": source_ink_evidence[
+            "source_ink_glyph_identity"
+        ],
+        "source_ink_code_point": source_ink_evidence["source_ink_code_point"],
+        "source_ink_mapping_sha256": source_ink_evidence[
+            "source_ink_mapping_sha256"
+        ],
         "zero_advance_logical_proof": (
             zero_ink_identity and local_advance <= 1e-12
         ),
@@ -1147,19 +1244,6 @@ def _blender_positioned_font_size_calibration_for_item(
     source_em_size_m: float,
 ) -> Optional[Dict[str, Any]]:
     """Return host-size calibration without constructing glyph contours."""
-    glyph_id = getattr(text_item, "source_glyph_id", None)
-    source_text = str(getattr(text_item, "text", "") or "")
-    zero_ink_identity = bool(
-        _positioned_source_ink_evidence(
-            text_item,
-            require_exact_glyph=(
-                text_is_unicode_whitespace(source_text)
-                or text_is_unicode_default_ignorable(source_text)
-            ),
-        )["zero_ink_identity"]
-    )
-    if zero_ink_identity and glyph_id is None:
-        return None
     try:
         asset = text_item.font_asset
         units_per_em = int(asset.units_per_em)
@@ -1256,10 +1340,7 @@ def _apply_target_quad_affine(
     positioned_character = bool(getattr(text_item, "positioned_character", False))
     if (
         not positioned_character
-        and (
-            text_is_zero_ink(getattr(text_item, "text", ""))
-            or not _quad_requires_full_affine(target_quad)
-        )
+        and not _quad_requires_full_affine(target_quad)
     ):
         obj["pdf_full_affine_applied"] = False
         obj["pdf_metric_affine_applied"] = False
@@ -2878,9 +2959,9 @@ def _verify_transform_and_dimensions(obj, text_item) -> tuple[list[str], Dict[st
         evidence["evaluated_bounds_verified"] = True
         has_visible_source = text_has_visible_ink(getattr(text_item, "text", ""))
         evidence["source_has_visible_characters"] = has_visible_source
-        # A whitespace-only PDF span legitimately has no rendered bounding
-        # geometry. Preserve its exact editable body and transform; do not
-        # invent visible geometry or downgrade its requested representation.
+        # Unicode-only text classification is conservative. Exact positioned
+        # empty-glyph delivery is verified by the metric/source-glyph path
+        # above; every other non-empty value must satisfy physical bounds.
         if has_visible_source and target_width > 1e-9:
             width_tolerance = max(1e-7, target_width * 1e-3)
             if abs(actual_width - target_width) > width_tolerance:
@@ -4289,7 +4370,7 @@ def _positioned_zero_ink_source_manifest(
             "character_item_id": f"{item_id}:char:{index}",
             "character_index": index,
             "text": str(layout.text),
-            "glyph_id": int(glyph_id) if glyph_id is not None else None,
+            "glyph_id": glyph_id,
             "advance_width_model": float(layout.advance_width),
             "glyph_height_model": float(layout.glyph_height),
             "source_origin_pdf": [
@@ -4316,6 +4397,15 @@ def _positioned_zero_ink_source_manifest(
             ],
             "source_ink_classification": source_ink["source_ink_classification"],
             "source_ink_evidence": source_ink["source_ink_evidence"],
+            "source_ink_glyph_id": source_ink["source_ink_glyph_id"],
+            "source_ink_font_sha256": source_ink["source_ink_font_sha256"],
+            "source_ink_glyph_identity": source_ink[
+                "source_ink_glyph_identity"
+            ],
+            "source_ink_code_point": source_ink["source_ink_code_point"],
+            "source_ink_mapping_sha256": source_ink[
+                "source_ink_mapping_sha256"
+            ],
         })
     return {
         "schema": ZERO_INK_SOURCE_MANIFEST_SCHEMA,
@@ -4355,7 +4445,7 @@ def _character_text_item(text_item: NormalizedText, layout) -> NormalizedText:
         source_char_layout=(),
         requires_individual_positioning=False,
         positioned_character=True,
-        source_glyph_id=(int(layout.glyph_id) if layout.glyph_id is not None else None),
+        source_glyph_id=getattr(layout, "glyph_id", None),
     )
 
 
@@ -4429,7 +4519,7 @@ def _attempt_positioned_native_characters(
             "character_item_id": character_id,
             "character_index": index,
             "text": str(layout.text),
-            "glyph_id": int(glyph_id) if glyph_id is not None else None,
+            "glyph_id": glyph_id,
             "advance_width_model": float(layout.advance_width),
             "glyph_height_model": float(layout.glyph_height),
             "source_origin_pdf": list(layout.source_origin_pdf),
@@ -4444,6 +4534,19 @@ def _attempt_positioned_native_characters(
                 "source_ink_classification"
             ),
             "source_ink_evidence": manifest_character.get("source_ink_evidence"),
+            "source_ink_glyph_id": manifest_character.get("source_ink_glyph_id"),
+            "source_ink_font_sha256": manifest_character.get(
+                "source_ink_font_sha256"
+            ),
+            "source_ink_glyph_identity": manifest_character.get(
+                "source_ink_glyph_identity"
+            ),
+            "source_ink_code_point": manifest_character.get(
+                "source_ink_code_point"
+            ),
+            "source_ink_mapping_sha256": manifest_character.get(
+                "source_ink_mapping_sha256"
+            ),
             "requested_representation": requested,
             "delivered_representation": delivered,
             "positioned_character": bool(
@@ -4857,7 +4960,7 @@ def _attempt_positioned_converted_characters(
             "character_item_id": character_id,
             "character_index": candidate["index"],
             "text": str(layout.text),
-            "glyph_id": int(glyph_id) if glyph_id is not None else None,
+            "glyph_id": glyph_id,
             "advance_width_model": float(layout.advance_width),
             "glyph_height_model": float(layout.glyph_height),
             "source_origin_pdf": list(layout.source_origin_pdf),
@@ -4872,6 +4975,19 @@ def _attempt_positioned_converted_characters(
                 "source_ink_classification"
             ),
             "source_ink_evidence": manifest_character.get("source_ink_evidence"),
+            "source_ink_glyph_id": manifest_character.get("source_ink_glyph_id"),
+            "source_ink_font_sha256": manifest_character.get(
+                "source_ink_font_sha256"
+            ),
+            "source_ink_glyph_identity": manifest_character.get(
+                "source_ink_glyph_identity"
+            ),
+            "source_ink_code_point": manifest_character.get(
+                "source_ink_code_point"
+            ),
+            "source_ink_mapping_sha256": manifest_character.get(
+                "source_ink_mapping_sha256"
+            ),
             "requested_representation": requested,
             "delivered_representation": delivered,
             "positioned_character": bool(

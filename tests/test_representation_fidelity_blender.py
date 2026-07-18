@@ -597,6 +597,52 @@ def _visible_default_ignorable_metric_font_asset():
     return asset
 
 
+def _visible_whitespace_metric_font_asset():
+    """Return an exact font whose U+0020 glyph has physical contours."""
+    from fontTools.ttLib import TTFont
+
+    asset = _metric_font_asset()
+    font = TTFont(BytesIO(asset.usable_bytes))
+    for cmap in font["cmap"].tables:
+        if cmap.isUnicode():
+            cmap.cmap[0x0020] = "A"
+    stream = BytesIO()
+    font.save(stream)
+    font.close()
+    asset.usable_bytes = stream.getvalue()
+    asset.usable_sha256 = sha256(asset.usable_bytes).hexdigest()
+    asset.asset_id = f"sha256:{asset.usable_sha256}"
+    return asset
+
+
+def _source_cmap_metric_font_asset(*, visible_whitespace=False):
+    """Mark an exact test font's cmap as installed from source PDF mapping."""
+    asset = (
+        _visible_whitespace_metric_font_asset()
+        if visible_whitespace
+        else _metric_font_asset()
+    )
+    asset.unicode_map_installed = True
+    return asset
+
+
+def _source_cmap_without_space_metric_font_asset():
+    from fontTools.ttLib import TTFont
+
+    asset = _source_cmap_metric_font_asset()
+    font = TTFont(BytesIO(asset.usable_bytes))
+    for cmap in font["cmap"].tables:
+        if cmap.isUnicode():
+            cmap.cmap.pop(0x0020, None)
+    stream = BytesIO()
+    font.save(stream)
+    font.close()
+    asset.usable_bytes = stream.getvalue()
+    asset.usable_sha256 = sha256(asset.usable_bytes).hexdigest()
+    asset.asset_id = f"sha256:{asset.usable_sha256}"
+    return asset
+
+
 def _empty_default_ignorable_metric_font_asset(character, *, zero_advance=False):
     from fontTools.ttLib import TTFont
 
@@ -703,7 +749,7 @@ def _mixed_zero_ink_character_layout():
         ),
         TextCharLayout(
             text=" ",
-            glyph_id=None,
+            glyph_id=2,
             source_origin_pdf=(16.0, 20.0),
             source_bbox_pdf=(16.0, 10.0, 19.0, 22.0),
             source_quad_pdf=((16.0, 10.0), (19.0, 10.0), (19.0, 22.0), (16.0, 22.0)),
@@ -730,7 +776,7 @@ def _whitespace_only_character_layout():
     return (
         TextCharLayout(
             text=" ",
-            glyph_id=None,
+            glyph_id=2,
             source_origin_pdf=(10.0, 20.0),
             source_bbox_pdf=(10.0, 10.0, 13.0, 22.0),
             source_quad_pdf=((10.0, 10.0), (13.0, 10.0), (13.0, 22.0), (10.0, 22.0)),
@@ -741,7 +787,7 @@ def _whitespace_only_character_layout():
         ),
         TextCharLayout(
             text=" ",
-            glyph_id=None,
+            glyph_id=2,
             source_origin_pdf=(13.0, 20.0),
             source_bbox_pdf=(13.0, 10.0, 16.0, 22.0),
             source_quad_pdf=((13.0, 10.0), (16.0, 10.0), (16.0, 22.0), (13.0, 22.0)),
@@ -793,7 +839,14 @@ def _install_positioned_empty_conversion_host(
         return not text.strip() or text in expected_zero_ink_texts
 
     def apply_metric_identity(obj, text_item, *_args, **_kwargs):
-        zero_ink = zero_ink_text(text_item.text)
+        try:
+            zero_ink = bool(
+                bl_text_builder._positioned_source_ink_evidence(text_item)[
+                    "zero_ink_identity"
+                ]
+            )
+        except (AttributeError, IndexError, RuntimeError, TypeError, ValueError):
+            zero_ink = zero_ink_text(text_item.text)
         z_offset_m = float(_args[0]) if _args else 0.0
         local_advance = float(text_item.advance_width) * 0.001
         local_line_height = float(text_item.glyph_height) * 0.001
@@ -824,9 +877,7 @@ def _install_positioned_empty_conversion_host(
         obj["pdf_metric_affine_applied"] = True
         obj["pdf_affine_matrix"] = flattened_matrix
         obj["pdf_metric_zero_ink_identity"] = zero_ink
-        obj["pdf_metric_metric_source"] = (
-            "source_layout_zero_ink" if zero_ink else "embedded_font_glyph_metrics"
-        )
+        obj["pdf_metric_metric_source"] = "embedded_font_glyph_metrics"
         obj["pdf_metric_local_advance"] = local_advance
         obj["pdf_metric_local_line_height"] = local_line_height
         obj["pdf_metric_local_baseline_y"] = local_baseline_y
@@ -1158,7 +1209,8 @@ def test_positioned_conversion_preserves_zero_ink_space_and_delivers_visible_sib
         provenance_opts=opts,
     )
 
-    assert obj is not None and obj.type == expected_type
+    record = opts._text_delivery_records[-1]
+    assert obj is not None and obj.type == expected_type, record
     assert len(collection.objects.items) == 2
     assert {candidate.type for candidate in collection.objects.items} == {
         expected_type
@@ -1166,8 +1218,7 @@ def test_positioned_conversion_preserves_zero_ink_space_and_delivers_visible_sib
     assert {
         candidate.get("pdf_text_source") for candidate in collection.objects.items
     } == {"A", "B"}
-    record = opts._text_delivery_records[-1]
-    assert record["status"] == "delivered"
+    assert record["status"] == "delivered", record
     assert record["requested_representation"] == mode
     assert record["final_representation"] == mode
     assert record["fallback_used"] is False
@@ -1186,7 +1237,7 @@ def test_positioned_conversion_preserves_zero_ink_space_and_delivers_visible_sib
     assert [entry["delivered_representation"] for entry in characters] == [mode] * 3
     space = characters[1]
     assert space["item_id"] == "page:2:text:41"
-    assert space["glyph_id"] is None
+    assert space["glyph_id"] == 2
     assert space["advance_width_model"] == pytest.approx(3.0)
     assert space["source_origin_pdf"] == [16.0, 20.0]
     assert space["target_origin_model"] == [18.0, 24.0]
@@ -2384,7 +2435,7 @@ def test_positioned_conversion_failure_is_atomic_and_cannot_cross_type_fallback(
     assert len(fake.data.objects.removed) >= 2
 
 
-def test_positioned_whitespace_without_glyph_id_uses_source_layout_identity_metrics():
+def test_positioned_whitespace_without_glyph_id_cannot_authorize_zero_ink():
     layout = TextCharLayout(
         text=" ",
         glyph_id=None,
@@ -2397,17 +2448,22 @@ def test_positioned_whitespace_without_glyph_id_uses_source_layout_identity_metr
         glyph_height=6.0,
     )
     child = bl_text_builder._character_text_item(_item(), layout)
-    data = _FontData("WhitespaceIdentity")
-    data.size = 0.006
-    obj = _Object("WhitespaceIdentity", data)
+    source_ink = bl_text_builder._positioned_source_ink_evidence(child)
 
-    metrics = bl_text_builder._positioned_font_axis_metrics(obj, child)
-
-    assert metrics["glyph_id"] == -1
-    assert metrics["metric_source"] == "source_layout_zero_ink"
-    assert metrics["zero_ink_identity"] is True
-    assert metrics["local_advance"] == pytest.approx(0.006)
-    assert metrics["local_line_height"] == pytest.approx(0.006)
+    assert source_ink["zero_ink_identity"] is False
+    assert source_ink["source_ink_classification"] == "visible"
+    assert source_ink["source_ink_evidence"] == (
+        "unicode_whitespace_without_source_glyph_authority"
+    )
+    with pytest.raises(
+        RuntimeError,
+        match="exact embedded font metrics are unavailable",
+    ):
+        bl_text_builder._positioned_font_axis_metrics_values(
+            child,
+            size=0.006,
+            baseline_alignment="BOTTOM_BASELINE",
+        )
 
 
 @pytest.mark.parametrize(
@@ -2557,9 +2613,257 @@ def test_text_ink_classifier_does_not_discard_non_whitespace_c0_controls(text):
         "\u3000",
     ],
 )
-def test_text_ink_classifier_uses_exact_unicode_17_white_space_property(text):
+def test_unicode_17_white_space_property_is_only_a_hint_without_font_evidence(text):
     assert text_delivery.text_is_unicode_whitespace(text) is True
-    assert text_delivery.classify_text_ink(text) == "zero_ink"
+    assert text_delivery.classify_text_ink(text) == "visible"
+
+
+def test_zero_ink_character_claim_requires_bound_physical_glyph_evidence():
+    unbound = {
+        "text": " ",
+        "source_ink_classification": "zero_ink",
+        "source_ink_evidence": "exact_source_glyph_empty",
+    }
+
+    assert text_delivery.source_character_is_zero_ink(unbound) is False
+
+
+def test_exact_empty_whitespace_glyph_seals_font_and_glyph_identity():
+    layout = _whitespace_only_character_layout()[0]
+    layout.glyph_id = 2
+    item = _item()
+    item.font_asset = _metric_font_asset()
+    child = bl_text_builder._character_text_item(item, layout)
+
+    source_ink = bl_text_builder._positioned_source_ink_evidence(child)
+
+    assert source_ink["zero_ink_identity"] is True
+    assert source_ink["source_ink_evidence"] == "exact_source_glyph_empty"
+    assert source_ink["source_ink_glyph_id"] == 2
+    assert source_ink["source_ink_font_sha256"] == item.font_asset.usable_sha256
+
+
+def test_missing_trace_gid_recovers_empty_glyph_from_authenticated_source_cmap():
+    layout = _whitespace_only_character_layout()[0]
+    layout.glyph_id = None
+    item = _item()
+    item.font_asset = _source_cmap_metric_font_asset()
+    child = bl_text_builder._character_text_item(item, layout)
+
+    source_ink = bl_text_builder._positioned_source_ink_evidence(child)
+    character = {
+        "text": " ",
+        "glyph_id": None,
+        **source_ink,
+    }
+
+    assert source_ink["zero_ink_identity"] is True
+    assert source_ink["source_ink_evidence"] == "exact_source_glyph_empty"
+    assert source_ink["source_ink_glyph_identity"] == "exact_source_unicode_cmap"
+    assert source_ink["source_ink_code_point"] == 0x0020
+    assert source_ink["source_ink_glyph_id"] == 2
+    assert source_ink["source_ink_font_sha256"] == item.font_asset.usable_sha256
+    assert text_delivery.source_character_is_zero_ink(character) is True
+
+
+@pytest.mark.parametrize(
+    ("field", "tampered_value"),
+    [
+        ("source_ink_font_sha256", "0" * 64),
+        ("source_ink_code_point", 0x0021),
+        ("source_ink_mapping_sha256", "0" * 64),
+    ],
+)
+def test_recovered_cmap_zero_ink_rejects_tampered_mapping_chain(
+    field,
+    tampered_value,
+):
+    layout = _whitespace_only_character_layout()[0]
+    layout.glyph_id = None
+    item = _item()
+    item.font_asset = _source_cmap_metric_font_asset()
+    child = bl_text_builder._character_text_item(item, layout)
+    source_ink = bl_text_builder._positioned_source_ink_evidence(child)
+    character = {
+        "text": " ",
+        "glyph_id": None,
+        **source_ink,
+        field: tampered_value,
+    }
+
+    assert text_delivery.source_character_is_zero_ink(character) is False
+
+
+@pytest.mark.parametrize("bad_glyph_id", [1, True, "2", 2.0])
+def test_recovered_cmap_zero_ink_rejects_forged_or_noninteger_glyph_id(bad_glyph_id):
+    layout = _whitespace_only_character_layout()[0]
+    layout.glyph_id = None
+    item = _item()
+    item.font_asset = _source_cmap_metric_font_asset()
+    child = bl_text_builder._character_text_item(item, layout)
+    source_ink = bl_text_builder._positioned_source_ink_evidence(child)
+    character = {
+        "text": " ",
+        "glyph_id": None,
+        **source_ink,
+        "source_ink_glyph_id": bad_glyph_id,
+    }
+
+    assert text_delivery.source_character_is_zero_ink(character) is False
+
+
+def test_missing_trace_gid_cannot_recover_from_tampered_exact_font_digest():
+    layout = _whitespace_only_character_layout()[0]
+    layout.glyph_id = None
+    item = _item()
+    item.font_asset = _source_cmap_metric_font_asset()
+    item.font_asset.usable_sha256 = "0" * 64
+    child = bl_text_builder._character_text_item(item, layout)
+
+    source_ink = bl_text_builder._positioned_source_ink_evidence(child)
+
+    assert source_ink["zero_ink_identity"] is False
+    assert source_ink["source_ink_classification"] == "visible"
+    assert source_ink["source_ink_glyph_id"] is None
+
+
+def test_missing_trace_gid_cannot_recover_when_exact_source_cmap_lacks_character():
+    layout = _whitespace_only_character_layout()[0]
+    layout.glyph_id = None
+    item = _item()
+    item.font_asset = _source_cmap_without_space_metric_font_asset()
+    child = bl_text_builder._character_text_item(item, layout)
+
+    source_ink = bl_text_builder._positioned_source_ink_evidence(child)
+
+    assert source_ink["zero_ink_identity"] is False
+    assert source_ink["source_ink_classification"] == "visible"
+    assert source_ink["source_ink_glyph_id"] is None
+
+
+@pytest.mark.parametrize("bad_glyph_id", [True, "2", 2.0])
+def test_invalid_source_trace_glyph_id_cannot_create_zero_ink_authority(bad_glyph_id):
+    item = _item()
+    item.font_asset = _source_cmap_metric_font_asset()
+    item.text = " "
+    item.source_glyph_id = bad_glyph_id
+
+    source_ink = bl_text_builder._positioned_source_ink_evidence(item)
+
+    assert source_ink["zero_ink_identity"] is False
+    assert source_ink["source_ink_classification"] == "visible"
+    assert source_ink["source_ink_evidence"] == "invalid_source_glyph_identity"
+
+
+def test_exact_contoured_u0020_is_visible_source_ink():
+    layout = _whitespace_only_character_layout()[0]
+    layout.glyph_id = 1
+    item = _item()
+    item.font_asset = _visible_whitespace_metric_font_asset()
+    child = bl_text_builder._character_text_item(item, layout)
+
+    source_ink = bl_text_builder._positioned_source_ink_evidence(child)
+
+    assert source_ink["zero_ink_identity"] is False
+    assert source_ink["source_ink_classification"] == "visible"
+    assert source_ink["source_ink_evidence"] == "exact_source_glyph_contours"
+    assert source_ink["source_ink_glyph_id"] == 1
+    assert source_ink["source_ink_font_sha256"] == item.font_asset.usable_sha256
+
+
+def test_missing_trace_gid_cmap_recovery_keeps_contoured_u0020_visible():
+    layout = _whitespace_only_character_layout()[0]
+    layout.glyph_id = None
+    item = _item()
+    item.font_asset = _source_cmap_metric_font_asset(visible_whitespace=True)
+    child = bl_text_builder._character_text_item(item, layout)
+
+    source_ink = bl_text_builder._positioned_source_ink_evidence(child)
+
+    assert source_ink["zero_ink_identity"] is False
+    assert source_ink["source_ink_classification"] == "visible"
+    assert source_ink["source_ink_evidence"] == "exact_source_glyph_contours"
+    assert source_ink["source_ink_glyph_identity"] == "exact_source_unicode_cmap"
+    assert source_ink["source_ink_code_point"] == 0x0020
+    assert source_ink["source_ink_glyph_id"] == 1
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_type"),
+    [
+        ("text", "FONT"),
+        ("3d_text", "FONT"),
+        ("glyphs", "CURVE"),
+        ("geometry", "MESH"),
+    ],
+)
+def test_contoured_u0020_keeps_requested_physical_representation(
+    monkeypatch,
+    mode,
+    expected_type,
+):
+    fake, collection = _install(monkeypatch)
+    _install_positioned_empty_conversion_host(
+        monkeypatch,
+        fake,
+        host_placeholder_texts=(" ",),
+    )
+    layout = _whitespace_only_character_layout()[0]
+    layout.glyph_id = None
+    item = _item()
+    item.font_asset = _source_cmap_metric_font_asset(visible_whitespace=True)
+    item.font_name = "MetricFixture"
+    item.text = " "
+    item.normalized = ""
+    item.source_char_layout = (layout,)
+    item.requires_individual_positioning = True
+    opts = types.SimpleNamespace(import_mode="vector", text_mode=mode)
+
+    obj = bl_text_builder.build_text(
+        item,
+        collection,
+        page_number=2,
+        text_mode=mode,
+        provenance_opts=opts,
+    )
+
+    record = opts._text_delivery_records[-1]
+    character = record["attempts"][0]["evidence"]["character_entities"][0]
+    assert obj is not None and obj.type == expected_type
+    assert record["status"] == "delivered"
+    assert record["final_representation"] == mode
+    assert record["fallback_used"] is False
+    assert record.get("zero_ink_character_count", 0) == 0
+    assert character["source_ink_classification"] == "visible"
+    assert character["source_ink_evidence"] == "exact_source_glyph_contours"
+
+
+def test_nonpositioned_unicode_whitespace_cannot_bypass_required_affine(monkeypatch):
+    _install(monkeypatch)
+    _install_mathutils(monkeypatch)
+    item = _item()
+    item.text = " "
+    item.normalized = ""
+    item.target_quad_model = (
+        (18.0, 30.0),
+        (12.0, 30.0),
+        (12.0, 24.0),
+        (18.0, 24.0),
+    )
+    obj = _Object("MirroredWhitespace", _FontData("MirroredWhitespace"))
+    obj.bound_box = (
+        (0.0, 0.0, 0.0),
+        (1.0, 0.0, 0.0),
+        (1.0, 1.0, 0.0),
+        (0.0, 1.0, 0.0),
+    )
+
+    carrier = bl_text_builder._apply_target_quad_affine(obj, item, 0.0)
+
+    assert carrier is None
+    assert obj["pdf_full_affine_applied"] is True
+    assert obj["pdf_metric_affine_applied"] is False
+    assert obj["pdf_affine_matrix"][0] < 0.0
 
 
 @pytest.mark.parametrize(
@@ -2584,6 +2888,7 @@ def test_positioned_visible_combining_mark_keeps_requested_physical_representati
     _install_positioned_empty_conversion_host(monkeypatch, fake)
     layout = _whitespace_only_character_layout()[0]
     layout.text = character
+    layout.glyph_id = None
     item = _item()
     item.text = character
     item.normalized = character
@@ -2788,9 +3093,15 @@ def test_zero_advance_whitespace_metric_affine_uses_singular_logical_matrix(
     _install_mathutils(monkeypatch)
     layout = _zero_advance_variation_selector_layout()
     layout.text = " "
-    child = bl_text_builder._character_text_item(_item(), layout)
+    layout.glyph_id = 2
+    parent = _item()
+    parent.font_asset = _empty_default_ignorable_metric_font_asset(
+        " ",
+        zero_advance=True,
+    )
+    child = bl_text_builder._character_text_item(parent, layout)
     data = _FontData("ZeroAdvanceLogicalProof")
-    data.size = 0.006
+    data.size = 0.0054
     obj = _Object("ZeroAdvanceLogicalProof", data)
     obj["pdf_baseline_alignment"] = "BOTTOM_BASELINE"
 
@@ -3494,7 +3805,7 @@ def test_blender_evaluated_affine_comparison_accepts_float32_factorization_noise
     assert matches is False
 
 
-def test_positioned_zero_ink_native_font_bypasses_physical_size_calibration(
+def test_positioned_zero_ink_native_font_uses_exact_physical_size_calibration(
     monkeypatch,
 ):
     _install(monkeypatch)
@@ -3525,10 +3836,12 @@ def test_positioned_zero_ink_native_font_bypasses_physical_size_calibration(
     assert outcome is None
     assert obj is not None
     assert obj.type == "FONT"
-    assert data.size == pytest.approx(0.006)
+    assert data.size == pytest.approx(0.0054)
     assert obj.get("pdf_metric_zero_ink_identity") is True
-    assert obj.get("pdf_metric_units_per_em") == 0
-    assert obj.get("pdf_metric_host_font_size_calibration") is None
+    assert obj.get("pdf_metric_units_per_em") == 1000
+    assert obj.get("pdf_metric_host_font_size_calibration") == (
+        "blender_font_bbox_normalization_v1"
+    )
 
 
 def test_exact_glyph_design_bounds_rejects_cached_upem_mismatch(monkeypatch):
@@ -5396,7 +5709,16 @@ _ZERO_INK_CHARACTER_SOURCE_FIELDS = (
     "target_origin_model",
     "target_quad_model",
     "intended_affine_matrix",
+    "source_ink_classification",
+    "source_ink_evidence",
+    "source_ink_glyph_id",
+    "source_ink_font_sha256",
+    "source_ink_glyph_identity",
+    "source_ink_code_point",
+    "source_ink_mapping_sha256",
 )
+
+_ZERO_INK_TEST_FONT_SHA256 = sha256(b"exact-zero-ink-test-font").hexdigest()
 
 
 def _zero_ink_source_manifest_from_evidence(evidence):
@@ -5491,7 +5813,7 @@ def _verified_zero_ink_delivery_evidence(
             "character_item_id": f"{item_id}:char:{index}",
             "character_index": index,
             "text": " ",
-            "glyph_id": None,
+            "glyph_id": 2,
             "advance_width_model": 3.0,
             "glyph_height_model": 12.0,
             "source_origin_pdf": [10.0 + index * 3.0, 20.0],
@@ -5515,6 +5837,13 @@ def _verified_zero_ink_delivery_evidence(
                 [origin_x, 24.0],
             ],
             "intended_affine_matrix": _test_metric_affine(origin_x),
+            "source_ink_classification": "zero_ink",
+            "source_ink_evidence": "exact_source_glyph_empty",
+            "source_ink_glyph_id": 2,
+            "source_ink_font_sha256": _ZERO_INK_TEST_FONT_SHA256,
+            "source_ink_glyph_identity": "source_trace_glyph_id",
+            "source_ink_code_point": None,
+            "source_ink_mapping_sha256": None,
             "requested_representation": requested,
             "delivered_representation": delivered,
             "positioned_character": True,
@@ -5607,6 +5936,13 @@ def _verified_mixed_zero_ink_delivery_evidence(
         {
             "text": "A",
             "glyph_id": 37,
+            "source_ink_classification": "visible",
+            "source_ink_evidence": "unicode_visible_without_source_ink_probe",
+            "source_ink_glyph_id": 37,
+            "source_ink_font_sha256": None,
+            "source_ink_glyph_identity": "source_trace_glyph_id",
+            "source_ink_code_point": None,
+            "source_ink_mapping_sha256": None,
             "source_origin_pdf": [10.0, 20.0],
             "source_bbox_pdf": [10.0, 10.0, 16.0, 22.0],
             "source_quad_pdf": [
@@ -5628,7 +5964,14 @@ def _verified_mixed_zero_ink_delivery_evidence(
         },
         {
             "text": " ",
-            "glyph_id": None,
+            "glyph_id": 2,
+            "source_ink_classification": "zero_ink",
+            "source_ink_evidence": "exact_source_glyph_empty",
+            "source_ink_glyph_id": 2,
+            "source_ink_font_sha256": _ZERO_INK_TEST_FONT_SHA256,
+            "source_ink_glyph_identity": "source_trace_glyph_id",
+            "source_ink_code_point": None,
+            "source_ink_mapping_sha256": None,
             "source_origin_pdf": [16.0, 20.0],
             "source_bbox_pdf": [16.0, 10.0, 19.0, 22.0],
             "source_quad_pdf": [
@@ -5651,6 +5994,13 @@ def _verified_mixed_zero_ink_delivery_evidence(
         {
             "text": "B",
             "glyph_id": 91,
+            "source_ink_classification": "visible",
+            "source_ink_evidence": "unicode_visible_without_source_ink_probe",
+            "source_ink_glyph_id": 91,
+            "source_ink_font_sha256": None,
+            "source_ink_glyph_identity": "source_trace_glyph_id",
+            "source_ink_code_point": None,
+            "source_ink_mapping_sha256": None,
             "source_origin_pdf": [19.0, 20.0],
             "source_bbox_pdf": [19.0, 10.0, 25.0, 22.0],
             "source_quad_pdf": [
@@ -5753,7 +6103,7 @@ def _verified_mixed_zero_ink_delivery_evidence(
         "character_item_id": f"{item_id}:char:1",
         "character_index": 1,
         "source_character_text": " ",
-        "source_glyph_id": None,
+        "source_glyph_id": 2,
         "requested_representation": requested,
         "zero_ink_character_manifest_schema": (
             _ZERO_INK_CHARACTER_MANIFEST_SCHEMA
@@ -6130,7 +6480,7 @@ def test_entityless_zero_ink_delivery_requires_complete_bound_proof_and_stays_re
         ("source_count", "zero_ink_source_character_coverage_mismatch"),
         ("fractional_count", "zero_ink_source_character_count_invalid"),
         ("fractional_character_index", "zero_ink_character_index_unbound"),
-        ("visible_text", "zero_ink_character_has_visible_text"),
+        ("visible_text", "zero_ink_source_manifest_mismatch"),
         ("character_entity", "zero_ink_character_has_physical_entity_identity"),
         ("character_proof", "zero_ink_character_identity_unverified"),
         ("character_cleanup", "zero_ink_character_cleanup_incomplete"),

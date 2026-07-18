@@ -63,6 +63,11 @@ _ZERO_INK_CHARACTER_SOURCE_FIELDS = (
     "intended_affine_matrix",
     "source_ink_classification",
     "source_ink_evidence",
+    "source_ink_glyph_id",
+    "source_ink_font_sha256",
+    "source_ink_glyph_identity",
+    "source_ink_code_point",
+    "source_ink_mapping_sha256",
 )
 _LADDERS = {
     "labels": ("labels", "text", "3d_text", "glyphs", "geometry", "raster"),
@@ -112,28 +117,19 @@ def _is_white_space_code_point(code_point: int) -> bool:
 def classify_text_ink(value: Any) -> str:
     """Conservatively classify text without font or rendered-source evidence.
 
-    Unicode White_Space is intrinsically zero ink. Default_Ignorable_Code_Point
-    is only a semantic hint: real fonts can map those characters to visible
-    contours, so a Unicode-only call must preserve them until source evidence
-    proves otherwise.
+    Unicode properties are semantic hints, never physical ink authority. Real
+    fonts can map any non-empty character, including White_Space and
+    Default_Ignorable_Code_Point values, to visible contours. Preserve every
+    non-empty value until exact source-font/glyph evidence proves zero ink.
     """
     text = value if isinstance(value, str) else "" if value is None else str(value)
     if not text:
         return "empty"
-    for character in text:
-        code_point = ord(character)
-        if _is_white_space_code_point(code_point):
-            continue
-        return "visible"
-    return "zero_ink"
+    return "visible"
 
 
 def text_has_visible_ink(value: Any) -> bool:
     return classify_text_ink(value) == "visible"
-
-
-def text_is_zero_ink(value: Any) -> bool:
-    return classify_text_ink(value) == "zero_ink"
 
 
 def text_is_unicode_whitespace(value: Any) -> bool:
@@ -148,14 +144,75 @@ def text_is_unicode_default_ignorable(value: Any) -> bool:
     )
 
 
+def source_unicode_cmap_binding_sha256(
+    font_sha256: Any,
+    code_point: Any,
+    glyph_id: Any,
+):
+    """Bind one source Unicode lookup to an exact font digest and physical glyph."""
+    code_point = _strict_int(code_point)
+    glyph_id = _strict_int(glyph_id)
+    if (
+        not _is_sha256_digest(font_sha256)
+        or code_point is None
+        or not 0 <= code_point <= 0x10FFFF
+        or glyph_id is None
+        or glyph_id < 0
+    ):
+        return None
+    payload = json.dumps(
+        ["exact_source_unicode_cmap_v1", font_sha256, code_point, glyph_id],
+        allow_nan=False,
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+    return sha256(payload.encode("utf-8")).hexdigest()
+
+
 def source_character_is_zero_ink(character: Any) -> bool:
-    """Read source-bound ink authority, falling back only for legacy manifests."""
+    """Accept zero ink only when an exact source font and glyph are sealed."""
     if not isinstance(character, dict):
         return False
     classification = character.get("source_ink_classification")
-    if classification in {"zero_ink", "visible"}:
-        return classification == "zero_ink"
-    return text_is_zero_ink(character.get("text"))
+    if classification != "zero_ink":
+        return False
+    source_glyph_id = _strict_int(character.get("glyph_id"))
+    evidence_glyph_id = _strict_int(character.get("source_ink_glyph_id"))
+    font_sha256 = character.get("source_ink_font_sha256")
+    if not (
+        character.get("source_ink_evidence") == "exact_source_glyph_empty"
+        and evidence_glyph_id is not None
+        and evidence_glyph_id >= 0
+        and _is_sha256_digest(font_sha256)
+    ):
+        return False
+    glyph_identity = character.get("source_ink_glyph_identity")
+    if glyph_identity == "source_trace_glyph_id":
+        return bool(
+            source_glyph_id is not None
+            and source_glyph_id >= 0
+            and evidence_glyph_id == source_glyph_id
+            and character.get("source_ink_code_point") is None
+            and character.get("source_ink_mapping_sha256") is None
+        )
+    if glyph_identity != "exact_source_unicode_cmap":
+        return False
+    text = character.get("text")
+    code_point = _strict_int(character.get("source_ink_code_point"))
+    mapping_sha256 = character.get("source_ink_mapping_sha256")
+    return bool(
+        character.get("glyph_id") is None
+        and isinstance(text, str)
+        and len(text) == 1
+        and code_point == ord(text)
+        and _is_sha256_digest(mapping_sha256)
+        and mapping_sha256
+        == source_unicode_cmap_binding_sha256(
+            font_sha256,
+            code_point,
+            evidence_glyph_id,
+        )
+    )
 
 
 @dataclass(frozen=True)
@@ -382,6 +439,14 @@ def _strict_int(value: Any):
     return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
+def _is_sha256_digest(value: Any) -> bool:
+    return bool(
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
 def _strict_cleanup_identities(value: Any):
     """Return exact cleanup identities, rejecting blank or non-string entries."""
     if not isinstance(value, (list, tuple)):
@@ -553,6 +618,10 @@ def _zero_ink_manifest_contract_failures(
             not isinstance(source_ink_evidence, str) or not source_ink_evidence
         ):
             failures.append("zero_ink_source_manifest_ink_evidence_missing")
+        if classification == "zero_ink" and not source_character_is_zero_ink(
+            character
+        ):
+            failures.append("zero_ink_source_manifest_physical_ink_evidence_unbound")
         glyph_id = character.get("glyph_id")
         if glyph_id is not None and _strict_int(glyph_id) is None:
             failures.append("zero_ink_source_manifest_glyph_identity_invalid")
@@ -1646,10 +1715,10 @@ __all__ = [
     "make_zero_ink_character_manifest",
     "normalize_representation",
     "source_character_is_zero_ink",
+    "source_unicode_cmap_binding_sha256",
     "text_has_visible_ink",
     "text_is_unicode_whitespace",
     "text_is_unicode_default_ignorable",
-    "text_is_zero_ink",
     "zero_ink_character_proof_failures",
     "zero_ink_delivery_proof_failures",
 ]
