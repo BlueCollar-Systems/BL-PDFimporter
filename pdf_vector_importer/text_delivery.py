@@ -34,6 +34,20 @@ _DEFAULT_IGNORABLE_CODE_POINT_RANGES = (
     (0x1D173, 0x1D17A),
     (0xE0000, 0xE0FFF),
 )
+# Unicode 17.0 UCD, PropList.txt, White_Space:
+# https://www.unicode.org/Public/17.0.0/ucd/PropList.txt
+_WHITE_SPACE_CODE_POINT_RANGES = (
+    (0x0009, 0x000D),
+    (0x0020, 0x0020),
+    (0x0085, 0x0085),
+    (0x00A0, 0x00A0),
+    (0x1680, 0x1680),
+    (0x2000, 0x200A),
+    (0x2028, 0x2029),
+    (0x202F, 0x202F),
+    (0x205F, 0x205F),
+    (0x3000, 0x3000),
+)
 _ZERO_INK_CHARACTER_SOURCE_FIELDS = (
     "character_item_id",
     "character_index",
@@ -83,6 +97,16 @@ def _is_default_ignorable_code_point(code_point: int) -> bool:
     return False
 
 
+def _is_white_space_code_point(code_point: int) -> bool:
+    """Return Unicode 17.0 White_Space property membership."""
+    for lower, upper in _WHITE_SPACE_CODE_POINT_RANGES:
+        if code_point < lower:
+            return False
+        if code_point <= upper:
+            return True
+    return False
+
+
 def classify_text_ink(value: Any) -> str:
     """Classify nonempty text as visible or semantically zero ink.
 
@@ -94,7 +118,11 @@ def classify_text_ink(value: Any) -> str:
     if not text:
         return "empty"
     for character in text:
-        if character.isspace() or _is_default_ignorable_code_point(ord(character)):
+        code_point = ord(character)
+        if (
+            _is_white_space_code_point(code_point)
+            or _is_default_ignorable_code_point(code_point)
+        ):
             continue
         return "visible"
     return "zero_ink"
@@ -106,6 +134,11 @@ def text_has_visible_ink(value: Any) -> bool:
 
 def text_is_zero_ink(value: Any) -> bool:
     return classify_text_ink(value) == "zero_ink"
+
+
+def text_is_unicode_whitespace(value: Any) -> bool:
+    text = value if isinstance(value, str) else "" if value is None else str(value)
+    return bool(text) and all(_is_white_space_code_point(ord(char)) for char in text)
 
 
 @dataclass(frozen=True)
@@ -497,11 +530,6 @@ def _zero_ink_manifest_contract_failures(
             failures.append("zero_ink_source_manifest_character_text_missing")
         elif require_all_zero_ink and not text_is_zero_ink(character_text):
             failures.append("zero_ink_source_manifest_character_text_not_zero_ink")
-        character_is_zero_ink = bool(
-            isinstance(character_text, str)
-            and character_text
-            and text_is_zero_ink(character_text)
-        )
         glyph_id = character.get("glyph_id")
         if glyph_id is not None and _strict_int(glyph_id) is None:
             failures.append("zero_ink_source_manifest_glyph_identity_invalid")
@@ -512,7 +540,6 @@ def _zero_ink_manifest_contract_failures(
                 metric = math.nan
             zero_advance_is_valid = (
                 metric_field == "advance_width_model"
-                and character_is_zero_ink
                 and metric == 0.0
             )
             if not math.isfinite(metric) or (
@@ -1560,6 +1587,7 @@ __all__ = [
     "make_zero_ink_character_manifest",
     "normalize_representation",
     "text_has_visible_ink",
+    "text_is_unicode_whitespace",
     "text_is_zero_ink",
     "zero_ink_character_proof_failures",
     "zero_ink_delivery_proof_failures",

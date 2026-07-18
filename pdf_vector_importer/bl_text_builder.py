@@ -29,6 +29,7 @@ from .text_delivery import (
     make_zero_ink_character_manifest,
     normalize_representation,
     text_has_visible_ink,
+    text_is_unicode_whitespace,
     text_is_zero_ink,
 )
 
@@ -302,10 +303,7 @@ def _metric_character_matrix_values(
     hx, hy = ur[0] - ul[0], ur[1] - ul[1]
     vx, vy = ul[0] - ll[0], ul[1] - ll[1]
     if advance <= 1e-12:
-        axis_tolerance = max(
-            1e-12,
-            max(abs(value) for point in (ul, ur, ll) for value in point) * 1e-9,
-        )
+        axis_tolerance = 1e-12
         if math.hypot(hx, hy) > axis_tolerance:
             raise ValueError(
                 "zero local advance requires a degenerate target horizontal axis"
@@ -506,7 +504,9 @@ def _positioned_font_axis_metrics_values(
     glyph_id = getattr(text_item, "source_glyph_id", None)
     source_text = str(getattr(text_item, "text", "") or "")
     zero_ink_identity = classify_text_ink(source_text) == "zero_ink"
-    if zero_ink_identity and (glyph_id is None or not source_text.isspace()):
+    if zero_ink_identity and (
+        glyph_id is None or not text_is_unicode_whitespace(source_text)
+    ):
         try:
             local_advance = abs(float(text_item.advance_width)) * MM_TO_M
             local_line_height = abs(float(text_item.glyph_height)) * MM_TO_M
@@ -539,6 +539,8 @@ def _positioned_font_axis_metrics_values(
             "line_height_units": 0,
             "design_unit_scale": 0.0,
             "local_advance": local_advance,
+            "local_matrix_horizontal_extent": local_advance,
+            "matrix_horizontal_extent_source": "source_layout_advance",
             "local_line_height": local_line_height,
             "local_baseline_y": local_baseline_y,
             "source_ink_bounds_design_units": None,
@@ -563,7 +565,7 @@ def _positioned_font_axis_metrics_values(
         glyph_id < 0
         or units_per_em <= 0
         or line_height_units <= 0
-        or advance_units <= 0
+        or advance_units < 0
         or not math.isfinite(size)
         or size <= 0.0
     ):
@@ -574,6 +576,22 @@ def _positioned_font_axis_metrics_values(
     )
     if source_ink_bounds is None and not zero_ink_identity:
         raise RuntimeError("visible positioned character has no exact source glyph ink bounds")
+    local_advance = float(advance_units) * design_unit_scale
+    local_matrix_horizontal_extent = local_advance
+    matrix_horizontal_extent_source = "embedded_font_glyph_advance"
+    if advance_units == 0 and not zero_ink_identity:
+        ink_x0, _ink_y0, ink_x1, _ink_y1 = source_ink_bounds
+        local_matrix_horizontal_extent = (
+            float(ink_x1) - float(ink_x0)
+        ) * design_unit_scale
+        if (
+            not math.isfinite(local_matrix_horizontal_extent)
+            or local_matrix_horizontal_extent <= 1e-12
+        ):
+            raise RuntimeError(
+                "visible zero-advance glyph has no finite exact contour extent"
+            )
+        matrix_horizontal_extent_source = "exact_source_glyph_ink_width"
     local_baseline_y = (
         -float(descender) * design_unit_scale
         if baseline_alignment == "BOTTOM"
@@ -587,12 +605,17 @@ def _positioned_font_axis_metrics_values(
         "advance_units": advance_units,
         "line_height_units": line_height_units,
         "design_unit_scale": design_unit_scale,
-        "local_advance": float(advance_units) * design_unit_scale,
+        "local_advance": local_advance,
+        "local_matrix_horizontal_extent": local_matrix_horizontal_extent,
+        "matrix_horizontal_extent_source": matrix_horizontal_extent_source,
         "local_line_height": float(line_height_units) * design_unit_scale,
         "local_baseline_y": local_baseline_y,
         "source_ink_bounds_design_units": source_ink_bounds,
         "metric_source": "embedded_font_glyph_metrics",
         "zero_ink_identity": zero_ink_identity,
+        "zero_advance_logical_proof": (
+            zero_ink_identity and local_advance <= 1e-12
+        ),
     }
 
 
@@ -671,7 +694,10 @@ def _apply_target_quad_affine(
     if positioned_character:
         metric_evidence = _positioned_font_axis_metrics(obj, text_item)
         matrix_values = _metric_character_matrix_values(
-            local_advance=metric_evidence["local_advance"],
+            local_advance=metric_evidence.get(
+                "local_matrix_horizontal_extent",
+                metric_evidence["local_advance"],
+            ),
             local_line_height=metric_evidence["local_line_height"],
             local_baseline_y=metric_evidence["local_baseline_y"],
             target_origin=getattr(text_item, "insertion", None),
@@ -1449,8 +1475,12 @@ def _verify_metric_character_transform(obj, text_item) -> tuple[list[str], Dict[
             target_quad[0][1] - target_quad[3][1],
         )
         expected_advance = (
-            target_origin[0] + target_horizontal[0],
-            target_origin[1] + target_horizontal[1],
+            target_origin
+            if local_advance <= 1e-12
+            else (
+                target_origin[0] + target_horizontal[0],
+                target_origin[1] + target_horizontal[1],
+            )
         )
         expected_line = (
             target_origin[0] + target_vertical[0],
@@ -1997,10 +2027,13 @@ def _copy_object_transform(source, target) -> None:
         "pdf_metric_line_height_units",
         "pdf_metric_design_unit_scale",
         "pdf_metric_local_advance",
+        "pdf_metric_local_matrix_horizontal_extent",
+        "pdf_metric_matrix_horizontal_extent_source",
         "pdf_metric_local_line_height",
         "pdf_metric_local_baseline_y",
         "pdf_metric_metric_source",
         "pdf_metric_zero_ink_identity",
+        "pdf_metric_zero_advance_logical_proof",
         "pdf_metric_expected_world_ink_bounds_m",
         "pdf_metric_target_origin_m",
         "pdf_metric_target_horizontal_axis_m",
@@ -2823,28 +2856,39 @@ def _positioned_zero_ink_source_manifest(
     characters = []
     for index, layout in enumerate(layouts):
         glyph_id = getattr(layout, "glyph_id", None)
-        if text_is_zero_ink(layout.text):
+        zero_ink_character = text_is_zero_ink(layout.text)
+        visible_zero_advance_character = bool(
+            not zero_ink_character
+            and float(layout.advance_width) == 0.0
+            and glyph_id is not None
+        )
+        if zero_ink_character or visible_zero_advance_character:
             child = _character_text_item(text_item, layout)
             metrics = _positioned_font_axis_metrics_values(
                 child,
                 size=float(child.font_size) * MM_TO_M,
                 baseline_alignment=baseline_alignment,
             )
-            local_advance = metrics["local_advance"]
+            local_matrix_horizontal_extent = metrics.get(
+                "local_matrix_horizontal_extent",
+                metrics["local_advance"],
+            )
             local_line_height = metrics["local_line_height"]
             local_baseline_y = metrics["local_baseline_y"]
         else:
-            local_advance = float(layout.advance_width) * MM_TO_M
+            local_matrix_horizontal_extent = (
+                float(layout.advance_width) * MM_TO_M
+            )
             local_line_height = float(layout.glyph_height) * MM_TO_M
             local_baseline_y = 0.0
         intended_matrix = _metric_character_matrix_values(
-            local_advance=local_advance,
+            local_advance=local_matrix_horizontal_extent,
             local_line_height=local_line_height,
             local_baseline_y=local_baseline_y,
             target_origin=layout.target_origin,
             target_quad=layout.target_quad,
             z=float(z_offset_m),
-            allow_zero_advance=text_is_zero_ink(layout.text),
+            allow_zero_advance=zero_ink_character,
         )
         characters.append({
             "character_item_id": f"{item_id}:char:{index}",

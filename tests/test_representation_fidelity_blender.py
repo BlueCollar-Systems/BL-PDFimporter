@@ -501,6 +501,25 @@ def _metric_font_asset():
     )
 
 
+def _visible_zero_advance_metric_font_asset():
+    from fontTools.ttLib import TTFont
+
+    asset = _metric_font_asset()
+    font = TTFont(BytesIO(asset.usable_bytes))
+    font["hmtx"].metrics["A"] = (0, 100)
+    for cmap in font["cmap"].tables:
+        if cmap.isUnicode():
+            cmap.cmap[0x0301] = "A"
+    stream = BytesIO()
+    font.save(stream)
+    font.close()
+    asset.usable_bytes = stream.getvalue()
+    asset.usable_sha256 = sha256(asset.usable_bytes).hexdigest()
+    asset.asset_id = f"sha256:{asset.usable_sha256}"
+    asset.glyph_advances = (500, 0, 300)
+    return asset
+
+
 def _item(span_id: int = 41, *, font_asset=True) -> NormalizedText:
     return NormalizedText(
         id=span_id,
@@ -2154,6 +2173,51 @@ def test_text_ink_classifier_preserves_visible_combining_marks_and_glyphs(text):
 
 
 @pytest.mark.parametrize(
+    "text",
+    ["\x00", "\x1c", "\x1d", "\x1e", "\x1f", "\x7f"],
+)
+def test_text_ink_classifier_does_not_discard_non_whitespace_c0_controls(text):
+    # U+001C..U+001F are not in Unicode's White_Space property. Python's
+    # str.isspace() nevertheless accepts them because of their bidi classes,
+    # so using that API as the source of truth silently retypes source data.
+    assert text_delivery.classify_text_ink(text) == "visible"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "\x09",
+        "\x0a",
+        "\x0b",
+        "\x0c",
+        "\x0d",
+        "\x20",
+        "\x85",
+        "\u00a0",
+        "\u1680",
+        "\u2000",
+        "\u200a",
+        "\u2028",
+        "\u2029",
+        "\u202f",
+        "\u205f",
+        "\u3000",
+    ],
+)
+def test_text_ink_classifier_uses_exact_unicode_17_white_space_property(text):
+    assert text_delivery.text_is_unicode_whitespace(text) is True
+    assert text_delivery.classify_text_ink(text) == "zero_ink"
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["\x08", "\x0e", "\x1c", "\x1f", "\x7f", "\u0084", "\u0086"],
+)
+def test_unicode_17_white_space_property_rejects_python_only_or_nearby_values(text):
+    assert text_delivery.text_is_unicode_whitespace(text) is False
+
+
+@pytest.mark.parametrize(
     ("mode", "expected_type"),
     [("glyphs", "CURVE"), ("geometry", "MESH")],
 )
@@ -2392,6 +2456,130 @@ def test_zero_advance_zero_ink_metric_affine_uses_singular_logical_matrix(
     )
 
 
+def test_visible_zero_advance_combining_glyph_is_not_rejected_or_collapsed(
+    monkeypatch,
+):
+    _fake, collection = _install(monkeypatch)
+    _install_mathutils(monkeypatch)
+    asset = _visible_zero_advance_metric_font_asset()
+    # Glyph 1 has real contours but, as combining marks commonly do, no
+    # horizontal advance. Its ink quad remains physically non-degenerate.
+    item = _item()
+    item.font_asset = asset
+    layout = _whitespace_only_character_layout()[0]
+    layout.text = "\u0301"
+    layout.glyph_id = 1
+    child = bl_text_builder._character_text_item(item, layout)
+    data = _FontData("VisibleZeroAdvanceCombining")
+    data.size = child.font_size * 0.001
+    obj = _Object("VisibleZeroAdvanceCombining", data)
+    obj["pdf_baseline_alignment"] = "BOTTOM_BASELINE"
+
+    bl_text_builder._apply_target_quad_affine(
+        obj,
+        child,
+        0.0,
+        collection=collection,
+    )
+
+    assert obj.get("pdf_metric_zero_ink_identity") is False
+    assert obj.get("pdf_metric_local_advance") == 0.0
+    assert obj.get("pdf_metric_local_matrix_horizontal_extent") == pytest.approx(
+        0.0024
+    )
+    assert obj.get("pdf_metric_matrix_horizontal_extent_source") == (
+        "exact_source_glyph_ink_width"
+    )
+    assert obj.get("pdf_metric_zero_advance_logical_proof") is False
+    matrix = list(obj.get("pdf_affine_matrix", []))
+    assert len(matrix) == 16
+    assert all(math.isfinite(value) for value in matrix)
+    assert math.hypot(matrix[0], matrix[4]) > 0.0
+    obj.bound_box = (
+        (0.0006, -0.0012, 0.0),
+        (0.0030, -0.0012, 0.0),
+        (0.0030, 0.0042, 0.0),
+        (0.0006, 0.0042, 0.0),
+    )
+    failures, evidence = bl_text_builder._verify_metric_character_transform(
+        obj,
+        child,
+    )
+    assert failures == []
+    assert evidence["local_advance_m"] == 0.0
+    assert evidence["actual_advance_endpoint_m"] == pytest.approx(
+        evidence["expected_advance_endpoint_m"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_type"),
+    [("glyphs", "CURVE"), ("geometry", "MESH")],
+)
+def test_visible_zero_advance_combining_glyph_keeps_requested_representation(
+    monkeypatch,
+    mode,
+    expected_type,
+):
+    _fake, collection = _install(monkeypatch)
+    _install_mathutils(monkeypatch)
+    item = _item()
+    item.font_asset = _visible_zero_advance_metric_font_asset()
+    item.font_name = "MetricFixture"
+    item.text = "\u0301"
+    item.normalized = "\u0301"
+    layout = _whitespace_only_character_layout()[0]
+    layout.text = "\u0301"
+    layout.glyph_id = 1
+    layout.advance_width = 0.0
+    item.source_char_layout = (layout,)
+    item.requires_individual_positioning = True
+    opts = types.SimpleNamespace(import_mode="vector", text_mode=mode)
+
+    def verify_zero_advance_visible(obj, _text_item):
+        matrix = list(obj.get("pdf_affine_matrix", []))
+        assert obj.get("pdf_metric_local_advance") == 0.0
+        assert obj.get("pdf_metric_zero_ink_identity") is False
+        assert obj.get("pdf_metric_local_matrix_horizontal_extent") > 0.0
+        assert len(matrix) == 16
+        assert all(math.isfinite(value) for value in matrix)
+        return [], {
+            "full_affine_applied": True,
+            "metric_affine_applied": True,
+            "zero_ink_identity": False,
+            "zero_advance_logical_proof": False,
+            "evaluated_bounds_verified": True,
+            "evaluated_ink_bounds_verified": True,
+            "local_advance_m": 0.0,
+            "intended_affine_matrix": matrix,
+            "evaluated_affine_matrix": list(matrix),
+        }
+
+    monkeypatch.setattr(
+        bl_text_builder,
+        "_verify_transform_and_dimensions",
+        verify_zero_advance_visible,
+    )
+
+    obj = bl_text_builder.build_text(
+        item,
+        collection,
+        page_number=2,
+        text_mode=mode,
+        provenance_opts=opts,
+    )
+
+    record = opts._text_delivery_records[-1]
+    assert obj is not None, json.dumps(record, default=str, indent=2)
+    assert obj.type == expected_type
+    assert record["status"] == "delivered"
+    assert record["requested_representation"] == mode
+    assert record["final_representation"] == mode
+    assert record["entity_ids"] == [obj.name]
+    assert record["fallback_used"] is False
+    assert len(record["attempts"]) == 1
+
+
 def test_zero_advance_metric_affine_rejects_fabricated_horizontal_extent():
     with pytest.raises(
         ValueError,
@@ -2409,6 +2597,28 @@ def test_zero_advance_metric_affine_rejects_fabricated_horizontal_extent():
             ),
             z=0.0,
             allow_zero_advance=True,
+        )
+
+
+def test_zero_advance_metric_affine_does_not_scale_tolerance_with_page_position():
+    target_quad = (
+        (1.0e12, 1.0e12 + 6.0),
+        (1.0e12 + 0.5, 1.0e12 + 6.0),
+        (1.0e12 + 0.5, 1.0e12),
+        (1.0e12, 1.0e12),
+    )
+    with pytest.raises(
+        ValueError,
+        match="zero local advance requires a degenerate target horizontal axis",
+    ):
+        bl_text_builder._metric_character_matrix_values(
+            local_advance=0.0,
+            local_line_height=6.0,
+            target_origin=target_quad[3],
+            target_quad=target_quad,
+            z=0.0,
+            allow_zero_advance=True,
+            unit_scale=1.0,
         )
 
 
