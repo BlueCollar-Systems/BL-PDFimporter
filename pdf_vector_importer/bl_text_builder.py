@@ -23,10 +23,13 @@ from .text_delivery import (
     ZERO_INK_SOURCE_MANIFEST_SCHEMA,
     AttemptOutcome,
     ZeroInkReconciliationAuthority,
+    classify_text_ink,
     deliver_item,
     freeze_zero_ink_source_manifest,
     make_zero_ink_character_manifest,
     normalize_representation,
+    text_has_visible_ink,
+    text_is_zero_ink,
 )
 
 
@@ -267,6 +270,7 @@ def _metric_character_matrix_values(
     z: float,
     local_baseline_y: float = 0.0,
     unit_scale: float = MM_TO_M,
+    allow_zero_advance: bool = False,
 ):
     """Map exact-font advance/line axes while pinning the PDF baseline origin."""
     advance = float(local_advance)
@@ -276,7 +280,8 @@ def _metric_character_matrix_values(
         not math.isfinite(advance)
         or not math.isfinite(line_height)
         or not math.isfinite(baseline_y)
-        or advance <= 1e-12
+        or advance < 0.0
+        or (advance <= 1e-12 and not allow_zero_advance)
         or line_height <= 1e-12
     ):
         raise ValueError("local exact-font character metrics are invalid")
@@ -296,7 +301,18 @@ def _metric_character_matrix_values(
     )
     hx, hy = ur[0] - ul[0], ur[1] - ul[1]
     vx, vy = ul[0] - ll[0], ul[1] - ll[1]
-    ax, ay = hx / advance, hy / advance
+    if advance <= 1e-12:
+        axis_tolerance = max(
+            1e-12,
+            max(abs(value) for point in (ul, ur, ll) for value in point) * 1e-9,
+        )
+        if math.hypot(hx, hy) > axis_tolerance:
+            raise ValueError(
+                "zero local advance requires a degenerate target horizontal axis"
+            )
+        ax = ay = 0.0
+    else:
+        ax, ay = hx / advance, hy / advance
     bx, by = vx / line_height, vy / line_height
     tx = origin[0] - bx * baseline_y
     ty = origin[1] - by * baseline_y
@@ -488,7 +504,9 @@ def _positioned_font_axis_metrics_values(
     """Return the exact local axes used by both source proof and runtime."""
     asset = getattr(text_item, "font_asset", None)
     glyph_id = getattr(text_item, "source_glyph_id", None)
-    if glyph_id is None and not str(getattr(text_item, "text", "") or "").strip():
+    source_text = str(getattr(text_item, "text", "") or "")
+    zero_ink_identity = classify_text_ink(source_text) == "zero_ink"
+    if zero_ink_identity and (glyph_id is None or not source_text.isspace()):
         try:
             local_advance = abs(float(text_item.advance_width)) * MM_TO_M
             local_line_height = abs(float(text_item.glyph_height)) * MM_TO_M
@@ -506,14 +524,14 @@ def _positioned_font_axis_metrics_values(
             not math.isfinite(local_advance)
             or not math.isfinite(local_line_height)
             or not math.isfinite(local_baseline_y)
-            or local_advance <= 0.0
+            or local_advance < 0.0
             or local_line_height <= 0.0
         ):
             raise RuntimeError(
                 "source-layout metrics are invalid for positioned zero-ink character"
             )
         return {
-            "glyph_id": -1,
+            "glyph_id": int(glyph_id) if glyph_id is not None else -1,
             "units_per_em": 0,
             "ascender": 0,
             "descender": 0,
@@ -526,6 +544,7 @@ def _positioned_font_axis_metrics_values(
             "source_ink_bounds_design_units": None,
             "metric_source": "source_layout_zero_ink",
             "zero_ink_identity": True,
+            "zero_advance_logical_proof": local_advance <= 1e-12,
         }
     try:
         glyph_id = int(glyph_id)
@@ -550,9 +569,10 @@ def _positioned_font_axis_metrics_values(
     ):
         raise RuntimeError("exact embedded font metrics are invalid for positioned character")
     design_unit_scale = size / float(units_per_em)
-    source_ink_bounds = _exact_glyph_design_bounds(asset, glyph_id)
-    zero_ink_identity = source_ink_bounds is None
-    if zero_ink_identity and str(getattr(text_item, "text", "") or "").strip():
+    source_ink_bounds = (
+        None if zero_ink_identity else _exact_glyph_design_bounds(asset, glyph_id)
+    )
+    if source_ink_bounds is None and not zero_ink_identity:
         raise RuntimeError("visible positioned character has no exact source glyph ink bounds")
     local_baseline_y = (
         -float(descender) * design_unit_scale
@@ -636,7 +656,7 @@ def _apply_target_quad_affine(
     if (
         not positioned_character
         and (
-            not str(getattr(text_item, "text", "") or "").strip()
+            text_is_zero_ink(getattr(text_item, "text", ""))
             or not _quad_requires_full_affine(target_quad)
         )
     ):
@@ -657,6 +677,7 @@ def _apply_target_quad_affine(
             target_origin=getattr(text_item, "insertion", None),
             target_quad=target_quad,
             z=float(z_offset_m),
+            allow_zero_advance=bool(metric_evidence.get("zero_ink_identity")),
         )
         expected_ink_bounds = _metric_expected_world_ink_bounds(
             metric_evidence, matrix_values
@@ -679,7 +700,16 @@ def _apply_target_quad_affine(
 
     carrier = None
     try:
-        if _matrix_requires_affine_carrier(matrix_values):
+        zero_advance_logical_proof = bool(
+            positioned_character
+            and metric_evidence.get("zero_ink_identity") is True
+            and float(metric_evidence.get("local_advance", math.inf)) <= 1e-12
+        )
+        if zero_advance_logical_proof:
+            # There is no physical glyph to carry. Store the finite singular
+            # matrix directly so a zero-advance source remains truthful.
+            obj.matrix_world = Matrix(matrix_values)
+        elif _matrix_requires_affine_carrier(matrix_values):
             parent_values, child_values = _factor_affine_matrix_values(matrix_values)
             target_collection = collection
             if target_collection is None:
@@ -1429,6 +1459,9 @@ def _verify_metric_character_transform(obj, text_item) -> tuple[list[str], Dict[
         evaluated_matrix = [float(value) for row in matrix for value in row]
         intended_matrix = [float(value) for value in obj.get("pdf_affine_matrix", [])]
         zero_ink_identity = bool(obj.get("pdf_metric_zero_ink_identity", False))
+        zero_advance_logical_proof = bool(
+            obj.get("pdf_metric_zero_advance_logical_proof", False)
+        )
         expected_world_ink_bounds = None
         actual_world_ink_bounds = None
         ink_bounds_verified = zero_ink_identity
@@ -1530,6 +1563,7 @@ def _verify_metric_character_transform(obj, text_item) -> tuple[list[str], Dict[
             evaluated_affine_matrix=evaluated_matrix,
             intended_affine_matrix=intended_matrix,
             zero_ink_identity=zero_ink_identity,
+            zero_advance_logical_proof=zero_advance_logical_proof,
             expected_world_ink_bounds_m=(
                 list(expected_world_ink_bounds)
                 if expected_world_ink_bounds is not None
@@ -1554,6 +1588,10 @@ def _verify_metric_character_transform(obj, text_item) -> tuple[list[str], Dict[
         )
         if not all(math.isfinite(value) for value in finite_values):
             failures.append("nonfinite_metric_character_transform")
+        if zero_advance_logical_proof != (
+            zero_ink_identity and local_advance <= 1e-12
+        ):
+            failures.append("zero_advance_logical_proof_mismatch")
         tolerance = 1e-7
         for actual, expected, reason in (
             (actual_baseline, target_origin, "evaluated_baseline_anchor_mismatch"),
@@ -1758,7 +1796,7 @@ def _verify_transform_and_dimensions(obj, text_item) -> tuple[list[str], Dict[st
         evidence["actual_dimensions_m"] = [actual_width, actual_height]
         evidence["evaluated_dimensions_m"] = [evaluated_width, evaluated_height]
         evidence["evaluated_bounds_verified"] = True
-        has_visible_source = bool(str(getattr(text_item, "text", "") or "").strip())
+        has_visible_source = text_has_visible_ink(getattr(text_item, "text", ""))
         evidence["source_has_visible_characters"] = has_visible_source
         # A whitespace-only PDF span legitimately has no rendered bounding
         # geometry. Preserve its exact editable body and transform; do not
@@ -2785,7 +2823,7 @@ def _positioned_zero_ink_source_manifest(
     characters = []
     for index, layout in enumerate(layouts):
         glyph_id = getattr(layout, "glyph_id", None)
-        if str(layout.text) and not str(layout.text).strip():
+        if text_is_zero_ink(layout.text):
             child = _character_text_item(text_item, layout)
             metrics = _positioned_font_axis_metrics_values(
                 child,
@@ -2806,6 +2844,7 @@ def _positioned_zero_ink_source_manifest(
             target_origin=layout.target_origin,
             target_quad=layout.target_quad,
             z=float(z_offset_m),
+            allow_zero_advance=text_is_zero_ink(layout.text),
         )
         characters.append({
             "character_item_id": f"{item_id}:char:{index}",
@@ -3079,7 +3118,7 @@ def _prepare_positioned_converted_candidate(
         source_marks_zero_ink
         and source_evidence.get("zero_ink_identity") is True
         and source_evidence.get("evaluated_ink_bounds_verified") is True
-        and not str(getattr(text_item, "text", "") or "").strip()
+        and text_is_zero_ink(getattr(text_item, "text", ""))
     )
     try:
         evaluated = source.evaluated_get(depsgraph)
@@ -3107,19 +3146,19 @@ def _prepare_positioned_converted_candidate(
                 clear = getattr(evaluated, "to_curve_clear", None)
                 if callable(clear):
                     clear()
-            if not list(getattr(final_data, "splines", []) or []):
-                if verified_zero_ink:
-                    return None, final_data, None, {
-                        **source_evidence,
-                        "item_id": item_id,
-                        "zero_ink_identity": True,
-                        "evaluated_ink_bounds_verified": True,
-                        "conversion_outcome": (
-                            "verified_zero_ink_no_physical_entity"
-                        ),
-                        "converted_datablock_kind": "CURVE",
-                        "converted_ink_element_count": 0,
-                    }
+            converted_splines = list(getattr(final_data, "splines", []) or [])
+            if verified_zero_ink:
+                return None, final_data, None, {
+                    **source_evidence,
+                    "item_id": item_id,
+                    "zero_ink_identity": True,
+                    "evaluated_ink_bounds_verified": True,
+                    "conversion_outcome": "verified_zero_ink_no_physical_entity",
+                    "converted_datablock_kind": "CURVE",
+                    "converted_ink_element_count": len(converted_splines),
+                    "discarded_host_placeholder_ink": bool(converted_splines),
+                }
+            if not converted_splines:
                 return None, final_data, AttemptOutcome.failed(
                     "glyph_curve_has_no_verified_splines",
                     evidence={"item_id": item_id},
@@ -3135,19 +3174,19 @@ def _prepare_positioned_converted_candidate(
             if not callable(mesh_factory):  # pragma: no cover - checked by caller
                 raise RuntimeError("positioned mesh conversion capability disappeared")
             final_data = mesh_factory(evaluated, depsgraph=depsgraph)
-            if not list(getattr(final_data, "vertices", []) or []):
-                if verified_zero_ink:
-                    return None, final_data, None, {
-                        **source_evidence,
-                        "item_id": item_id,
-                        "zero_ink_identity": True,
-                        "evaluated_ink_bounds_verified": True,
-                        "conversion_outcome": (
-                            "verified_zero_ink_no_physical_entity"
-                        ),
-                        "converted_datablock_kind": "MESH",
-                        "converted_ink_element_count": 0,
-                    }
+            converted_vertices = list(getattr(final_data, "vertices", []) or [])
+            if verified_zero_ink:
+                return None, final_data, None, {
+                    **source_evidence,
+                    "item_id": item_id,
+                    "zero_ink_identity": True,
+                    "evaluated_ink_bounds_verified": True,
+                    "conversion_outcome": "verified_zero_ink_no_physical_entity",
+                    "converted_datablock_kind": "MESH",
+                    "converted_ink_element_count": len(converted_vertices),
+                    "discarded_host_placeholder_ink": bool(converted_vertices),
+                }
+            if not converted_vertices:
                 return None, final_data, AttemptOutcome.failed(
                     "geometry_mesh_has_no_verified_vertices",
                     evidence={"item_id": item_id},

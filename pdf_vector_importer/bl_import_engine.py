@@ -40,6 +40,7 @@ from .text_delivery import (
     freeze_zero_ink_source_manifest,
     normalize_representation,
     open_zero_ink_reconciliation_authority,
+    text_is_zero_ink,
     zero_ink_character_proof_failures,
     zero_ink_delivery_proof_failures,
 )
@@ -1999,8 +2000,7 @@ def _canonical_zero_ink_delivery_manifest(
         for character in source_characters
         if isinstance(character, dict)
         and isinstance(character.get("text"), str)
-        and bool(character.get("text"))
-        and not character.get("text").strip()
+        and text_is_zero_ink(character.get("text"))
     )
     logical_zero_ink = bool(source_characters) and zero_count == len(source_characters)
     if _strict_manifest_int(manifest.get("source_character_count")) != len(
@@ -2230,8 +2230,7 @@ def _reverify_text_delivery_after_stack(
                 for character in canonical_characters
                 if isinstance(character, dict)
                 and isinstance(character.get("text"), str)
-                and bool(character.get("text"))
-                and not character.get("text").strip()
+                and text_is_zero_ink(character.get("text"))
             )
             canonical_logical_zero_ink = bool(canonical_characters) and (
                 canonical_zero_count == len(canonical_characters)
@@ -2332,8 +2331,7 @@ def _reverify_text_delivery_after_stack(
             for character in manifest_characters
             if isinstance(character, dict)
             and isinstance(character.get("text"), str)
-            and bool(character.get("text"))
-            and not character.get("text").strip()
+            and text_is_zero_ink(character.get("text"))
         )
         record_zero_count = record.get("zero_ink_character_count")
         evidence_characters = prior_evidence.get("character_entities")
@@ -2346,8 +2344,7 @@ def _reverify_text_delivery_after_stack(
                     and character["verification"].get("zero_ink_identity") is True
                     or (
                         isinstance(character.get("text"), str)
-                        and bool(character.get("text"))
-                        and not character.get("text").strip()
+                        and text_is_zero_ink(character.get("text"))
                     )
                 )
                 for character in evidence_characters

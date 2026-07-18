@@ -26,7 +26,7 @@ if "bpy" not in sys.modules:
 if "bmesh" not in sys.modules:
     sys.modules["bmesh"] = types.SimpleNamespace()
 
-from pdf_vector_importer import bl_import_engine, bl_text_builder
+from pdf_vector_importer import bl_import_engine, bl_text_builder, text_delivery
 from pdf_vector_importer.pdfcadcore.primitives import NormalizedText, TextCharLayout
 from pdf_vector_importer.text_delivery import AttemptOutcome, deliver_item, fallback_ladder
 
@@ -621,14 +621,47 @@ def _whitespace_only_character_layout():
     )
 
 
+def _zero_advance_variation_selector_layout():
+    return TextCharLayout(
+        text="\ufe0f",
+        glyph_id=None,
+        source_origin_pdf=(10.0, 20.0),
+        source_bbox_pdf=(10.0, 10.0, 10.0, 22.0),
+        source_quad_pdf=(
+            (10.0, 10.0),
+            (10.0, 10.0),
+            (10.0, 22.0),
+            (10.0, 22.0),
+        ),
+        target_origin=(12.0, 24.0),
+        target_quad=(
+            (12.0, 30.0),
+            (12.0, 30.0),
+            (12.0, 24.0),
+            (12.0, 24.0),
+        ),
+        advance_width=0.0,
+        glyph_height=6.0,
+    )
+
+
 def _install_positioned_empty_conversion_host(
     monkeypatch,
     fake,
     *,
     empty_visible_glyphs=False,
+    zero_ink_texts=(),
+    host_placeholder_texts=(),
 ):
+    expected_zero_ink_texts = set(zero_ink_texts)
+    expected_host_placeholder_texts = set(host_placeholder_texts)
+
+    def zero_ink_text(value):
+        text = str(value)
+        return not text.strip() or text in expected_zero_ink_texts
+
     def apply_metric_identity(obj, text_item, *_args, **_kwargs):
-        zero_ink = not str(text_item.text).strip()
+        zero_ink = zero_ink_text(text_item.text)
         z_offset_m = float(_args[0]) if _args else 0.0
         matrix = bl_text_builder._metric_character_matrix_values(
             local_advance=float(text_item.advance_width) * 0.001,
@@ -637,6 +670,7 @@ def _install_positioned_empty_conversion_host(
             target_origin=text_item.insertion,
             target_quad=text_item.target_quad_model,
             z=z_offset_m,
+            allow_zero_advance=zero_ink,
         )
         flattened_matrix = [float(value) for row in matrix for value in row]
         obj["pdf_full_affine_applied"] = True
@@ -671,6 +705,9 @@ def _install_positioned_empty_conversion_host(
                 "evaluated_ink_bounds_verified": True,
                 "zero_ink_identity": zero_ink,
                 "local_advance_m": float(text_item.advance_width) * 0.001,
+                "zero_advance_logical_proof": (
+                    zero_ink and abs(float(text_item.advance_width)) <= 1e-12
+                ),
                 "intended_affine_matrix": matrix,
                 "evaluated_affine_matrix": list(matrix),
             },
@@ -690,7 +727,10 @@ def _install_positioned_empty_conversion_host(
             depsgraph,
             apply_modifiers=apply_modifiers,
         )
-        if empty_visible_glyphs or not str(self.data.body).strip():
+        if empty_visible_glyphs or (
+            zero_ink_text(self.data.body)
+            and str(self.data.body) not in expected_host_placeholder_texts
+        ):
             curve.splines = []
         return curve
 
@@ -698,7 +738,10 @@ def _install_positioned_empty_conversion_host(
 
     def to_mesh_with_expected_empty_ink(evaluated, depsgraph=None):
         mesh = original_to_mesh(evaluated, depsgraph=depsgraph)
-        if empty_visible_glyphs or not str(evaluated.data.body).strip():
+        if empty_visible_glyphs or (
+            zero_ink_text(evaluated.data.body)
+            and str(evaluated.data.body) not in expected_host_placeholder_texts
+        ):
             mesh.vertices = []
             mesh.polygons = []
         return mesh
@@ -2092,6 +2135,281 @@ def test_positioned_whitespace_without_glyph_id_uses_source_layout_identity_metr
     assert metrics["zero_ink_identity"] is True
     assert metrics["local_advance"] == pytest.approx(0.006)
     assert metrics["local_line_height"] == pytest.approx(0.006)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [" ", "\u034f", "\u200d", "\u2061", "\ufe0f", "\U000e0100"],
+)
+def test_text_ink_classifier_recognizes_unicode_default_ignorables(text):
+    assert text_delivery.classify_text_ink(text) == "zero_ink"
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["\u0301", "\u20dd", "\u06dd", "A\ufe0f"],
+)
+def test_text_ink_classifier_preserves_visible_combining_marks_and_glyphs(text):
+    assert text_delivery.classify_text_ink(text) == "visible"
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_type"),
+    [("glyphs", "CURVE"), ("geometry", "MESH")],
+)
+def test_positioned_visible_combining_mark_keeps_requested_physical_representation(
+    monkeypatch,
+    mode,
+    expected_type,
+):
+    character = "\u0301"
+    fake, collection = _install(monkeypatch)
+    _install_positioned_empty_conversion_host(monkeypatch, fake)
+    layout = _whitespace_only_character_layout()[0]
+    layout.text = character
+    item = _item()
+    item.text = character
+    item.normalized = character
+    item.source_char_layout = (layout,)
+    item.requires_individual_positioning = True
+    opts = types.SimpleNamespace(import_mode="vector", text_mode=mode)
+
+    obj = bl_text_builder.build_text(
+        item,
+        collection,
+        page_number=2,
+        text_mode=mode,
+        provenance_opts=opts,
+    )
+
+    record = opts._text_delivery_records[-1]
+    assert obj is not None
+    assert obj.type == expected_type
+    assert record["status"] == "delivered"
+    assert record["final_representation"] == mode
+    assert record["entity_ids"] == [obj.name]
+    assert record.get("zero_ink_character_count", 0) == 0
+
+
+@pytest.mark.parametrize("mode", ["glyphs", "geometry"])
+@pytest.mark.parametrize(
+    "character",
+    ["\u2061", "\u2062", "\u2063", "\u2064", "\ufe0e", "\ufe0f"],
+)
+def test_positioned_default_ignorable_character_delivers_zero_ink_without_notdef(
+    monkeypatch,
+    mode,
+    character,
+):
+    fake, collection = _install(monkeypatch)
+    _install_positioned_empty_conversion_host(
+        monkeypatch,
+        fake,
+        zero_ink_texts=(character,),
+    )
+    layout = _whitespace_only_character_layout()[0]
+    layout.text = character
+    item = _item()
+    item.text = character
+    item.normalized = character
+    item.source_char_layout = (layout,)
+    item.requires_individual_positioning = True
+    opts = types.SimpleNamespace(import_mode="vector", text_mode=mode)
+
+    obj = bl_text_builder.build_text(
+        item,
+        collection,
+        page_number=2,
+        text_mode=mode,
+        provenance_opts=opts,
+    )
+
+    assert obj is None
+    record = opts._text_delivery_records[-1]
+    assert record["status"] == "delivered"
+    assert record["requested_representation"] == mode
+    assert record["final_representation"] == mode
+    assert record["entity_ids"] == []
+    assert record["zero_ink_delivery"] is True
+    assert record["zero_ink_character_count"] == 1
+    assert collection.objects.items == []
+    assert getattr(opts, "_text_delivered_entity_counts", {}) == {}
+
+    monkeypatch.setattr(bl_import_engine, "bpy", fake)
+    assert bl_import_engine._reverify_text_delivery_after_stack(
+        [record],
+        page_number=2,
+        stack_offset_m=0.0,
+        provenance_opts=opts,
+    ) == []
+
+
+@pytest.mark.parametrize(
+    ("mode", "converted_kind"),
+    [("glyphs", "CURVE"), ("geometry", "MESH")],
+)
+def test_positioned_default_ignorable_discards_host_notdef_placeholder(
+    monkeypatch,
+    mode,
+    converted_kind,
+):
+    character = "\u2061"
+    fake, collection = _install(monkeypatch)
+    _install_positioned_empty_conversion_host(
+        monkeypatch,
+        fake,
+        zero_ink_texts=(character,),
+        host_placeholder_texts=(character,),
+    )
+    layout = _whitespace_only_character_layout()[0]
+    layout.text = character
+    item = _item()
+    item.text = character
+    item.normalized = character
+    item.source_char_layout = (layout,)
+    item.requires_individual_positioning = True
+    opts = types.SimpleNamespace(import_mode="vector", text_mode=mode)
+
+    assert bl_text_builder.build_text(
+        item,
+        collection,
+        page_number=2,
+        text_mode=mode,
+        provenance_opts=opts,
+    ) is None
+
+    record = opts._text_delivery_records[-1]
+    verification = record["attempts"][0]["evidence"]["character_entities"][0][
+        "verification"
+    ]
+    assert record["status"] == "delivered"
+    assert record["final_representation"] == mode
+    assert record["entity_ids"] == []
+    assert collection.objects.items == []
+    assert verification["converted_datablock_kind"] == converted_kind
+    assert verification["converted_ink_element_count"] > 0
+    assert verification["discarded_host_placeholder_ink"] is True
+    assert verification["cleanup"]["status"] == "complete"
+
+
+@pytest.mark.parametrize("mode", ["glyphs", "geometry"])
+def test_positioned_variation_selector_zero_advance_keeps_finite_logical_proof(
+    monkeypatch,
+    mode,
+):
+    character = "\ufe0f"
+    fake, collection = _install(monkeypatch)
+    _install_positioned_empty_conversion_host(
+        monkeypatch,
+        fake,
+        zero_ink_texts=(character,),
+    )
+    layout = _zero_advance_variation_selector_layout()
+    item = _item()
+    item.text = character
+    item.normalized = character
+    item.source_char_layout = (layout,)
+    item.requires_individual_positioning = True
+    opts = types.SimpleNamespace(import_mode="vector", text_mode=mode)
+
+    assert bl_text_builder.build_text(
+        item,
+        collection,
+        page_number=2,
+        text_mode=mode,
+        provenance_opts=opts,
+    ) is None
+
+    record = opts._text_delivery_records[-1]
+    character_evidence = record["attempts"][0]["evidence"]["character_entities"][0]
+    verification = character_evidence["verification"]
+    intended = verification["intended_affine_matrix"]
+    evaluated = verification["evaluated_affine_matrix"]
+    assert record["status"] == "delivered"
+    assert record["final_representation"] == mode
+    assert record["entity_ids"] == []
+    assert record["zero_ink_delivery"] is True
+    assert record["zero_ink_character_count"] == 1
+    assert character_evidence["advance_width_model"] == 0.0
+    assert verification["local_advance_m"] == 0.0
+    assert len(intended) == len(evaluated) == 16
+    assert all(math.isfinite(value) for value in intended + evaluated)
+    assert intended[0] == intended[4] == 0.0
+    assert evaluated == pytest.approx(intended)
+    assert verification["zero_ink_identity"] is True
+    assert verification["conversion_outcome"] == (
+        "verified_zero_ink_no_physical_entity"
+    )
+    assert collection.objects.items == []
+    assert getattr(opts, "_text_delivered_entity_counts", {}) == {}
+
+    monkeypatch.setattr(bl_import_engine, "bpy", fake)
+    assert bl_import_engine._reverify_text_delivery_after_stack(
+        [record],
+        page_number=2,
+        stack_offset_m=0.0,
+        provenance_opts=opts,
+    ) == []
+
+
+def test_zero_advance_zero_ink_metric_affine_uses_singular_logical_matrix(
+    monkeypatch,
+):
+    _fake, collection = _install(monkeypatch)
+    _install_mathutils(monkeypatch)
+    layout = _zero_advance_variation_selector_layout()
+    child = bl_text_builder._character_text_item(_item(), layout)
+    data = _FontData("ZeroAdvanceLogicalProof")
+    data.size = 0.006
+    obj = _Object("ZeroAdvanceLogicalProof", data)
+    obj["pdf_baseline_alignment"] = "BOTTOM_BASELINE"
+
+    carrier = bl_text_builder._apply_target_quad_affine(
+        obj,
+        child,
+        0.0,
+        collection=collection,
+    )
+
+    matrix = list(obj.get("pdf_affine_matrix", []))
+    assert carrier is None
+    assert obj.get("pdf_affine_carrier", "") == ""
+    assert obj.get("pdf_metric_zero_ink_identity") is True
+    assert obj.get("pdf_metric_zero_advance_logical_proof") is True
+    assert obj.get("pdf_metric_local_advance") == 0.0
+    assert len(matrix) == 16
+    assert all(math.isfinite(value) for value in matrix)
+    assert matrix[0] == matrix[4] == 0.0
+    failures, verification = bl_text_builder._verify_metric_character_transform(
+        obj,
+        child,
+    )
+    assert failures == []
+    assert verification["zero_advance_logical_proof"] is True
+    assert verification["local_advance_m"] == 0.0
+    assert verification["actual_advance_endpoint_m"] == pytest.approx(
+        verification["expected_advance_endpoint_m"]
+    )
+
+
+def test_zero_advance_metric_affine_rejects_fabricated_horizontal_extent():
+    with pytest.raises(
+        ValueError,
+        match="zero local advance requires a degenerate target horizontal axis",
+    ):
+        bl_text_builder._metric_character_matrix_values(
+            local_advance=0.0,
+            local_line_height=0.006,
+            target_origin=(12.0, 24.0),
+            target_quad=(
+                (12.0, 30.0),
+                (15.0, 30.0),
+                (15.0, 24.0),
+                (12.0, 24.0),
+            ),
+            z=0.0,
+            allow_zero_advance=True,
+        )
 
 
 def test_positioned_font_axis_metrics_use_upem_for_horizontal_glyph_domain():

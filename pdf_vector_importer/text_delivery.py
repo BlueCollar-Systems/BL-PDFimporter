@@ -13,6 +13,27 @@ IMPORTER_ID = "bc_pdf_vector_importer.blender"
 ZERO_INK_SOURCE_MANIFEST_SCHEMA = "positioned_zero_ink_source_manifest_v1"
 ZERO_INK_CHARACTER_MANIFEST_SCHEMA = "positioned_zero_ink_character_manifest_v1"
 ZERO_INK_DELIVERY_MANIFEST_SCHEMA = "positioned_zero_ink_delivery_manifest_v1"
+# Unicode 17.0 UCD, DerivedCoreProperties.txt, Default_Ignorable_Code_Point:
+# https://www.unicode.org/Public/17.0.0/ucd/DerivedCoreProperties.txt
+_DEFAULT_IGNORABLE_CODE_POINT_RANGES = (
+    (0x00AD, 0x00AD),
+    (0x034F, 0x034F),
+    (0x061C, 0x061C),
+    (0x115F, 0x1160),
+    (0x17B4, 0x17B5),
+    (0x180B, 0x180F),
+    (0x200B, 0x200F),
+    (0x202A, 0x202E),
+    (0x2060, 0x206F),
+    (0x3164, 0x3164),
+    (0xFE00, 0xFE0F),
+    (0xFEFF, 0xFEFF),
+    (0xFFA0, 0xFFA0),
+    (0xFFF0, 0xFFF8),
+    (0x1BCA0, 0x1BCA3),
+    (0x1D173, 0x1D17A),
+    (0xE0000, 0xE0FFF),
+)
 _ZERO_INK_CHARACTER_SOURCE_FIELDS = (
     "character_item_id",
     "character_index",
@@ -50,6 +71,41 @@ _FONT_PROOF_CATEGORIES = {
         "runtime_source_document_unavailable_for_item"
     },
 }
+
+
+def _is_default_ignorable_code_point(code_point: int) -> bool:
+    """Return Unicode 17.0 Default_Ignorable_Code_Point membership."""
+    for lower, upper in _DEFAULT_IGNORABLE_CODE_POINT_RANGES:
+        if code_point < lower:
+            return False
+        if code_point <= upper:
+            return True
+    return False
+
+
+def classify_text_ink(value: Any) -> str:
+    """Classify nonempty text as visible or semantically zero ink.
+
+    Whitespace and Unicode Default_Ignorable_Code_Point characters carry layout
+    identity but no standalone visible ink. Any other code point keeps the whole
+    string visible, including ordinary combining marks and visible format glyphs.
+    """
+    text = value if isinstance(value, str) else "" if value is None else str(value)
+    if not text:
+        return "empty"
+    for character in text:
+        if character.isspace() or _is_default_ignorable_code_point(ord(character)):
+            continue
+        return "visible"
+    return "zero_ink"
+
+
+def text_has_visible_ink(value: Any) -> bool:
+    return classify_text_ink(value) == "visible"
+
+
+def text_is_zero_ink(value: Any) -> bool:
+    return classify_text_ink(value) == "zero_ink"
 
 
 @dataclass(frozen=True)
@@ -408,7 +464,7 @@ def _zero_ink_manifest_contract_failures(
     source_text = manifest.get("source_text")
     if not isinstance(source_text, str) or not source_text:
         failures.append("zero_ink_source_manifest_text_missing")
-    elif require_all_zero_ink and source_text.strip():
+    elif require_all_zero_ink and not text_is_zero_ink(source_text):
         failures.append("zero_ink_source_manifest_text_not_zero_ink")
     characters = manifest.get("characters")
     if not isinstance(characters, list):
@@ -439,8 +495,13 @@ def _zero_ink_manifest_contract_failures(
         character_text = character.get("text")
         if not isinstance(character_text, str) or not character_text:
             failures.append("zero_ink_source_manifest_character_text_missing")
-        elif require_all_zero_ink and character_text.strip():
+        elif require_all_zero_ink and not text_is_zero_ink(character_text):
             failures.append("zero_ink_source_manifest_character_text_not_zero_ink")
+        character_is_zero_ink = bool(
+            isinstance(character_text, str)
+            and character_text
+            and text_is_zero_ink(character_text)
+        )
         glyph_id = character.get("glyph_id")
         if glyph_id is not None and _strict_int(glyph_id) is None:
             failures.append("zero_ink_source_manifest_glyph_identity_invalid")
@@ -449,7 +510,14 @@ def _zero_ink_manifest_contract_failures(
                 metric = float(character.get(metric_field))
             except (TypeError, ValueError):
                 metric = math.nan
-            if not math.isfinite(metric) or metric <= 0.0:
+            zero_advance_is_valid = (
+                metric_field == "advance_width_model"
+                and character_is_zero_ink
+                and metric == 0.0
+            )
+            if not math.isfinite(metric) or (
+                metric <= 0.0 and not zero_advance_is_valid
+            ):
                 failures.append(f"zero_ink_source_manifest_{metric_field}_invalid")
         for origin_field in ("source_origin_pdf", "target_origin_model"):
             if not _finite_sequence(character.get(origin_field), 2):
@@ -620,8 +688,7 @@ def _zero_ink_character_proof_failures(
         for index, character in enumerate(expected_characters)
         if isinstance(character, dict)
         and isinstance(character.get("text"), str)
-        and bool(character.get("text"))
-        and not character.get("text").strip()
+        and text_is_zero_ink(character.get("text"))
     ]
     if not zero_indices:
         failures.append("zero_ink_character_source_identity_missing")
@@ -702,7 +769,7 @@ def _zero_ink_character_proof_failures(
         if (
             not isinstance(character_text, str)
             or not character_text
-            or character_text.strip()
+            or not text_is_zero_ink(character_text)
         ):
             failures.append("zero_ink_character_has_visible_text")
         if character.get("requested_representation") != requested_representation:
@@ -720,6 +787,15 @@ def _zero_ink_character_proof_failures(
         if not isinstance(verification, dict):
             failures.append("zero_ink_character_identity_unverified")
             continue
+        try:
+            expected_advance = float(expected_character.get("advance_width_model"))
+        except (TypeError, ValueError):
+            expected_advance = math.nan
+        if (
+            expected_advance == 0.0
+            and verification.get("zero_advance_logical_proof") is not True
+        ):
+            failures.append("zero_advance_logical_proof_unverified")
         intended_matrix = verification.get("intended_affine_matrix")
         evaluated_matrix = verification.get("evaluated_affine_matrix")
         if not _finite_sequence(intended_matrix, 16):
@@ -965,7 +1041,7 @@ def _zero_ink_delivery_proof_failures(
         character_text = character.get("text")
         if not isinstance(character_text, str) or not character_text:
             failures.append("zero_ink_character_text_missing")
-        elif character_text.strip():
+        elif not text_is_zero_ink(character_text):
             failures.append("zero_ink_character_has_visible_text")
         if character.get("requested_representation") != requested_representation:
             failures.append("zero_ink_character_requested_representation_unbound")
@@ -980,7 +1056,7 @@ def _zero_ink_delivery_proof_failures(
             advance = float(character.get("advance_width_model"))
         except (TypeError, ValueError):
             advance = math.nan
-        if not math.isfinite(advance) or advance <= 0.0:
+        if not math.isfinite(advance) or advance < 0.0:
             failures.append("zero_ink_character_advance_unverified")
         try:
             glyph_height = float(character.get("glyph_height_model"))
@@ -1013,6 +1089,8 @@ def _zero_ink_delivery_proof_failures(
             != "verified_zero_ink_no_physical_entity"
         ):
             failures.append("zero_ink_character_identity_unverified")
+        if advance == 0.0 and verification.get("zero_advance_logical_proof") is not True:
+            failures.append("zero_advance_logical_proof_unverified")
         if (
             verification.get("item_id") != str(item_id)
             or _strict_int(verification.get("page_number")) != int(page_number)
@@ -1145,8 +1223,7 @@ def _zero_ink_delivery_manifest(
         for character in characters
         if isinstance(character, dict)
         and isinstance(character.get("text"), str)
-        and bool(character.get("text"))
-        and not character.get("text").strip()
+        and text_is_zero_ink(character.get("text"))
     )
     normalized_ids = [str(value) for value in entity_ids if str(value)]
     contribution = 0 if logical_zero_ink_delivery else 1
@@ -1268,8 +1345,7 @@ def deliver_item(
                 and any(
                     isinstance(character, dict)
                     and isinstance(character.get("text"), str)
-                    and bool(character.get("text"))
-                    and not character.get("text").strip()
+                    and text_is_zero_ink(character.get("text"))
                     for character in manifest_characters
                 )
             )
@@ -1287,8 +1363,7 @@ def deliver_item(
                         is True
                         or (
                             isinstance(character.get("text"), str)
-                            and bool(character.get("text"))
-                            and not character.get("text").strip()
+                            and text_is_zero_ink(character.get("text"))
                         )
                     )
                     for character in evidence_characters
@@ -1478,11 +1553,14 @@ __all__ = [
     "ZERO_INK_CHARACTER_MANIFEST_SCHEMA",
     "ZERO_INK_DELIVERY_MANIFEST_SCHEMA",
     "ZERO_INK_SOURCE_MANIFEST_SCHEMA",
+    "classify_text_ink",
     "deliver_item",
     "fallback_ladder",
     "freeze_zero_ink_source_manifest",
     "make_zero_ink_character_manifest",
     "normalize_representation",
+    "text_has_visible_ink",
+    "text_is_zero_ink",
     "zero_ink_character_proof_failures",
     "zero_ink_delivery_proof_failures",
 ]
