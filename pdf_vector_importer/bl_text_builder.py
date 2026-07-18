@@ -40,6 +40,7 @@ _FONT_CACHE: Dict[str, bpy.types.VectorFont] = {}
 _EXACT_GLYPH_DESIGN_BOUNDS_CACHE: Dict[
     Tuple[str, int, int], Optional[Tuple[float, float, float, float]]
 ] = {}
+_EXACT_GLYPH_CUBIC_CONTOURS_CACHE: Dict[Tuple[str, int, int], tuple] = {}
 _TEXT_MODES = {"labels", "text", "3d_text", "glyphs", "geometry", "raster"}
 _METRIC_INK_BOUNDS_TOLERANCE_M = 5e-5
 LOGGER = logging.getLogger(__name__)
@@ -453,6 +454,145 @@ def _exact_glyph_design_bounds(asset, glyph_id: int):
     return bounds
 
 
+def _exact_glyph_cubic_contours(asset, glyph_id: int):
+    """Return decomposed source-font contours as exact cubic segments."""
+    try:
+        data = bytes(asset.usable_bytes)
+        digest = str(asset.usable_sha256 or "")
+        expected_upem = int(asset.units_per_em)
+        glyph_id = int(glyph_id)
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise RuntimeError("exact embedded glyph contour source is unavailable") from exc
+    if (
+        not data
+        or not digest
+        or sha256(data).hexdigest() != digest
+        or expected_upem <= 0
+        or glyph_id < 0
+    ):
+        raise RuntimeError("exact embedded glyph contour source is invalid")
+    cache_key = (digest, glyph_id, expected_upem)
+    if cache_key in _EXACT_GLYPH_CUBIC_CONTOURS_CACHE:
+        return _EXACT_GLYPH_CUBIC_CONTOURS_CACHE[cache_key]
+
+    try:
+        from fontTools.pens.basePen import BasePen
+        from fontTools.ttLib import TTFont, TTLibError
+    except ImportError as exc:
+        raise RuntimeError("fontTools is unavailable for exact glyph contours") from exc
+
+    class ExactCubicContourPen(BasePen):
+        def __init__(self, glyph_set):
+            super().__init__(glyph_set)
+            self.contours = []
+            self._contour_start = None
+            self._segments = []
+
+        @staticmethod
+        def _point(value):
+            point = (float(value[0]), float(value[1]))
+            if not all(math.isfinite(component) for component in point):
+                raise RuntimeError("exact embedded glyph contour is non-finite")
+            return point
+
+        @staticmethod
+        def _line_controls(start, end):
+            return (
+                (
+                    start[0] + (end[0] - start[0]) / 3.0,
+                    start[1] + (end[1] - start[1]) / 3.0,
+                ),
+                (
+                    start[0] + 2.0 * (end[0] - start[0]) / 3.0,
+                    start[1] + 2.0 * (end[1] - start[1]) / 3.0,
+                ),
+            )
+
+        def _append_line(self, end):
+            start = self._point(self._getCurrentPoint())
+            end = self._point(end)
+            control_1, control_2 = self._line_controls(start, end)
+            self._segments.append((start, control_1, control_2, end))
+
+        def _moveTo(self, point):
+            if self._contour_start is not None or self._segments:
+                raise RuntimeError("exact embedded glyph contour nesting is invalid")
+            self._contour_start = self._point(point)
+
+        def _lineTo(self, point):
+            self._append_line(point)
+
+        def _curveToOne(self, control_1, control_2, end):
+            self._segments.append((
+                self._point(self._getCurrentPoint()),
+                self._point(control_1),
+                self._point(control_2),
+                self._point(end),
+            ))
+
+        def _qCurveToOne(self, control, end):
+            start = self._point(self._getCurrentPoint())
+            control = self._point(control)
+            end = self._point(end)
+            control_1 = (
+                start[0] + (2.0 / 3.0) * (control[0] - start[0]),
+                start[1] + (2.0 / 3.0) * (control[1] - start[1]),
+            )
+            control_2 = (
+                end[0] + (2.0 / 3.0) * (control[0] - end[0]),
+                end[1] + (2.0 / 3.0) * (control[1] - end[1]),
+            )
+            self._segments.append((start, control_1, control_2, end))
+
+        def _closePath(self):
+            if self._contour_start is None:
+                raise RuntimeError("exact embedded glyph contour has no start point")
+            current = self._point(self._getCurrentPoint())
+            if current != self._contour_start:
+                self._append_line(self._contour_start)
+            if not self._segments:
+                raise RuntimeError("exact embedded glyph contour has no segments")
+            self.contours.append(tuple(self._segments))
+            self._contour_start = None
+            self._segments = []
+
+        def _endPath(self):
+            raise RuntimeError("open embedded glyph contours are unsupported")
+
+    font = None
+    try:
+        font = TTFont(BytesIO(data), lazy=False, recalcTimestamp=False)
+        if int(font["head"].unitsPerEm) != expected_upem:
+            raise RuntimeError(
+                "embedded font metric metadata does not match glyph design units"
+            )
+        glyph_order = tuple(font.getGlyphOrder())
+        glyph_name = glyph_order[glyph_id]
+        glyph_set = font.getGlyphSet()
+        pen = ExactCubicContourPen(glyph_set)
+        glyph_set[glyph_name].draw(pen)
+        contours = tuple(pen.contours)
+        if not contours:
+            raise RuntimeError("visible embedded glyph has no exact contours")
+    except RuntimeError:
+        raise
+    except (
+        AttributeError,
+        IndexError,
+        KeyError,
+        OSError,
+        TTLibError,
+        TypeError,
+        ValueError,
+    ) as exc:
+        raise RuntimeError("exact embedded glyph contours are unavailable") from exc
+    finally:
+        if font is not None:
+            font.close()
+    _EXACT_GLYPH_CUBIC_CONTOURS_CACHE[cache_key] = contours
+    return contours
+
+
 def _metric_expected_world_ink_bounds(metric_evidence, matrix_values):
     """Transform exact source glyph bounds through the intended metric affine."""
     source_bounds = metric_evidence.get("source_ink_bounds_design_units")
@@ -673,6 +813,7 @@ def _apply_target_quad_affine(
     text_item,
     z_offset_m: float,
     collection=None,
+    positioned_metric_evidence=None,
 ):
     target_quad = getattr(text_item, "target_quad_model", None)
     positioned_character = bool(getattr(text_item, "positioned_character", False))
@@ -692,7 +833,11 @@ def _apply_target_quad_affine(
         raise RuntimeError("Blender mathutils unavailable for required text affine") from exc
     metric_evidence: Dict[str, Any] = {}
     if positioned_character:
-        metric_evidence = _positioned_font_axis_metrics(obj, text_item)
+        metric_evidence = (
+            dict(positioned_metric_evidence)
+            if positioned_metric_evidence is not None
+            else _positioned_font_axis_metrics(obj, text_item)
+        )
         matrix_values = _metric_character_matrix_values(
             local_advance=metric_evidence.get(
                 "local_matrix_horizontal_extent",
@@ -2061,6 +2206,327 @@ def _copy_object_transform(source, target) -> None:
                 target.matrix_world = matrix.copy() if hasattr(matrix, "copy") else matrix
     except (AttributeError, ReferenceError, TypeError):
         pass
+
+
+def _visible_zero_advance_exact_contour_required(text_item) -> bool:
+    try:
+        advance = float(text_item.advance_width)
+        glyph_id = int(text_item.source_glyph_id)
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return (
+        bool(getattr(text_item, "positioned_character", False))
+        and advance == 0.0
+        and glyph_id >= 0
+        and text_has_visible_ink(getattr(text_item, "text", ""))
+    )
+
+
+def _positioned_item_uses_only_exact_contours(text_item, requested: str) -> bool:
+    if requested not in {"glyphs", "geometry"}:
+        return False
+    layouts = tuple(getattr(text_item, "source_char_layout", ()) or ())
+    if not layouts:
+        return False
+    for layout in layouts:
+        try:
+            advance = float(layout.advance_width)
+            glyph_id = int(layout.glyph_id)
+        except (AttributeError, TypeError, ValueError):
+            return False
+        if (
+            advance != 0.0
+            or glyph_id < 0
+            or not text_has_visible_ink(getattr(layout, "text", ""))
+        ):
+            return False
+    return True
+
+
+_EXACT_CONTOUR_METADATA_KEYS = (
+    "pdf_exact_contour_source",
+    "pdf_exact_contour_font_sha256",
+    "pdf_exact_contour_glyph_id",
+    "pdf_exact_contour_count",
+    "pdf_exact_contour_segment_count",
+    "pdf_exact_contour_design_bounds",
+    "pdf_exact_contour_bypassed_host_font_shaping",
+    "pdf_exact_contour_self_contained",
+)
+
+
+def _copy_exact_contour_metadata(source, target) -> None:
+    for key in _EXACT_CONTOUR_METADATA_KEYS:
+        try:
+            target[key] = source.get(key)
+        except (AttributeError, ReferenceError, TypeError):
+            pass
+
+
+def _populate_exact_embedded_glyph_curve(curve_data, contours, metric_evidence):
+    design_unit_scale = float(metric_evidence["design_unit_scale"])
+    baseline_y = float(metric_evidence["local_baseline_y"])
+    if (
+        not math.isfinite(design_unit_scale)
+        or design_unit_scale <= 0.0
+        or not math.isfinite(baseline_y)
+    ):
+        raise RuntimeError("exact embedded glyph local metric domain is invalid")
+
+    curve_data.dimensions = "2D"
+    curve_data.fill_mode = "BOTH"
+    curve_data.resolution_u = max(
+        int(getattr(curve_data, "resolution_u", 12) or 12),
+        24,
+    )
+    if hasattr(curve_data, "render_resolution_u"):
+        curve_data.render_resolution_u = max(
+            int(getattr(curve_data, "render_resolution_u", 0) or 0),
+            24,
+        )
+
+    def local_point(point):
+        return (
+            float(point[0]) * design_unit_scale,
+            float(point[1]) * design_unit_scale + baseline_y,
+            0.0,
+        )
+
+    segment_count = 0
+    for contour in contours:
+        if not contour:
+            raise RuntimeError("exact embedded glyph contour is empty")
+        for index, segment in enumerate(contour):
+            next_segment = contour[(index + 1) % len(contour)]
+            if tuple(segment[3]) != tuple(next_segment[0]):
+                raise RuntimeError("exact embedded glyph contour is discontinuous")
+        spline = curve_data.splines.new("BEZIER")
+        spline.bezier_points.add(len(contour) - 1)
+        spline.use_cyclic_u = True
+        spline.resolution_u = max(
+            int(getattr(spline, "resolution_u", 12) or 12),
+            24,
+        )
+        for index, segment in enumerate(contour):
+            point = spline.bezier_points[index]
+            point.co = local_point(segment[0])
+            point.handle_left_type = "FREE"
+            point.handle_right_type = "FREE"
+            # A new Blender curve point carries radius=1 even when the curve
+            # has no bevel or extrusion. Blender 5.2 includes that dormant
+            # radius in evaluated CURVE bounds, inflating an exact millimeter
+            # outline by one meter. Zero is the truthful radial thickness for
+            # this flat embedded-font contour and leaves the contour unchanged.
+            point.radius = 0.0
+        for index, segment in enumerate(contour):
+            point = spline.bezier_points[index]
+            next_point = spline.bezier_points[(index + 1) % len(contour)]
+            point.handle_right = local_point(segment[1])
+            next_point.handle_left = local_point(segment[2])
+        segment_count += len(contour)
+    return len(contours), segment_count
+
+
+def _create_exact_embedded_glyph_candidate(
+    text_item,
+    collection,
+    *,
+    page_number,
+    requested,
+    delivered,
+    item_id,
+    visual_style,
+    z_offset_m,
+    entity_suffix,
+    baseline_alignment,
+    mesh_factory=None,
+):
+    """Emit a visible zero-advance glyph without host FONT shaping."""
+    curve_obj = None
+    curve_data = None
+    final = None
+    final_data = None
+    material = None
+    try:
+        glyph_id = int(text_item.source_glyph_id)
+        asset = text_item.font_asset
+        asset_page = int(asset.page_number)
+        asset_span_font = str(asset.span_font_name or "")
+        expected_span_font = str(text_item.font_name or "")
+        asset_format = str(asset.usable_format or "").lower().lstrip(".")
+        if (
+            asset_page != int(page_number)
+            or asset_span_font != expected_span_font
+            or asset_format not in {"cff", "otf", "ttf"}
+        ):
+            raise RuntimeError("exact embedded glyph contour asset identity is invalid")
+        metrics = _positioned_font_axis_metrics_values(
+            text_item,
+            size=float(text_item.font_size) * MM_TO_M,
+            baseline_alignment=baseline_alignment,
+        )
+        if (
+            metrics.get("zero_ink_identity") is not False
+            or float(metrics.get("local_advance", math.nan)) != 0.0
+            or metrics.get("matrix_horizontal_extent_source")
+            != "exact_source_glyph_ink_width"
+        ):
+            raise RuntimeError(
+                "exact contour routing requires a visible zero-advance source glyph"
+            )
+        contours = _exact_glyph_cubic_contours(asset, glyph_id)
+        design_bounds = _exact_glyph_design_bounds(asset, glyph_id)
+        if design_bounds is None:
+            raise RuntimeError("visible embedded glyph has no exact design bounds")
+
+        name = f"P{page_number}_text_{delivered}_{int(text_item.id)}{entity_suffix}"
+        curve_data = bpy.data.curves.new(name=name, type="CURVE")
+        contour_count, segment_count = _populate_exact_embedded_glyph_curve(
+            curve_data,
+            contours,
+            metrics,
+        )
+        curve_obj = bpy.data.objects.new(name, curve_data)
+        _set_object_metadata(
+            curve_obj,
+            item_id=item_id,
+            requested=requested,
+            delivered=delivered,
+            text_item=text_item,
+        )
+        curve_obj["pdf_baseline_alignment"] = baseline_alignment
+        curve_obj["pdf_baseline_compensation_m"] = 0.0
+        curve_obj["pdf_text_source"] = str(text_item.text)
+        curve_obj["pdf_exact_contour_source"] = "embedded_font_glyph_outline"
+        curve_obj["pdf_exact_contour_font_sha256"] = str(asset.usable_sha256)
+        curve_obj["pdf_exact_contour_glyph_id"] = glyph_id
+        curve_obj["pdf_exact_contour_count"] = contour_count
+        curve_obj["pdf_exact_contour_segment_count"] = segment_count
+        curve_obj["pdf_exact_contour_design_bounds"] = [
+            float(value) for value in design_bounds
+        ]
+        curve_obj["pdf_exact_contour_bypassed_host_font_shaping"] = True
+        curve_obj["pdf_exact_contour_self_contained"] = True
+        curve_obj["pdf_exact_font_packed"] = False
+
+        material = _get_or_create_text_material(
+            visual_style,
+            source_color=text_item.color,
+        )
+        expected_rgb = _styled_text_color(
+            visual_style,
+            source_color=text_item.color,
+        )
+        curve_obj["pdf_text_material"] = str(getattr(material, "name", "") or "")
+        curve_obj["pdf_text_material_owned"] = True
+        curve_obj["pdf_text_expected_rgba"] = [
+            *tuple(float(value) for value in expected_rgb),
+            1.0,
+        ]
+        curve_data.materials.append(material)
+        curve_obj.color = material.diffuse_color
+        collection.objects.link(curve_obj)
+        _apply_target_quad_affine(
+            curve_obj,
+            text_item,
+            z_offset_m,
+            collection=collection,
+            positioned_metric_evidence=metrics,
+        )
+        try:
+            bpy.context.view_layer.update()
+        except Exception:
+            pass
+
+        if delivered == "glyphs":
+            final = curve_obj
+            final_data = curve_data
+        elif delivered == "geometry":
+            if not callable(mesh_factory):
+                raise RuntimeError("exact contour mesh conversion capability is unavailable")
+            depsgraph = bpy.context.evaluated_depsgraph_get()
+            evaluated = curve_obj.evaluated_get(depsgraph)
+            final_data = mesh_factory(evaluated, depsgraph=depsgraph)
+            if not list(getattr(final_data, "vertices", []) or []):
+                raise RuntimeError("exact contour mesh has no vertices")
+            final_data.name = f"{name}_mesh"
+            final = bpy.data.objects.new(name, final_data)
+            _copy_object_transform(curve_obj, final)
+            _set_object_metadata(
+                final,
+                item_id=item_id,
+                requested=requested,
+                delivered=delivered,
+                text_item=text_item,
+            )
+            _copy_text_material_metadata(curve_obj, final)
+            _copy_exact_contour_metadata(curve_obj, final)
+            final["pdf_exact_font_packed"] = False
+            final["pdf_text_source"] = str(text_item.text)
+            collection.objects.link(final)
+            cleanup, remaining_objects, remaining_data = _remove_object_and_data(
+                curve_obj,
+                curve_data,
+                collection,
+            )
+            if cleanup.get("status") != "complete":
+                raise _OwnedConstructionError(
+                    "superseded exact contour curve cleanup failed",
+                    owned_objects=(*remaining_objects, final),
+                    owned_datablocks=(*remaining_data, final_data),
+                )
+            curve_obj = None
+            curve_data = None
+        else:  # pragma: no cover - caller constrains the rung
+            raise ValueError(f"unsupported exact contour representation: {delivered}")
+
+        evidence = {
+            "exact_contour_source": "embedded_font_glyph_outline",
+            "exact_contour_font_sha256": str(asset.usable_sha256),
+            "exact_contour_glyph_id": glyph_id,
+            "exact_contour_count": contour_count,
+            "exact_contour_segment_count": segment_count,
+            "exact_contour_design_bounds": [
+                float(value) for value in design_bounds
+            ],
+            "exact_contour_bypassed_host_font_shaping": True,
+            "exact_contour_self_contained": True,
+        }
+        return final, final_data, None, evidence
+    except Exception as exc:
+        construction_objects = tuple(getattr(exc, "owned_objects", ()) or ())
+        construction_data = tuple(getattr(exc, "owned_datablocks", ()) or ())
+        objects = _unique_owned_objects(curve_obj, final, *construction_objects)
+        datablocks = []
+        for value in (
+            curve_data,
+            final_data,
+            material,
+            *construction_data,
+        ):
+            if _valid_owned_ref(value) and all(
+                value is not existing for existing in datablocks
+            ):
+                datablocks.append(value)
+        failure = AttemptOutcome.failed(
+            "exact_embedded_glyph_contour_construction_failed_not_impossibility_proof",
+            evidence={
+                "item_id": item_id,
+                "exception_type": type(exc).__name__,
+                "detail": str(exc),
+                "exact_contour_bypassed_host_font_shaping": True,
+            },
+            owned_artifacts=tuple(
+                _artifact(obj, getattr(obj, "data", None)) for obj in objects
+            ) + tuple(
+                _artifact(None, data)
+                for data in datablocks
+                if all(data is not getattr(obj, "data", None) for obj in objects)
+            ),
+            owned_objects=objects,
+            owned_datablocks=tuple(datablocks),
+        )
+        return final, final_data, failure, None
 
 
 def _attempt_labels(
@@ -3458,6 +3924,37 @@ def _attempt_positioned_converted_characters(
         child = _character_text_item(text_item, layout)
         glyph_id = getattr(layout, "glyph_id", None)
         suffix = f"_c{index:04d}_g{glyph_id if glyph_id is not None else 'na'}"
+        if _visible_zero_advance_exact_contour_required(child):
+            final, final_data, failure, exact_contour_evidence = (
+                _create_exact_embedded_glyph_candidate(
+                    child,
+                    collection,
+                    page_number=page_number,
+                    requested=requested,
+                    delivered=delivered,
+                    item_id=item_id,
+                    visual_style=visual_style,
+                    z_offset_m=z_offset_m,
+                    entity_suffix=suffix,
+                    baseline_alignment=baseline_alignment,
+                    mesh_factory=mesh_factory,
+                )
+            )
+            if failure is not None:
+                return aggregate_failure(failure, index)
+            candidates.append({
+                "index": index,
+                "layout": layout,
+                "child": child,
+                "source": None,
+                "source_data": None,
+                "final": final,
+                "final_data": final_data,
+                "source_verification": None,
+                "zero_ink_evidence": None,
+                "exact_contour_evidence": exact_contour_evidence,
+            })
+            continue
         source, source_data, failure = _create_font_candidate(
             child,
             collection,
@@ -3483,6 +3980,7 @@ def _attempt_positioned_converted_characters(
             "final_data": None,
             "source_verification": None,
             "zero_ink_evidence": None,
+            "exact_contour_evidence": None,
         })
 
     try:
@@ -3500,6 +3998,22 @@ def _attempt_positioned_converted_characters(
 
     source_records = []
     for candidate in candidates:
+        if candidate["exact_contour_evidence"] is not None:
+            exact_outcome = AttemptOutcome.delivered(
+                candidate["final"],
+                entity_ids=(candidate["final"].name,),
+                evidence={
+                    "item_id": item_id,
+                    **candidate["exact_contour_evidence"],
+                },
+                owned_artifacts=_owned_artifacts_for_text_entity(
+                    candidate["final"], candidate["final_data"]
+                ),
+                owned_objects=_owned_objects_for_text_entity(candidate["final"]),
+                owned_datablocks=(candidate["final_data"],),
+            )
+            source_records.append(character_record(candidate, exact_outcome))
+            continue
         source_outcome = _verify_font_candidate(
             candidate["source"],
             candidate["child"],
@@ -3530,6 +4044,8 @@ def _attempt_positioned_converted_characters(
         return aggregate_failure(failure, records=source_records)
 
     for candidate in candidates:
+        if candidate["exact_contour_evidence"] is not None:
+            continue
         final, final_data, failure, zero_ink_evidence = (
             _prepare_positioned_converted_candidate(
                 candidate["source"],
@@ -3554,6 +4070,8 @@ def _attempt_positioned_converted_characters(
             return aggregate_failure(failure, candidate["index"], records)
 
     for candidate in candidates:
+        if candidate["exact_contour_evidence"] is not None:
+            continue
         if candidate["zero_ink_evidence"] is not None:
             try:
                 material_name = str(
@@ -3687,6 +4205,7 @@ def _attempt_positioned_converted_characters(
             entity_ids=(candidate["final"].name,),
             evidence={
                 "item_id": item_id,
+                **dict(candidate["exact_contour_evidence"] or {}),
                 **verification_evidence,
                 detail_key: len(detail_values),
             },
@@ -3914,10 +4433,13 @@ def build_text(
     )
     baseline_alignment = None
     if positioned_text:
-        try:
-            baseline_alignment = _probe_positioned_baseline_alignment()
-        except (AttributeError, RuntimeError, TypeError, ValueError):
-            baseline_alignment = None
+        if _positioned_item_uses_only_exact_contours(text_item, requested):
+            baseline_alignment = "BOTTOM_BASELINE"
+        else:
+            try:
+                baseline_alignment = _probe_positioned_baseline_alignment()
+            except (AttributeError, RuntimeError, TypeError, ValueError):
+                baseline_alignment = None
     zero_ink_source_manifest = None
     zero_ink_source_manifest_sha256 = ""
     if (

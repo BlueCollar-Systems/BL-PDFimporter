@@ -61,14 +61,50 @@ class _FontData:
         self._align_y = value
 
 
+class _BezierPoint:
+    def __init__(self):
+        self.co = (0.0, 0.0, 0.0)
+        self.handle_left = (0.0, 0.0, 0.0)
+        self.handle_right = (0.0, 0.0, 0.0)
+        self.handle_left_type = "FREE"
+        self.handle_right_type = "FREE"
+        self.radius = 1.0
+
+
+class _BezierPoints(list):
+    def __init__(self):
+        super().__init__([_BezierPoint()])
+
+    def add(self, count):
+        self.extend(_BezierPoint() for _index in range(count))
+
+
+class _BezierSpline:
+    def __init__(self):
+        self.bezier_points = _BezierPoints()
+        self.use_cyclic_u = False
+        self.resolution_u = 12
+
+
+class _Splines(list):
+    def new(self, spline_type):
+        assert spline_type == "BEZIER"
+        spline = _BezierSpline()
+        self.append(spline)
+        return spline
+
+
 class _CurveData:
     type = "CURVE"
 
-    def __init__(self, name: str, base_dimensions=None):
+    def __init__(self, name: str, base_dimensions=None, *, direct=False):
         self.name = name
-        self.splines = [object(), object()]
+        self.splines = _Splines() if direct else [object(), object()]
         self.materials = _MaterialList()
         self.base_dimensions = base_dimensions
+        self.dimensions = "2D"
+        self.fill_mode = "BOTH"
+        self.resolution_u = 12
 
     def copy(self):
         copied = _CurveData(f"{self.name}_copy", self.base_dimensions)
@@ -295,10 +331,14 @@ class _Curves:
     def __init__(self, *, baseline_available=True):
         self.removed = []
         self.baseline_available = baseline_available
+        self.created_types = []
 
     def new(self, name: str, type: str):
-        assert type == "FONT"
-        return _FontData(name, baseline_available=self.baseline_available)
+        self.created_types.append(type)
+        if type == "FONT":
+            return _FontData(name, baseline_available=self.baseline_available)
+        assert type == "CURVE"
+        return _CurveData(name, direct=True)
 
     def remove(self, data):
         self.removed.append(data.name)
@@ -518,6 +558,21 @@ def _visible_zero_advance_metric_font_asset():
     asset.asset_id = f"sha256:{asset.usable_sha256}"
     asset.glyph_advances = (500, 0, 300)
     return asset
+
+
+def _visible_zero_advance_item():
+    item = _item()
+    item.font_asset = _visible_zero_advance_metric_font_asset()
+    item.font_name = "MetricFixture"
+    item.text = "\u0301"
+    item.normalized = "\u0301"
+    layout = _whitespace_only_character_layout()[0]
+    layout.text = "\u0301"
+    layout.glyph_id = 1
+    layout.advance_width = 0.0
+    item.source_char_layout = (layout,)
+    item.requires_individual_positioning = True
+    return item
 
 
 def _item(span_id: int = 41, *, font_asset=True) -> NormalizedText:
@@ -2512,6 +2567,60 @@ def test_visible_zero_advance_combining_glyph_is_not_rejected_or_collapsed(
     )
 
 
+def test_visible_zero_advance_glyph_uses_exact_embedded_outline_segments():
+    asset = _visible_zero_advance_metric_font_asset()
+
+    contours = bl_text_builder._exact_glyph_cubic_contours(asset, 1)
+
+    assert len(contours) == 1
+    assert len(contours[0]) == 4
+    assert tuple(segment[0] for segment in contours[0]) == (
+        (100.0, -200.0),
+        (500.0, -200.0),
+        (500.0, 700.0),
+        (100.0, 700.0),
+    )
+    assert tuple(segment[3] for segment in contours[0])[-1] == (100.0, -200.0)
+    assert bl_text_builder._exact_glyph_design_bounds(asset, 1) == (
+        100.0,
+        -200.0,
+        500.0,
+        700.0,
+    )
+
+
+def test_exact_embedded_outline_converts_quadratic_segment_without_approximation():
+    from fontTools.pens.ttGlyphPen import TTGlyphPen
+    from fontTools.ttLib import TTFont
+
+    asset = _visible_zero_advance_metric_font_asset()
+    font = TTFont(BytesIO(asset.usable_bytes))
+    pen = TTGlyphPen(None)
+    pen.moveTo((0, 0))
+    pen.qCurveTo((200, 400), (400, 0))
+    pen.lineTo((0, 0))
+    pen.closePath()
+    font["glyf"]["A"] = pen.glyph()
+    stream = BytesIO()
+    font.save(stream)
+    font.close()
+    asset.usable_bytes = stream.getvalue()
+    asset.usable_sha256 = sha256(asset.usable_bytes).hexdigest()
+    asset.asset_id = f"sha256:{asset.usable_sha256}"
+
+    contours = bl_text_builder._exact_glyph_cubic_contours(asset, 1)
+
+    quadratic = contours[0][0]
+    start_x, start_y = quadratic[0]
+    assert quadratic[1] == pytest.approx(
+        (start_x + 400.0 / 3.0, start_y + 800.0 / 3.0)
+    )
+    assert quadratic[2] == pytest.approx(
+        (start_x + 800.0 / 3.0, start_y + 800.0 / 3.0)
+    )
+    assert quadratic[3] == pytest.approx((start_x + 400.0, start_y))
+
+
 @pytest.mark.parametrize(
     ("mode", "expected_type"),
     [("glyphs", "CURVE"), ("geometry", "MESH")],
@@ -2578,6 +2687,200 @@ def test_visible_zero_advance_combining_glyph_keeps_requested_representation(
     assert record["entity_ids"] == [obj.name]
     assert record["fallback_used"] is False
     assert len(record["attempts"]) == 1
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_type"),
+    [("glyphs", "CURVE"), ("geometry", "MESH")],
+)
+def test_visible_zero_advance_combining_glyph_does_not_depend_on_host_font_shaping(
+    monkeypatch,
+    mode,
+    expected_type,
+):
+    """Exact contours must survive Blender's isolated-mark shaping mismatch.
+
+    Blender 5.2 positions an isolated U+0301 as a combining mark relative to an
+    implicit base.  Its evaluated FONT bounds therefore do not match the exact
+    embedded glyph bounds.  Glyph/Geometry delivery must use the exact embedded
+    contour (or another same-rung exact path), not fail because the intermediate
+    host FONT is visually wrong.
+    """
+    _fake, collection = _install(monkeypatch)
+    _install_mathutils(monkeypatch)
+    item = _item()
+    item.font_asset = _visible_zero_advance_metric_font_asset()
+    item.font_name = "MetricFixture"
+    item.text = "\u0301"
+    item.normalized = "\u0301"
+    layout = _whitespace_only_character_layout()[0]
+    layout.text = "\u0301"
+    layout.glyph_id = 1
+    layout.advance_width = 0.0
+    item.source_char_layout = (layout,)
+    item.requires_individual_positioning = True
+    opts = types.SimpleNamespace(import_mode="vector", text_mode=mode)
+
+    def verify_host_state(obj, text_item):
+        matrix = list(obj.get("pdf_affine_matrix", []))
+        common = {
+            "full_affine_applied": True,
+            "metric_affine_applied": True,
+            "zero_ink_identity": False,
+            "zero_advance_logical_proof": False,
+            "evaluated_bounds_verified": True,
+            "local_advance_m": 0.0,
+            "intended_affine_matrix": matrix,
+            "evaluated_affine_matrix": list(matrix),
+        }
+        if obj.type == "FONT":
+            return ["evaluated_ink_bounds_outside_exact_source_glyph_bounds"], {
+                **common,
+                "evaluated_ink_bounds_verified": False,
+                "expected_world_ink_bounds_m": [0.01275, 0.0252, 0.01575, 0.0268],
+                "actual_world_ink_bounds_m": [
+                    0.0098571423,
+                    0.0257142857,
+                    0.0141428579,
+                    0.0280000009,
+                ],
+            }
+        return [], {**common, "evaluated_ink_bounds_verified": True}
+
+    monkeypatch.setattr(
+        bl_text_builder,
+        "_verify_transform_and_dimensions",
+        verify_host_state,
+    )
+
+    def reject_host_font_candidate(*_args, **_kwargs):
+        raise AssertionError("visible zero-advance glyph routed through host FONT")
+
+    monkeypatch.setattr(
+        bl_text_builder,
+        "_create_font_candidate",
+        reject_host_font_candidate,
+    )
+
+    obj = bl_text_builder.build_text(
+        item,
+        collection,
+        page_number=2,
+        text_mode=mode,
+        provenance_opts=opts,
+    )
+
+    record = opts._text_delivery_records[-1]
+    assert obj is not None, json.dumps(record, default=str, indent=2)
+    assert obj.type == expected_type
+    assert _fake.data.fonts.loaded == []
+    assert "FONT" not in _fake.data.curves.created_types
+    assert obj.get("pdf_exact_contour_source") == "embedded_font_glyph_outline"
+    assert obj.get("pdf_exact_contour_glyph_id") == 1
+    assert obj.get("pdf_exact_contour_count") == 1
+    assert obj.get("pdf_exact_contour_self_contained") is True
+    assert obj.get("pdf_exact_font_packed") is False
+    assert obj.get("pdf_metric_local_advance") == 0.0
+    if mode == "glyphs":
+        points = [
+            point
+            for spline in obj.data.splines
+            for point in spline.bezier_points
+        ]
+        assert points
+        assert all(point.radius == 0.0 for point in points)
+    assert record["status"] == "delivered"
+    assert record["final_representation"] == mode
+    assert record["fallback_used"] is False
+    assert len(record["attempts"]) == 1
+    evidence = record["attempts"][0]["evidence"]
+    assert evidence["exact_contour_bypassed_host_font_shaping"] is True
+
+
+@pytest.mark.parametrize("mode", ["glyphs", "geometry"])
+def test_exact_zero_advance_contour_failure_cleans_owned_artifacts_without_fallback(
+    monkeypatch,
+    mode,
+):
+    fake, collection = _install(monkeypatch)
+    _install_mathutils(monkeypatch)
+    item = _visible_zero_advance_item()
+    opts = types.SimpleNamespace(import_mode="vector", text_mode=mode)
+
+    def reject_final_visual_bounds(obj, _text_item):
+        matrix = list(obj.get("pdf_affine_matrix", []))
+        return ["forced_exact_contour_visual_failure"], {
+            "full_affine_applied": True,
+            "metric_affine_applied": True,
+            "zero_ink_identity": False,
+            "zero_advance_logical_proof": False,
+            "evaluated_bounds_verified": True,
+            "evaluated_ink_bounds_verified": False,
+            "local_advance_m": 0.0,
+            "intended_affine_matrix": matrix,
+            "evaluated_affine_matrix": list(matrix),
+        }
+
+    monkeypatch.setattr(
+        bl_text_builder,
+        "_verify_transform_and_dimensions",
+        reject_final_visual_bounds,
+    )
+
+    obj = bl_text_builder.build_text(
+        item,
+        collection,
+        page_number=2,
+        text_mode=mode,
+        provenance_opts=opts,
+    )
+
+    record = opts._text_delivery_records[-1]
+    assert obj is None
+    assert record["status"] == "failed"
+    assert record["fallback_attempted"] is False
+    assert record["fallback_used"] is False
+    assert len(record["attempts"]) == 1
+    assert fake.data.fonts.loaded == []
+    assert "FONT" not in fake.data.curves.created_types
+    assert fake.data.objects.removed
+    assert fake.data.materials.removed
+    assert not collection.objects.items
+    if mode == "glyphs":
+        assert fake.data.curves.removed
+    else:
+        assert fake.data.curves.removed
+        assert fake.data.meshes.removed
+
+
+def test_exact_zero_advance_contour_rejects_mismatched_font_asset_identity(
+    monkeypatch,
+):
+    fake, collection = _install(monkeypatch)
+    _install_mathutils(monkeypatch)
+    item = _visible_zero_advance_item()
+    item.font_asset.page_number = 99
+    opts = types.SimpleNamespace(import_mode="vector", text_mode="glyphs")
+
+    obj = bl_text_builder.build_text(
+        item,
+        collection,
+        page_number=2,
+        text_mode="glyphs",
+        provenance_opts=opts,
+    )
+
+    record = opts._text_delivery_records[-1]
+    assert obj is None
+    assert record["status"] == "failed"
+    assert record["fallback_attempted"] is False
+    assert len(record["attempts"]) == 1
+    assert record["attempts"][0]["reason"] == (
+        "exact_embedded_glyph_contour_construction_failed_not_impossibility_proof"
+    )
+    assert fake.data.fonts.loaded == []
+    assert "FONT" not in fake.data.curves.created_types
+    assert not collection.objects.items
 
 
 def test_zero_advance_metric_affine_rejects_fabricated_horizontal_extent():
