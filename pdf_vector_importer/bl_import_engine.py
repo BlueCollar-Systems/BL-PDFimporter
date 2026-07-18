@@ -1874,14 +1874,15 @@ def _canonical_zero_ink_delivery_manifest(
     """Return sealed delivery/source truth; mutable maps are tamper detectors only."""
     failures = []
     if not isinstance(authority, ZeroInkReconciliationAuthority):
-        return None, None, ["zero_ink_reconciliation_authority_missing"]
+        return None, None, False, ["zero_ink_reconciliation_authority_missing"]
     try:
         source_manifest, manifest = open_zero_ink_reconciliation_authority(
             authority
         )
     except (TypeError, ValueError, OverflowError):
-        return None, None, ["zero_ink_reconciliation_authority_invalid"]
+        return None, None, False, ["zero_ink_reconciliation_authority_invalid"]
 
+    source_detector_valid = False
     source_manifests = getattr(
         provenance_opts,
         "_zero_ink_source_manifests",
@@ -1910,7 +1911,10 @@ def _canonical_zero_ink_delivery_manifest(
                 failures.append(
                     "zero_ink_character_source_manifest_digest_mismatch"
                 )
+            else:
+                source_detector_valid = True
 
+    delivery_detector_valid = False
     delivery_manifests = getattr(
         provenance_opts,
         "_zero_ink_delivery_manifests",
@@ -1938,6 +1942,8 @@ def _canonical_zero_ink_delivery_manifest(
                 != authority.delivery_manifest_sha256
             ):
                 failures.append("zero_ink_delivery_manifest_digest_mismatch")
+            else:
+                delivery_detector_valid = True
     if manifest.get("schema") != ZERO_INK_DELIVERY_MANIFEST_SCHEMA:
         failures.append("zero_ink_delivery_manifest_schema_unverified")
     if manifest.get("importer_id") != "bc_pdf_vector_importer.blender":
@@ -2025,7 +2031,12 @@ def _canonical_zero_ink_delivery_manifest(
         or manifest.get("source_manifest_sha256") != source_digest
     ):
         failures.append("zero_ink_delivery_manifest_source_crosslink_mismatch")
-    return manifest, source_manifest, list(dict.fromkeys(failures))
+    return (
+        manifest,
+        source_manifest,
+        source_detector_valid and delivery_detector_valid,
+        list(dict.fromkeys(failures)),
+    )
 
 
 def _reverify_text_delivery_after_stack(
@@ -2170,8 +2181,14 @@ def _reverify_text_delivery_after_stack(
         )
         canonical_delivery = None
         expected_manifest = None
+        canonical_detector_maps_bound = False
         if canonical_state_present:
-            canonical_delivery, expected_manifest, canonical_failures = (
+            (
+                canonical_delivery,
+                expected_manifest,
+                canonical_detector_maps_bound,
+                canonical_failures,
+            ) = (
                 _canonical_zero_ink_delivery_manifest(
                     provenance_opts,
                     authority=authority,
@@ -2182,7 +2199,6 @@ def _reverify_text_delivery_after_stack(
             record_failures.extend(canonical_failures)
 
         canonical_count_contribution = None
-        canonical_count_receipt_bound = False
         canonical_zero_count = None
         if isinstance(canonical_delivery, dict):
             entity_ids = list(canonical_delivery.get("entity_ids") or ())
@@ -2223,15 +2239,8 @@ def _reverify_text_delivery_after_stack(
             canonical_count_contribution = (
                 0 if canonical_logical_zero_ink else 1
             )
-            canonical_count_receipt_bound = bool(
-                isinstance(authority, ZeroInkReconciliationAuthority)
-                and record.get("source_manifest_sha256")
-                == authority.source_manifest_sha256
-                and record.get("zero_ink_delivery_manifest_sha256")
-                == authority.delivery_manifest_sha256
-            )
             if (
-                canonical_count_receipt_bound
+                canonical_detector_maps_bound
                 and isinstance(runtime_outcome, AttemptOutcome)
                 and runtime_delivery_representation != representation
             ):
@@ -2602,7 +2611,7 @@ def _reverify_text_delivery_after_stack(
                     )
             final_proof["cleanup"] = cleanup
             if canonical_state_present:
-                if canonical_count_receipt_bound:
+                if canonical_detector_maps_bound:
                     count_contribution = canonical_count_contribution
                     count_representation = representation
                 else:

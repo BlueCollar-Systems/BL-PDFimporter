@@ -1424,6 +1424,70 @@ def test_post_stack_forged_authority_cannot_redirect_delivery_bucket(monkeypatch
     }
 
 
+def test_post_stack_forged_authority_and_record_receipt_cannot_override_detectors(
+    monkeypatch,
+):
+    fake, collection = _install(monkeypatch)
+    _install_positioned_empty_conversion_host(monkeypatch, fake)
+    opts = types.SimpleNamespace(
+        import_mode="vector",
+        text_mode="glyphs",
+        _text_delivered_entity_counts={"glyph_curve": 5, "geometry_mesh": 7},
+    )
+    item = _item()
+    item.text = "A B"
+    item.normalized = "A B"
+    item.source_char_layout = _mixed_zero_ink_character_layout()
+    item.requires_individual_positioning = True
+
+    assert bl_text_builder.build_text(
+        item,
+        collection,
+        page_number=2,
+        text_mode="glyphs",
+        provenance_opts=opts,
+    ) is not None
+    record = opts._text_delivery_records[-1]
+    authority = opts._zero_ink_reconciliation_authorities[0]
+    forged_delivery = json.loads(authority.delivery_manifest_json)
+    forged_delivery["delivered_representation"] = "geometry"
+    forged_payload = json.dumps(
+        forged_delivery,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    forged_digest = sha256(forged_payload.encode("utf-8")).hexdigest()
+    opts._zero_ink_reconciliation_authorities = (
+        type(authority)(
+            item_id=authority.item_id,
+            source_manifest_json=authority.source_manifest_json,
+            source_manifest_sha256=authority.source_manifest_sha256,
+            delivery_manifest_json=forged_payload,
+            delivery_manifest_sha256=forged_digest,
+        ),
+    )
+    record["zero_ink_delivery_manifest_sha256"] = forged_digest
+
+    objects_by_name = {candidate.name: candidate for candidate in collection.objects.items}
+    fake.data.objects.get = objects_by_name.get
+    monkeypatch.setattr(bl_import_engine, "bpy", fake)
+    failures = bl_import_engine._reverify_text_delivery_after_stack(
+        [record],
+        page_number=2,
+        stack_offset_m=0.0,
+        provenance_opts=opts,
+    )
+
+    assert len(failures) == 1
+    assert "zero_ink_delivery_manifest_digest_mismatch" in failures[0]["failures"]
+    assert opts._text_delivered_entity_counts == {
+        "glyph_curve": 5,
+        "geometry_mesh": 7,
+    }
+
+
 def test_post_stack_runtime_outcome_retyping_cannot_redirect_delivery_bucket(
     monkeypatch,
 ):
@@ -1468,6 +1532,66 @@ def test_post_stack_runtime_outcome_retyping_cannot_redirect_delivery_bucket(
         "geometry_mesh": 7,
     }
     assert "zero_ink_runtime_delivery_representation_unbound" in failures[0]["failures"]
+
+
+def test_post_stack_corrupt_record_receipt_cannot_make_runtime_retyping_redirect_bucket(
+    monkeypatch,
+):
+    fake, collection = _install(monkeypatch)
+    _install_positioned_empty_conversion_host(monkeypatch, fake)
+    opts = types.SimpleNamespace(
+        import_mode="vector",
+        text_mode="glyphs",
+        _text_delivered_entity_counts={"glyph_curve": 5, "geometry_mesh": 7},
+    )
+    item = _item()
+    item.text = "A B"
+    item.normalized = "A B"
+    item.source_char_layout = _mixed_zero_ink_character_layout()
+    item.requires_individual_positioning = True
+
+    assert bl_text_builder.build_text(
+        item,
+        collection,
+        page_number=2,
+        text_mode="glyphs",
+        provenance_opts=opts,
+    ) is not None
+    record = opts._text_delivery_records[-1]
+    item_id = record["item_id"]
+    authority = opts._zero_ink_reconciliation_authorities[0]
+    assert authority.delivery_manifest_sha256 == record[
+        "zero_ink_delivery_manifest_sha256"
+    ]
+    assert opts._text_delivered_entity_counts == {
+        "glyph_curve": 6,
+        "geometry_mesh": 7,
+    }
+
+    # The sealed authority and both detector maps remain intact. Only the mutable
+    # record receipt and runtime evidence are corrupt, so neither may redirect
+    # rollback away from the canonically delivered Glyphs bucket.
+    record["source_manifest_sha256"] = "0" * 64
+    opts._text_delivery_outcomes[item_id].evidence[
+        "delivered_representation"
+    ] = "geometry"
+
+    objects_by_name = {candidate.name: candidate for candidate in collection.objects.items}
+    fake.data.objects.get = objects_by_name.get
+    monkeypatch.setattr(bl_import_engine, "bpy", fake)
+    failures = bl_import_engine._reverify_text_delivery_after_stack(
+        [record],
+        page_number=2,
+        stack_offset_m=0.0,
+        provenance_opts=opts,
+    )
+
+    assert len(failures) == 1
+    assert "zero_ink_record_manifest_identity_unbound" in failures[0]["failures"]
+    assert opts._text_delivered_entity_counts == {
+        "glyph_curve": 5,
+        "geometry_mesh": 7,
+    }
 
 
 @pytest.mark.parametrize("mode", ["glyphs", "geometry"])
