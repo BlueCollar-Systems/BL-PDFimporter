@@ -52,6 +52,17 @@ _FONT_PROOF_CATEGORIES = {
 }
 
 
+@dataclass(frozen=True)
+class ZeroInkReconciliationAuthority:
+    """Immutable-by-value source and delivery truth for post-stack reconciliation."""
+
+    item_id: str
+    source_manifest_json: str
+    source_manifest_sha256: str
+    delivery_manifest_json: str
+    delivery_manifest_sha256: str
+
+
 def normalize_representation(value: object) -> str:
     mode = str(value or "").strip().lower()
     if not mode:
@@ -265,6 +276,18 @@ def _strict_int(value: Any):
     return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
+def _strict_cleanup_identities(value: Any):
+    """Return exact cleanup identities, rejecting blank or non-string entries."""
+    if not isinstance(value, (list, tuple)):
+        return None
+    identities = []
+    for identity in value:
+        if not isinstance(identity, str) or not identity.strip():
+            return None
+        identities.append(identity)
+    return identities
+
+
 def freeze_zero_ink_source_manifest(manifest: Any) -> tuple[Dict[str, Any], str]:
     """Return an immutable-by-value JSON snapshot and its canonical digest."""
     if not isinstance(manifest, dict):
@@ -278,6 +301,74 @@ def freeze_zero_ink_source_manifest(manifest: Any) -> tuple[Dict[str, Any], str]
     )
     snapshot = json.loads(payload)
     return snapshot, sha256(payload.encode("utf-8")).hexdigest()
+
+
+def seal_zero_ink_reconciliation_authority(
+    *,
+    item_id: str,
+    source_manifest: Any,
+    source_manifest_sha256: str,
+    delivery_manifest_entry: Any,
+) -> ZeroInkReconciliationAuthority:
+    """Seal canonical manifests as immutable JSON strings before records escape."""
+    source_snapshot, source_digest = freeze_zero_ink_source_manifest(source_manifest)
+    if source_digest != source_manifest_sha256:
+        raise ValueError("zero-ink source manifest digest changed before sealing")
+    if not isinstance(delivery_manifest_entry, dict):
+        raise TypeError("zero-ink delivery manifest entry is unavailable")
+    delivery_snapshot, delivery_digest = freeze_zero_ink_source_manifest(
+        delivery_manifest_entry.get("manifest")
+    )
+    if delivery_digest != delivery_manifest_entry.get("sha256"):
+        raise ValueError("zero-ink delivery manifest digest changed before sealing")
+    if (
+        str(source_snapshot.get("item_id") or "") != str(item_id)
+        or str(delivery_snapshot.get("item_id") or "") != str(item_id)
+    ):
+        raise ValueError("zero-ink reconciliation item identity is unbound")
+    source_payload = json.dumps(
+        source_snapshot,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    delivery_payload = json.dumps(
+        delivery_snapshot,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return ZeroInkReconciliationAuthority(
+        item_id=str(item_id),
+        source_manifest_json=source_payload,
+        source_manifest_sha256=source_digest,
+        delivery_manifest_json=delivery_payload,
+        delivery_manifest_sha256=delivery_digest,
+    )
+
+
+def open_zero_ink_reconciliation_authority(
+    authority: Any,
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    """Verify and reopen one immutable reconciliation authority."""
+    if not isinstance(authority, ZeroInkReconciliationAuthority):
+        raise TypeError("zero-ink reconciliation authority is invalid")
+    source_manifest = json.loads(authority.source_manifest_json)
+    delivery_manifest = json.loads(authority.delivery_manifest_json)
+    source_snapshot, source_digest = freeze_zero_ink_source_manifest(source_manifest)
+    delivery_snapshot, delivery_digest = freeze_zero_ink_source_manifest(
+        delivery_manifest
+    )
+    if (
+        source_digest != authority.source_manifest_sha256
+        or delivery_digest != authority.delivery_manifest_sha256
+        or str(source_snapshot.get("item_id") or "") != authority.item_id
+        or str(delivery_snapshot.get("item_id") or "") != authority.item_id
+    ):
+        raise ValueError("zero-ink reconciliation authority digest is invalid")
+    return source_snapshot, delivery_snapshot
 
 
 def _prepare_zero_ink_source_manifest(manifest: Any):
@@ -583,12 +674,10 @@ def _zero_ink_character_proof_failures(
         failures.append("zero_ink_cleanup_incomplete")
         top_removed_values: list[str] = []
     else:
-        removed = cleanup.get("removed")
-        top_removed_values = (
-            [str(value) for value in removed if str(value)]
-            if isinstance(removed, (list, tuple))
-            else []
-        )
+        top_removed_values = _strict_cleanup_identities(cleanup.get("removed"))
+        if top_removed_values is None:
+            top_removed_values = []
+            failures.append("zero_ink_cleanup_ledger_incomplete")
     child_removed: set[str] = set()
 
     for expected_index in zero_indices:
@@ -719,13 +808,11 @@ def _zero_ink_character_proof_failures(
             or verification.get("empty_conversion_datablock_cleaned") is not True
         ):
             failures.append("zero_ink_character_cleanup_incomplete")
-        elif not isinstance(character_cleanup.get("removed"), (list, tuple)) or not character_cleanup.get("removed"):
+        elif not _strict_cleanup_identities(character_cleanup.get("removed")):
             failures.append("zero_ink_character_cleanup_ledger_missing")
         else:
             child_removed.update(
-                str(value)
-                for value in character_cleanup.get("removed")
-                if str(value)
+                _strict_cleanup_identities(character_cleanup.get("removed")) or ()
             )
     if (
         len(set(top_removed_values)) != len(top_removed_values)
@@ -849,12 +936,10 @@ def _zero_ink_delivery_proof_failures(
         failures.append("zero_ink_cleanup_incomplete")
         top_removed: set[str] = set()
     else:
-        removed = cleanup.get("removed")
-        top_removed = (
-            {str(value) for value in removed}
-            if isinstance(removed, (list, tuple))
-            else set()
-        )
+        removed = _strict_cleanup_identities(cleanup.get("removed"))
+        top_removed = set(removed or ())
+        if removed is None:
+            failures.append("zero_ink_cleanup_ledger_incomplete")
 
     characters = evidence.get("character_entities")
     if not isinstance(characters, (list, tuple)):
@@ -963,12 +1048,12 @@ def _zero_ink_delivery_proof_failures(
         ):
             failures.append("zero_ink_character_cleanup_incomplete")
         else:
-            character_removed = character_cleanup.get("removed")
-            if not isinstance(character_removed, (list, tuple)) or not character_removed:
+            character_removed = _strict_cleanup_identities(
+                character_cleanup.get("removed")
+            )
+            if not character_removed:
                 failures.append("zero_ink_character_cleanup_ledger_missing")
-            elif not {
-                str(value) for value in character_removed
-            }.issubset(top_removed):
+            elif not set(character_removed).issubset(top_removed):
                 failures.append("zero_ink_cleanup_ledger_incomplete")
     failures.extend(
         _zero_ink_character_proof_failures(
@@ -1294,6 +1379,14 @@ def deliver_item(
                     "sha256"
                 ]
                 record["_zero_ink_delivery_manifest"] = delivery_manifest
+                record["_zero_ink_reconciliation_authority"] = (
+                    seal_zero_ink_reconciliation_authority(
+                        item_id=str(item_id),
+                        source_manifest=expected_manifest,
+                        source_manifest_sha256=str(expected_manifest_sha256 or ""),
+                        delivery_manifest_entry=delivery_manifest,
+                    )
+                )
                 record["_delivered_outcome"] = outcome
                 return None, record
             elif outcome.status == "delivered" and (
@@ -1345,6 +1438,16 @@ def deliver_item(
                         "sha256"
                     ]
                     record["_zero_ink_delivery_manifest"] = delivery_manifest
+                    record["_zero_ink_reconciliation_authority"] = (
+                        seal_zero_ink_reconciliation_authority(
+                            item_id=str(item_id),
+                            source_manifest=expected_manifest,
+                            source_manifest_sha256=str(
+                                expected_manifest_sha256 or ""
+                            ),
+                            delivery_manifest_entry=delivery_manifest,
+                        )
+                    )
                 record["_delivered_outcome"] = outcome
                 return outcome.entity, record
 

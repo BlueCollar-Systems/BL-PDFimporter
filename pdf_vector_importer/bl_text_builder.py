@@ -22,6 +22,7 @@ from .text_delivery import (
     ZERO_INK_CHARACTER_MANIFEST_SCHEMA,
     ZERO_INK_SOURCE_MANIFEST_SCHEMA,
     AttemptOutcome,
+    ZeroInkReconciliationAuthority,
     deliver_item,
     freeze_zero_ink_source_manifest,
     make_zero_ink_character_manifest,
@@ -581,6 +582,44 @@ def _positioned_font_axis_metrics(obj, text_item) -> Dict[str, Any]:
         size=float(obj.data.size),
         baseline_alignment=str(obj.get("pdf_baseline_alignment", "") or ""),
     )
+
+
+def _probe_positioned_baseline_alignment() -> str:
+    """Select and cleanly prove the exact FONT baseline enum before sealing proof."""
+    curves = getattr(getattr(bpy, "data", None), "curves", None)
+    new = getattr(curves, "new", None)
+    remove = getattr(curves, "remove", None)
+    if not callable(new) or not callable(remove):
+        raise RuntimeError("Blender FONT baseline capability probe is unavailable")
+    probe = None
+    selected = None
+    probe_error = None
+    cleanup_error = None
+    try:
+        probe = new(name="BCPDF_PositionedBaselineProbe", type="FONT")
+        for alignment in ("BOTTOM_BASELINE", "BOTTOM"):
+            try:
+                probe.align_y = alignment
+                if str(getattr(probe, "align_y", "") or "") == alignment:
+                    selected = alignment
+                    break
+            except Exception as exc:
+                probe_error = exc
+        if selected is None:
+            raise RuntimeError(
+                "Blender supports neither required positioned baseline alignment"
+            ) from probe_error
+    finally:
+        if probe is not None:
+            try:
+                remove(probe)
+            except Exception as exc:
+                cleanup_error = exc
+    if cleanup_error is not None:
+        raise RuntimeError(
+            "Blender FONT baseline capability probe cleanup failed"
+        ) from cleanup_error
+    return selected
 
 
 def _apply_target_quad_affine(
@@ -1186,6 +1225,7 @@ def _create_font_candidate(
     z_offset_m: float,
     entity_suffix: str = "",
     defer_host_update: bool = False,
+    baseline_alignment: Optional[str] = None,
 ):
     font, font_outcome = _load_exact_font(text_item, item_id, page_number)
     if font_outcome is not None:
@@ -1207,13 +1247,35 @@ def _create_font_candidate(
         data.size = max(requested_size_mm * MM_TO_M, 0.0001)
         data.font = font
         data.align_x = "LEFT"
-        baseline_alignment = "BOTTOM_BASELINE"
+        sealed_baseline_alignment = baseline_alignment
         baseline_compensation_m = 0.0
-        try:
-            data.align_y = "BOTTOM_BASELINE"
-        except Exception as baseline_exc:
-            data.align_y = "BOTTOM"
-            baseline_alignment = "BOTTOM"
+        if positioned_character:
+            if sealed_baseline_alignment not in {"BOTTOM_BASELINE", "BOTTOM"}:
+                raise RuntimeError(
+                    "positioned FONT baseline alignment was not sealed"
+                )
+            try:
+                data.align_y = sealed_baseline_alignment
+            except Exception as baseline_exc:
+                raise RuntimeError(
+                    "sealed positioned FONT baseline alignment is unavailable"
+                ) from baseline_exc
+            if str(getattr(data, "align_y", "") or "") != sealed_baseline_alignment:
+                raise RuntimeError(
+                    "positioned FONT baseline alignment changed after sealing"
+                )
+        else:
+            sealed_baseline_alignment = "BOTTOM_BASELINE"
+            try:
+                data.align_y = "BOTTOM_BASELINE"
+            except Exception as baseline_exc:
+                data.align_y = "BOTTOM"
+                sealed_baseline_alignment = "BOTTOM"
+                if str(getattr(data, "align_y", "") or "") != "BOTTOM":
+                    raise RuntimeError(
+                        "fallback FONT baseline alignment is unavailable"
+                    ) from baseline_exc
+        if sealed_baseline_alignment == "BOTTOM":
             baseline_compensation_m = (
                 float(getattr(text_item, "baseline_descent", 0.0) or 0.0) * MM_TO_M
             )
@@ -1221,7 +1283,7 @@ def _create_font_candidate(
                 raise RuntimeError(
                     "BOTTOM_BASELINE unavailable and source baseline descent is not "
                     "available for measured compensation"
-                ) from baseline_exc
+                )
         data.extrude = _text_extrusion_depth(data.size) if delivered == "3d_text" else 0.0
         data.resolution_u = max(int(getattr(data, "resolution_u", 12) or 12), 24)
         obj = bpy.data.objects.new(name, data)
@@ -1232,7 +1294,7 @@ def _create_font_candidate(
             delivered=delivered,
             text_item=text_item,
         )
-        obj["pdf_baseline_alignment"] = baseline_alignment
+        obj["pdf_baseline_alignment"] = sealed_baseline_alignment
         obj["pdf_baseline_compensation_m"] = baseline_compensation_m
         x, y = text_item.insertion
         angle_rad = math.radians(float(getattr(text_item, "rotation", 0.0) or 0.0))
@@ -2711,8 +2773,11 @@ def _positioned_zero_ink_source_manifest(
     page_number: int,
     requested: str,
     z_offset_m: float,
+    baseline_alignment: str,
 ) -> Dict[str, Any]:
     """Snapshot source character/layout truth before any host mutation."""
+    if baseline_alignment not in {"BOTTOM_BASELINE", "BOTTOM"}:
+        raise ValueError("a supported positioned baseline alignment is required")
     layouts = tuple(getattr(text_item, "source_char_layout", ()) or ())
     characters = []
     for index, layout in enumerate(layouts):
@@ -2722,7 +2787,7 @@ def _positioned_zero_ink_source_manifest(
             metrics = _positioned_font_axis_metrics_values(
                 child,
                 size=float(child.font_size) * MM_TO_M,
-                baseline_alignment="BOTTOM_BASELINE",
+                baseline_alignment=baseline_alignment,
             )
             local_advance = metrics["local_advance"]
             local_line_height = metrics["local_line_height"]
@@ -2821,6 +2886,7 @@ def _attempt_positioned_native_characters(
     item_id,
     visual_style,
     z_offset_m,
+    baseline_alignment,
 ):
     """Create one positioned source item, then evaluate all characters once."""
     layouts = tuple(getattr(text_item, "source_char_layout", ()) or ())
@@ -2884,6 +2950,7 @@ def _attempt_positioned_native_characters(
             z_offset_m=z_offset_m,
             entity_suffix=suffix,
             defer_host_update=True,
+            baseline_alignment=baseline_alignment,
         )
         if failure is not None:
             outcomes = tuple(ownership_outcomes) + (failure,)
@@ -3143,6 +3210,7 @@ def _attempt_positioned_converted_characters(
     z_offset_m,
     source_manifest=None,
     source_manifest_sha256="",
+    baseline_alignment=None,
 ):
     """Batch positioned FONT evaluation and CURVE/MESH verification by item."""
     layouts = tuple(getattr(text_item, "source_char_layout", ()) or ())
@@ -3315,6 +3383,7 @@ def _attempt_positioned_converted_characters(
             z_offset_m=z_offset_m,
             entity_suffix=suffix,
             defer_host_update=True,
+            baseline_alignment=baseline_alignment,
         )
         if failure is not None:
             return aggregate_failure(failure, index)
@@ -3667,6 +3736,7 @@ def _attempt_positioned_characters(
     z_offset_m,
     source_manifest=None,
     source_manifest_sha256="",
+    baseline_alignment=None,
 ):
     layouts = tuple(getattr(text_item, "source_char_layout", ()) or ())
     if not layouts:
@@ -3684,6 +3754,11 @@ def _attempt_positioned_characters(
                 "layout_text": reconstructed,
             },
         )
+    if baseline_alignment not in {"BOTTOM_BASELINE", "BOTTOM"}:
+        return AttemptOutcome.failed(
+            "positioned_baseline_alignment_unavailable_not_impossibility_proof",
+            evidence={"item_id": item_id},
+        )
     if delivered in {"text", "3d_text"}:
         return _attempt_positioned_native_characters(
             text_item,
@@ -3694,6 +3769,7 @@ def _attempt_positioned_characters(
             item_id=item_id,
             visual_style=visual_style,
             z_offset_m=z_offset_m,
+            baseline_alignment=baseline_alignment,
         )
     if delivered in {"glyphs", "geometry"}:
         return _attempt_positioned_converted_characters(
@@ -3707,6 +3783,7 @@ def _attempt_positioned_characters(
             z_offset_m=z_offset_m,
             source_manifest=source_manifest,
             source_manifest_sha256=source_manifest_sha256,
+            baseline_alignment=baseline_alignment,
         )
 
     raise ValueError(f"unsupported positioned representation: {delivered}")
@@ -3746,11 +3823,20 @@ def build_text(
 
     effective_page = int(page_number or getattr(text_item, "page_number", 0) or 0)
     item_id = f"page:{effective_page}:text:{int(text_item.id)}"
+    positioned_text = bool(
+        getattr(text_item, "requires_individual_positioning", False)
+    )
+    baseline_alignment = None
+    if positioned_text:
+        try:
+            baseline_alignment = _probe_positioned_baseline_alignment()
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            baseline_alignment = None
     zero_ink_source_manifest = None
     zero_ink_source_manifest_sha256 = ""
     if (
         requested in {"glyphs", "geometry"}
-        and bool(getattr(text_item, "requires_individual_positioning", False))
+        and positioned_text
     ):
         try:
             raw_manifest = _positioned_zero_ink_source_manifest(
@@ -3759,6 +3845,7 @@ def build_text(
                 page_number=effective_page,
                 requested=requested,
                 z_offset_m=z_offset_m,
+                baseline_alignment=baseline_alignment,
             )
             (
                 zero_ink_source_manifest,
@@ -3773,7 +3860,7 @@ def build_text(
             return _attempt_labels(item_id, effective_page, int(text_item.id))
         if (
             representation in {"text", "3d_text", "glyphs", "geometry"}
-            and bool(getattr(text_item, "requires_individual_positioning", False))
+            and positioned_text
         ):
             return _attempt_positioned_characters(
                 text_item,
@@ -3786,6 +3873,7 @@ def build_text(
                 z_offset_m=z_offset_m,
                 source_manifest=zero_ink_source_manifest,
                 source_manifest_sha256=zero_ink_source_manifest_sha256,
+                baseline_alignment=baseline_alignment,
             )
         if representation in {"text", "3d_text"}:
             return _attempt_native_font(
@@ -3841,6 +3929,10 @@ def build_text(
         "_zero_ink_delivery_manifest",
         None,
     )
+    zero_ink_reconciliation_authority = record.pop(
+        "_zero_ink_reconciliation_authority",
+        None,
+    )
     _append_delivery_record(provenance_opts, record)
     zero_ink_delivery = (
         obj is None
@@ -3888,6 +3980,26 @@ def build_text(
                     delivery_manifests
                 )
             delivery_manifests[item_id] = zero_ink_delivery_manifest
+            if isinstance(
+                zero_ink_reconciliation_authority,
+                ZeroInkReconciliationAuthority,
+            ):
+                authorities = getattr(
+                    provenance_opts,
+                    "_zero_ink_reconciliation_authorities",
+                    (),
+                )
+                if not isinstance(authorities, tuple):
+                    authorities = ()
+                provenance_opts._zero_ink_reconciliation_authorities = (  # noqa: B010
+                    tuple(
+                        authority
+                        for authority in authorities
+                        if isinstance(authority, ZeroInkReconciliationAuthority)
+                        and authority.item_id != item_id
+                    )
+                    + (zero_ink_reconciliation_authority,)
+                )
 
     delivered = str(record["final_representation"])
     if delivered != requested:

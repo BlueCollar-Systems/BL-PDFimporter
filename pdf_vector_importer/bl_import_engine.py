@@ -36,8 +36,10 @@ from .pdfcadcore.primitive_extractor import (
 from .text_delivery import (
     AttemptOutcome,
     ZERO_INK_DELIVERY_MANIFEST_SCHEMA,
+    ZeroInkReconciliationAuthority,
     freeze_zero_ink_source_manifest,
     normalize_representation,
+    open_zero_ink_reconciliation_authority,
     zero_ink_character_proof_failures,
     zero_ink_delivery_proof_failures,
 )
@@ -1844,28 +1846,77 @@ def _strict_manifest_int(value):
 def _canonical_zero_ink_delivery_manifest(
     provenance_opts,
     *,
+    authority,
     item_id: str,
     page_number: int,
-    source_manifest,
 ):
-    """Return independently frozen delivery truth and all contract failures."""
+    """Return sealed delivery/source truth; mutable maps are tamper detectors only."""
     failures = []
-    manifests = getattr(
+    if not isinstance(authority, ZeroInkReconciliationAuthority):
+        return None, None, ["zero_ink_reconciliation_authority_missing"]
+    try:
+        source_manifest, manifest = open_zero_ink_reconciliation_authority(
+            authority
+        )
+    except (TypeError, ValueError, OverflowError):
+        return None, None, ["zero_ink_reconciliation_authority_invalid"]
+
+    source_manifests = getattr(
+        provenance_opts,
+        "_zero_ink_source_manifests",
+        None,
+    )
+    mutable_source = (
+        source_manifests.get(item_id)
+        if isinstance(source_manifests, dict)
+        else None
+    )
+    if not isinstance(mutable_source, dict):
+        failures.append("zero_ink_source_manifest_missing")
+    else:
+        try:
+            mutable_source_snapshot, mutable_source_digest = (
+                freeze_zero_ink_source_manifest(mutable_source)
+            )
+        except (TypeError, ValueError, OverflowError):
+            failures.append("zero_ink_source_manifest_invalid")
+        else:
+            if (
+                mutable_source_snapshot != source_manifest
+                or mutable_source_digest != authority.source_manifest_sha256
+            ):
+                failures.append("zero_ink_source_manifest_digest_mismatch")
+                failures.append(
+                    "zero_ink_character_source_manifest_digest_mismatch"
+                )
+
+    delivery_manifests = getattr(
         provenance_opts,
         "_zero_ink_delivery_manifests",
         None,
     )
-    entry = manifests.get(item_id) if isinstance(manifests, dict) else None
+    entry = (
+        delivery_manifests.get(item_id)
+        if isinstance(delivery_manifests, dict)
+        else None
+    )
     if not isinstance(entry, dict):
-        return None, ["zero_ink_delivery_manifest_missing"]
-    raw_manifest = entry.get("manifest")
-    expected_digest = entry.get("sha256")
-    try:
-        manifest, actual_digest = freeze_zero_ink_source_manifest(raw_manifest)
-    except (TypeError, ValueError, OverflowError):
-        return None, ["zero_ink_delivery_manifest_invalid"]
-    if not isinstance(expected_digest, str) or actual_digest != expected_digest:
-        failures.append("zero_ink_delivery_manifest_digest_mismatch")
+        failures.append("zero_ink_delivery_manifest_missing")
+    else:
+        try:
+            mutable_delivery, mutable_delivery_digest = (
+                freeze_zero_ink_source_manifest(entry.get("manifest"))
+            )
+        except (TypeError, ValueError, OverflowError):
+            failures.append("zero_ink_delivery_manifest_invalid")
+        else:
+            if (
+                mutable_delivery != manifest
+                or mutable_delivery_digest != entry.get("sha256")
+                or mutable_delivery_digest
+                != authority.delivery_manifest_sha256
+            ):
+                failures.append("zero_ink_delivery_manifest_digest_mismatch")
     if manifest.get("schema") != ZERO_INK_DELIVERY_MANIFEST_SCHEMA:
         failures.append("zero_ink_delivery_manifest_schema_unverified")
     if manifest.get("importer_id") != "bc_pdf_vector_importer.blender":
@@ -1953,7 +2004,7 @@ def _canonical_zero_ink_delivery_manifest(
         or manifest.get("source_manifest_sha256") != source_digest
     ):
         failures.append("zero_ink_delivery_manifest_source_crosslink_mismatch")
-    return manifest, list(dict.fromkeys(failures))
+    return manifest, source_manifest, list(dict.fromkeys(failures))
 
 
 def _reverify_text_delivery_after_stack(
@@ -2008,14 +2059,29 @@ def _reverify_text_delivery_after_stack(
         entity_proofs = []
         record_failures = []
         item_id = str(record.get("item_id") or "")
-        manifests = getattr(
+        source_manifests = getattr(
             provenance_opts,
             "_zero_ink_source_manifests",
             None,
         )
-        expected_manifest = (
-            manifests.get(item_id) if isinstance(manifests, dict) else None
+        reconciliation_authorities = getattr(
+            provenance_opts,
+            "_zero_ink_reconciliation_authorities",
+            (),
         )
+        authority_matches = [
+            authority
+            for authority in (
+                reconciliation_authorities
+                if isinstance(reconciliation_authorities, tuple)
+                else ()
+            )
+            if isinstance(authority, ZeroInkReconciliationAuthority)
+            and authority.item_id == item_id
+        ]
+        authority = authority_matches[0] if len(authority_matches) == 1 else None
+        if len(authority_matches) > 1:
+            record_failures.append("zero_ink_reconciliation_authority_ambiguous")
         runtime_outcomes = getattr(
             provenance_opts,
             "_text_delivery_outcomes",
@@ -2032,20 +2098,31 @@ def _reverify_text_delivery_after_stack(
             None,
         )
         canonical_state_present = bool(
-            expected_manifest is not None
+            authority is not None
+            or (
+                isinstance(source_manifests, dict)
+                and item_id in source_manifests
+            )
             or (
                 isinstance(delivery_manifests, dict)
                 and item_id in delivery_manifests
             )
+            or record.get("zero_ink_delivery") is True
+            or (
+                isinstance(record.get("zero_ink_character_count"), int)
+                and not isinstance(record.get("zero_ink_character_count"), bool)
+                and record.get("zero_ink_character_count") > 0
+            )
         )
         canonical_delivery = None
+        expected_manifest = None
         if canonical_state_present:
-            canonical_delivery, canonical_failures = (
+            canonical_delivery, expected_manifest, canonical_failures = (
                 _canonical_zero_ink_delivery_manifest(
                     provenance_opts,
+                    authority=authority,
                     item_id=item_id,
                     page_number=int(page_number),
-                    source_manifest=expected_manifest,
                 )
             )
             record_failures.extend(canonical_failures)
@@ -2070,11 +2147,26 @@ def _reverify_text_delivery_after_stack(
                 proof_page_number = int(page_number)
             if proof_source_span_id is None:
                 proof_source_span_id = int(record.get("source_span_id", 0) or 0)
-            canonical_count_contribution = _strict_manifest_int(
-                canonical_delivery.get("delivered_count_contribution")
+            canonical_characters = (
+                expected_manifest.get("characters")
+                if isinstance(expected_manifest, dict)
+                else []
             )
-            canonical_zero_count = _strict_manifest_int(
-                canonical_delivery.get("zero_ink_character_count")
+            if not isinstance(canonical_characters, list):
+                canonical_characters = []
+            canonical_zero_count = sum(
+                1
+                for character in canonical_characters
+                if isinstance(character, dict)
+                and isinstance(character.get("text"), str)
+                and bool(character.get("text"))
+                and not character.get("text").strip()
+            )
+            canonical_logical_zero_ink = bool(canonical_characters) and (
+                canonical_zero_count == len(canonical_characters)
+            )
+            canonical_count_contribution = (
+                0 if canonical_logical_zero_ink else 1
             )
             if not record_entity_ids_exact or record_entity_ids != entity_ids:
                 record_failures.append("zero_ink_record_entity_identity_unbound")
@@ -2096,9 +2188,10 @@ def _reverify_text_delivery_after_stack(
                 "source_manifest_sha256"
             ):
                 record_failures.append("zero_ink_record_manifest_identity_unbound")
-            entry = delivery_manifests.get(item_id)
             if record.get("zero_ink_delivery_manifest_sha256") != (
-                entry.get("sha256") if isinstance(entry, dict) else None
+                authority.delivery_manifest_sha256
+                if isinstance(authority, ZeroInkReconciliationAuthority)
+                else None
             ):
                 record_failures.append(
                     "zero_ink_record_delivery_manifest_identity_unbound"
@@ -2418,6 +2511,25 @@ def _reverify_text_delivery_after_stack(
                 )
                 if isinstance(zero_ink_delivery_manifests, dict):
                     zero_ink_delivery_manifests.pop(item_id, None)
+                authorities = getattr(
+                    provenance_opts,
+                    "_zero_ink_reconciliation_authorities",
+                    (),
+                )
+                if isinstance(authorities, tuple):
+                    provenance_opts._zero_ink_reconciliation_authorities = (  # noqa: B010
+                        tuple(
+                            candidate
+                            for candidate in authorities
+                            if not (
+                                isinstance(
+                                    candidate,
+                                    ZeroInkReconciliationAuthority,
+                                )
+                                and candidate.item_id == item_id
+                            )
+                        )
+                    )
             final_proof["cleanup"] = cleanup
             if canonical_state_present:
                 count_contribution = (
