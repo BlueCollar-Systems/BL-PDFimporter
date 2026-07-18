@@ -36,6 +36,7 @@ from .pdfcadcore.primitive_extractor import (
 from .text_delivery import (
     AttemptOutcome,
     normalize_representation,
+    zero_ink_character_proof_failures,
     zero_ink_delivery_proof_failures,
 )
 
@@ -1878,33 +1879,88 @@ def _reverify_text_delivery_after_stack(
         expected_type = expected_types.get(representation)
         entity_proofs = []
         record_failures = []
+        item_id = str(record.get("item_id") or "")
+        manifests = getattr(
+            provenance_opts,
+            "_zero_ink_source_manifests",
+            None,
+        )
+        expected_manifest = (
+            manifests.get(item_id) if isinstance(manifests, dict) else None
+        )
+        runtime_outcomes = getattr(
+            provenance_opts,
+            "_text_delivery_outcomes",
+            None,
+        )
+        runtime_outcome = (
+            runtime_outcomes.get(item_id)
+            if isinstance(runtime_outcomes, dict)
+            else None
+        )
         logical_zero_ink_claimed = not entity_ids and (
             record.get("zero_ink_delivery") is True
             or prior_evidence.get("zero_ink_delivery") is True
             or prior_evidence.get("proof_kind")
             == "positioned_zero_ink_delivery_v1"
         )
+        evidence_zero_count = prior_evidence.get("zero_ink_character_count")
+        raw_manifest_characters = (
+            expected_manifest.get("characters")
+            if isinstance(expected_manifest, dict)
+            else ()
+        )
+        manifest_characters = (
+            raw_manifest_characters
+            if isinstance(raw_manifest_characters, (list, tuple))
+            else ()
+        )
+        expected_zero_count = sum(
+            1
+            for character in manifest_characters
+            if isinstance(character, dict)
+            and isinstance(character.get("text"), str)
+            and bool(character.get("text"))
+            and not character.get("text").strip()
+        )
+        record_zero_count = record.get("zero_ink_character_count")
+        evidence_characters = prior_evidence.get("character_entities")
+        evidence_zero_child = bool(
+            isinstance(evidence_characters, (list, tuple))
+            and any(
+                isinstance(character, dict)
+                and (
+                    isinstance(character.get("verification"), dict)
+                    and character["verification"].get("zero_ink_identity") is True
+                    or (
+                        isinstance(character.get("text"), str)
+                        and bool(character.get("text"))
+                        and not character.get("text").strip()
+                    )
+                )
+                for character in evidence_characters
+            )
+        )
+        nested_zero_ink_claimed = bool(
+            representation in {"glyphs", "geometry"}
+            and (
+                expected_zero_count > 0
+                or evidence_zero_child
+                or (
+                    isinstance(evidence_zero_count, int)
+                    and not isinstance(evidence_zero_count, bool)
+                    and evidence_zero_count > 0
+                )
+                or (
+                    isinstance(record_zero_count, int)
+                    and not isinstance(record_zero_count, bool)
+                    and record_zero_count > 0
+                )
+            )
+        )
         logical_zero_ink_verified = False
+        nested_zero_ink_verified = False
         if logical_zero_ink_claimed:
-            item_id = str(record.get("item_id") or "")
-            manifests = getattr(
-                provenance_opts,
-                "_zero_ink_source_manifests",
-                None,
-            )
-            expected_manifest = (
-                manifests.get(item_id) if isinstance(manifests, dict) else None
-            )
-            runtime_outcomes = getattr(
-                provenance_opts,
-                "_text_delivery_outcomes",
-                None,
-            )
-            runtime_outcome = (
-                runtime_outcomes.get(item_id)
-                if isinstance(runtime_outcomes, dict)
-                else None
-            )
             if not isinstance(runtime_outcome, AttemptOutcome):
                 record_failures.append("zero_ink_runtime_outcome_missing")
             else:
@@ -1957,6 +2013,55 @@ def _reverify_text_delivery_after_stack(
                 record_failures.append("zero_ink_record_manifest_identity_unbound")
             record_failures = list(dict.fromkeys(record_failures))
             logical_zero_ink_verified = not record_failures
+            nested_zero_ink_verified = logical_zero_ink_verified
+        elif nested_zero_ink_claimed:
+            if not isinstance(runtime_outcome, AttemptOutcome):
+                record_failures.append("zero_ink_runtime_outcome_missing")
+                proof_outcome = AttemptOutcome.delivered(
+                    None,
+                    entity_ids=tuple(entity_ids),
+                    evidence=prior_evidence,
+                )
+            else:
+                runtime_ids = [
+                    str(value)
+                    for value in tuple(runtime_outcome.entity_ids or ())
+                    if str(value)
+                ]
+                if runtime_ids != entity_ids:
+                    record_failures.append(
+                        "zero_ink_runtime_outcome_entity_identity_unbound"
+                    )
+                proof_outcome = AttemptOutcome.delivered(
+                    runtime_outcome.entity,
+                    entity_ids=tuple(runtime_ids),
+                    evidence=prior_evidence,
+                )
+            record_failures.extend(
+                zero_ink_character_proof_failures(
+                    attempted_representation=representation,
+                    requested_representation=requested_representation,
+                    item_id=item_id,
+                    page_number=int(record.get("page", 0) or 0),
+                    source_span_id=int(record.get("source_span_id", 0) or 0),
+                    outcome=proof_outcome,
+                    expected_zero_ink_manifest=expected_manifest,
+                )
+            )
+            if record.get("zero_ink_character_count") != evidence_zero_count:
+                record_failures.append("zero_ink_record_character_count_unbound")
+            if record.get("source_manifest_sha256") != prior_evidence.get(
+                "source_manifest_sha256"
+            ):
+                record_failures.append("zero_ink_record_manifest_identity_unbound")
+            if [
+                str(value)
+                for value in tuple(delivered_attempt.get("entity_ids") or ())
+                if str(value)
+            ] != entity_ids:
+                record_failures.append("zero_ink_attempt_entity_identity_unbound")
+            record_failures = list(dict.fromkeys(record_failures))
+            nested_zero_ink_verified = not record_failures
         for entity_id in entity_ids:
             obj = getter(entity_id) if callable(getter) else None
             if obj is None:
@@ -2012,6 +2117,14 @@ def _reverify_text_delivery_after_stack(
                     record.get("source_manifest_sha256") or ""
                 ),
             })
+        if nested_zero_ink_claimed:
+            final_proof.update({
+                "logical_zero_ink_children": int(expected_zero_count),
+                "logical_zero_ink_children_verified": nested_zero_ink_verified,
+                "source_manifest_sha256": str(
+                    record.get("source_manifest_sha256") or ""
+                ),
+            })
         record["final_state_verification"] = final_proof
         if delivered_attempt:
             delivered_attempt["final_state_verification"] = final_proof
@@ -2046,11 +2159,19 @@ def _reverify_text_delivery_after_stack(
                 if isinstance(source_manifests, dict):
                     source_manifests.pop(item_id, None)
             final_proof["cleanup"] = cleanup
+            count_contribution = record.get("delivered_count_contribution")
+            if not (
+                isinstance(count_contribution, int)
+                and not isinstance(count_contribution, bool)
+                and count_contribution >= 0
+            ):
+                count_contribution = 0 if logical_zero_ink_claimed else 1
             failure = {
                 "item_id": item_id,
                 "page": int(page_number),
                 "failures": list(record_failures),
                 "cleanup": cleanup,
+                "delivered_count_contribution": count_contribution,
             }
             failures.append(failure)
             record["status"] = "failed"
@@ -2073,8 +2194,15 @@ def _reverify_text_delivery_after_stack(
                     "geometry": "geometry_mesh",
                     "raster": "raster_patch",
                 }.get(representation)
-                if isinstance(counts, dict) and bucket:
-                    counts[bucket] = max(0, int(counts.get(bucket, 0) or 0) - 1)
+                if (
+                    isinstance(counts, dict)
+                    and bucket
+                    and count_contribution > 0
+                ):
+                    counts[bucket] = max(
+                        0,
+                        int(counts.get(bucket, 0) or 0) - count_contribution,
+                    )
                 provenance = getattr(
                     provenance_opts,
                     "_source_provenance_objects",
@@ -2609,7 +2737,11 @@ def import_pdf(
                 provenance_opts=import_cfg,
             )
             total_stats["text_final_state_failures"].extend(final_text_failures)
-            text_count = max(0, int(text_count) - len(final_text_failures))
+            failed_text_count = sum(
+                max(0, int(failure.get("delivered_count_contribution", 1) or 0))
+                for failure in final_text_failures
+            )
+            text_count = max(0, int(text_count) - failed_text_count)
             # Advance offset for the next page (page_data.height is in mm)
             page_height_m = page_data.height * _MM_TO_M
             _page_stack_offset_m -= _page_stack_step(

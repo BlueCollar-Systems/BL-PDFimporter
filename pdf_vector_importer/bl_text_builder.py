@@ -19,10 +19,12 @@ from .pdfcadcore.primitives import NormalizedText
 from .pdfcadcore.text_scale import calibrate_text_size_to_bbox
 from .text_delivery import (
     IMPORTER_ID,
+    ZERO_INK_CHARACTER_MANIFEST_SCHEMA,
     ZERO_INK_SOURCE_MANIFEST_SCHEMA,
     AttemptOutcome,
     deliver_item,
     freeze_zero_ink_source_manifest,
+    make_zero_ink_character_manifest,
     normalize_representation,
 )
 
@@ -2696,12 +2698,21 @@ def _positioned_zero_ink_source_manifest(
     item_id: str,
     page_number: int,
     requested: str,
+    z_offset_m: float,
 ) -> Dict[str, Any]:
     """Snapshot source character/layout truth before any host mutation."""
     layouts = tuple(getattr(text_item, "source_char_layout", ()) or ())
     characters = []
     for index, layout in enumerate(layouts):
         glyph_id = getattr(layout, "glyph_id", None)
+        intended_matrix = _metric_character_matrix_values(
+            local_advance=float(layout.advance_width) * MM_TO_M,
+            local_line_height=float(layout.glyph_height) * MM_TO_M,
+            local_baseline_y=0.0,
+            target_origin=layout.target_origin,
+            target_quad=layout.target_quad,
+            z=float(z_offset_m),
+        )
         characters.append({
             "character_item_id": f"{item_id}:char:{index}",
             "character_index": index,
@@ -2727,6 +2738,9 @@ def _positioned_zero_ink_source_manifest(
             "target_quad_model": [
                 [float(point[0]), float(point[1])]
                 for point in layout.target_quad
+            ],
+            "intended_affine_matrix": [
+                float(value) for row in intended_matrix for value in row
             ],
         })
     return {
@@ -3129,7 +3143,30 @@ def _attempt_positioned_converted_characters(
         verification = dict(outcome.evidence or {})
         character_id = f"{item_id}:char:{candidate['index']}"
         glyph_id = getattr(layout, "glyph_id", None)
+        manifest_character = {}
+        if isinstance(source_manifest, dict):
+            manifest_characters = source_manifest.get("characters")
+            if (
+                isinstance(manifest_characters, list)
+                and candidate["index"] < len(manifest_characters)
+                and isinstance(manifest_characters[candidate["index"]], dict)
+            ):
+                manifest_character = manifest_characters[candidate["index"]]
+        character_manifest = None
+        character_manifest_sha256 = ""
         if verification.get("zero_ink_identity") is True:
+            try:
+                raw_character_manifest = make_zero_ink_character_manifest(
+                    source_manifest,
+                    source_manifest_sha256,
+                    candidate["index"],
+                )
+                character_manifest, character_manifest_sha256 = (
+                    freeze_zero_ink_source_manifest(raw_character_manifest)
+                )
+            except (AttributeError, TypeError, ValueError, OverflowError):
+                character_manifest = None
+                character_manifest_sha256 = ""
             verification.update({
                 "source_manifest_schema": ZERO_INK_SOURCE_MANIFEST_SCHEMA,
                 "source_manifest_sha256": source_manifest_sha256,
@@ -3143,6 +3180,12 @@ def _attempt_positioned_converted_characters(
                     int(glyph_id) if glyph_id is not None else None
                 ),
                 "requested_representation": requested,
+                "zero_ink_character_manifest_schema": (
+                    ZERO_INK_CHARACTER_MANIFEST_SCHEMA
+                ),
+                "zero_ink_character_manifest_sha256": (
+                    character_manifest_sha256
+                ),
             })
         record = {
             "item_id": item_id,
@@ -3157,6 +3200,9 @@ def _attempt_positioned_converted_characters(
             "source_quad_pdf": [list(point) for point in layout.source_quad_pdf],
             "target_origin_model": list(layout.target_origin),
             "target_quad_model": [list(point) for point in layout.target_quad],
+            "intended_affine_matrix": list(
+                manifest_character.get("intended_affine_matrix", ())
+            ),
             "requested_representation": requested,
             "delivered_representation": delivered,
             "positioned_character": bool(
@@ -3167,6 +3213,10 @@ def _attempt_positioned_converted_characters(
         }
         if verification.get("zero_ink_identity") is True:
             record["source_manifest_sha256"] = source_manifest_sha256
+            record["zero_ink_character_manifest"] = character_manifest
+            record["zero_ink_character_manifest_sha256"] = (
+                character_manifest_sha256
+            )
         return record
 
     def ownership(extra_outcomes=()):
@@ -3526,10 +3576,30 @@ def _attempt_positioned_converted_characters(
         if candidate["zero_ink_evidence"] is not None
     )
     physical_entity_count = sum(len(outcome.entity_ids) for outcome in outcomes)
+    zero_ink_removed = []
+    for character in character_evidence:
+        verification = character.get("verification", {})
+        if verification.get("zero_ink_identity") is not True:
+            continue
+        for removed_id in verification.get("cleanup", {}).get("removed", ()):
+            value = str(removed_id)
+            if value and value not in zero_ink_removed:
+                zero_ink_removed.append(value)
     evidence = {
         **_font_asset_evidence(text_item),
+        **_proof_identity(item_id, page_number, int(text_item.id)),
         **dict(first.evidence or {}),
         "item_id": item_id,
+        "requested_representation": requested,
+        "delivered_representation": delivered,
+        "source_manifest_schema": ZERO_INK_SOURCE_MANIFEST_SCHEMA,
+        "source_manifest_sha256": source_manifest_sha256,
+        "source_text": str(
+            source_manifest.get("source_text", text_item.text)
+            if isinstance(source_manifest, dict)
+            else text_item.text
+        ),
+        "source_character_count": len(candidates),
         "character_positioning_preserved": True,
         "character_count": len(candidates),
         "attempted_character_count": len(candidates),
@@ -3537,6 +3607,8 @@ def _attempt_positioned_converted_characters(
         "zero_ink_character_count": zero_ink_count,
         "physical_entity_count": physical_entity_count,
         "character_entities": character_evidence,
+        "cleanup_verified": True,
+        "cleanup": {"status": "complete", "removed": zero_ink_removed},
         "dependency_graph_updates": 2,
     }
     return AttemptOutcome.delivered(
@@ -3660,6 +3732,7 @@ def build_text(
                 item_id=item_id,
                 page_number=effective_page,
                 requested=requested,
+                z_offset_m=z_offset_m,
             )
             (
                 zero_ink_source_manifest,
@@ -3745,6 +3818,10 @@ def build_text(
         and record.get("zero_ink_delivery") is True
         and record.get("physical_entity_count") == 0
     )
+    logical_zero_ink_children = (
+        record.get("status") == "delivered"
+        and int(record.get("zero_ink_character_count", 0) or 0) > 0
+    )
     if obj is None and not zero_ink_delivery:
         LOGGER.error(
             "Blender text delivery failed for %s requested=%s attempts=%s",
@@ -3760,7 +3837,7 @@ def build_text(
             outcomes = {}
             provenance_opts._text_delivery_outcomes = outcomes  # noqa: B010
         outcomes[item_id] = delivered_outcome
-        if zero_ink_delivery and isinstance(zero_ink_source_manifest, dict):
+        if logical_zero_ink_children and isinstance(zero_ink_source_manifest, dict):
             manifests = getattr(
                 provenance_opts,
                 "_zero_ink_source_manifests",
@@ -3784,7 +3861,7 @@ def build_text(
             obj["pdf_text_fallback_reason"] = reason
         except Exception:
             pass
-    if not zero_ink_delivery:
+    if int(record.get("delivered_count_contribution", 0) or 0) > 0:
         _record_delivered_text_entity(provenance_opts, delivered)
     _record_text_provenance(
         provenance_opts,
