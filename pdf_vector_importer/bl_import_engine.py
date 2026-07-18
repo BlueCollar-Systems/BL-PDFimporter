@@ -1843,6 +1843,27 @@ def _strict_manifest_int(value):
     return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
+def _evidence_has_positioned_zero_ink(evidence) -> bool:
+    """Return whether delivery evidence objectively includes positioned zero ink."""
+    if not isinstance(evidence, dict):
+        return False
+    if evidence.get("proof_kind") == "positioned_zero_ink_delivery_v1":
+        return True
+    zero_count = _strict_manifest_int(evidence.get("zero_ink_character_count"))
+    if zero_count is not None and zero_count > 0:
+        return True
+    characters = evidence.get("character_entities")
+    return bool(
+        isinstance(characters, (list, tuple))
+        and any(
+            isinstance(character, dict)
+            and isinstance(character.get("verification"), dict)
+            and character["verification"].get("zero_ink_identity") is True
+            for character in characters
+        )
+    )
+
+
 def _canonical_zero_ink_delivery_manifest(
     provenance_opts,
     *,
@@ -2092,6 +2113,35 @@ def _reverify_text_delivery_after_stack(
             if isinstance(runtime_outcomes, dict)
             else None
         )
+        runtime_evidence = (
+            dict(runtime_outcome.evidence or {})
+            if isinstance(runtime_outcome, AttemptOutcome)
+            else {}
+        )
+        runtime_delivery_representation = str(
+            runtime_evidence.get("delivered_representation") or ""
+        )
+        runtime_delivery_count_contribution = None
+        if (
+            isinstance(runtime_outcome, AttemptOutcome)
+            and runtime_delivery_representation in expected_types
+        ):
+            raw_runtime_ids = tuple(runtime_outcome.entity_ids or ())
+            runtime_ids = tuple(
+                value
+                for value in raw_runtime_ids
+                if isinstance(value, str) and value
+            )
+            if len(runtime_ids) == len(raw_runtime_ids):
+                if runtime_outcome.entity is not None and runtime_ids:
+                    runtime_delivery_count_contribution = 1
+                elif (
+                    runtime_outcome.entity is None
+                    and not runtime_ids
+                    and runtime_evidence.get("proof_kind")
+                    == "positioned_zero_ink_delivery_v1"
+                ):
+                    runtime_delivery_count_contribution = 0
         delivery_manifests = getattr(
             provenance_opts,
             "_zero_ink_delivery_manifests",
@@ -2113,6 +2163,9 @@ def _reverify_text_delivery_after_stack(
                 and not isinstance(record.get("zero_ink_character_count"), bool)
                 and record.get("zero_ink_character_count") > 0
             )
+            or bool(str(record.get("zero_ink_delivery_manifest_sha256") or ""))
+            or _evidence_has_positioned_zero_ink(prior_evidence)
+            or _evidence_has_positioned_zero_ink(runtime_evidence)
         )
         canonical_delivery = None
         expected_manifest = None
@@ -2533,10 +2586,11 @@ def _reverify_text_delivery_after_stack(
             final_proof["cleanup"] = cleanup
             if canonical_state_present:
                 count_contribution = (
-                    canonical_count_contribution
-                    if canonical_count_contribution is not None
+                    runtime_delivery_count_contribution
+                    if runtime_delivery_count_contribution is not None
                     else 0
                 )
+                count_representation = runtime_delivery_representation
             else:
                 count_contribution = record.get("delivered_count_contribution")
                 if not (
@@ -2545,6 +2599,7 @@ def _reverify_text_delivery_after_stack(
                     and count_contribution >= 0
                 ):
                     count_contribution = 0 if logical_zero_ink_claimed else 1
+                count_representation = representation
             failure = {
                 "item_id": item_id,
                 "page": int(page_number),
@@ -2572,7 +2627,7 @@ def _reverify_text_delivery_after_stack(
                     "glyphs": "glyph_curve",
                     "geometry": "geometry_mesh",
                     "raster": "raster_patch",
-                }.get(representation)
+                }.get(count_representation)
                 if (
                     isinstance(counts, dict)
                     and bucket

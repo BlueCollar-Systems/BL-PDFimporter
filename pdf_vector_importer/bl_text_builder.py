@@ -611,10 +611,13 @@ def _probe_positioned_baseline_alignment() -> str:
             ) from probe_error
     finally:
         if probe is not None:
-            try:
-                remove(probe)
-            except Exception as exc:
-                cleanup_error = exc
+            for _attempt in range(2):
+                try:
+                    remove(probe)
+                    cleanup_error = None
+                    break
+                except Exception as exc:
+                    cleanup_error = exc
     if cleanup_error is not None:
         raise RuntimeError(
             "Blender FONT baseline capability probe cleanup failed"

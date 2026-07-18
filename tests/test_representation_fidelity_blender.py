@@ -1178,6 +1178,54 @@ def test_post_stack_manifest_removal_cannot_disable_zero_ink_branch(monkeypatch)
     assert "zero_ink_delivery_manifest_missing" in failures[0]["failures"]
 
 
+def test_post_stack_authority_removal_cannot_be_hidden_by_record_flags(monkeypatch):
+    fake, collection = _install(monkeypatch)
+    _install_positioned_empty_conversion_host(monkeypatch, fake)
+    opts = types.SimpleNamespace(import_mode="vector", text_mode="geometry")
+    item = _item()
+    item.text = "A B"
+    item.normalized = "A B"
+    item.source_char_layout = _mixed_zero_ink_character_layout()
+    item.requires_individual_positioning = True
+
+    assert bl_text_builder.build_text(
+        item,
+        collection,
+        page_number=2,
+        text_mode="geometry",
+        provenance_opts=opts,
+    ) is not None
+    record = opts._text_delivery_records[-1]
+    item_id = record["item_id"]
+    assert record["zero_ink_delivery_manifest_sha256"]
+    assert opts._text_delivery_outcomes[item_id].evidence[
+        "zero_ink_character_count"
+    ] == 1
+    record["attempts"][0]["evidence"]["character_entities"][1]["verification"][
+        "evaluated_affine_matrix"
+    ][3] += 0.01
+    record["final_representation"] = "raster"
+    record["zero_ink_character_count"] = 0
+    record["zero_ink_delivery"] = False
+    opts._zero_ink_reconciliation_authorities = ()
+    opts._zero_ink_source_manifests.pop(item_id)
+    opts._zero_ink_delivery_manifests.pop(item_id)
+
+    objects_by_name = {candidate.name: candidate for candidate in collection.objects.items}
+    fake.data.objects.get = objects_by_name.get
+    monkeypatch.setattr(bl_import_engine, "bpy", fake)
+    failures = bl_import_engine._reverify_text_delivery_after_stack(
+        [record],
+        page_number=2,
+        stack_offset_m=0.0,
+        provenance_opts=opts,
+    )
+
+    assert len(failures) == 1
+    assert record["status"] == "failed"
+    assert "zero_ink_reconciliation_authority_missing" in failures[0]["failures"]
+
+
 def test_post_stack_all_zero_proof_cannot_be_bypassed_by_ghost_record_retyping(
     monkeypatch,
 ):
@@ -1244,6 +1292,66 @@ def test_post_stack_manifest_retyping_reconciles_original_delivery_bucket(monkey
     opts._zero_ink_delivery_manifests[record["item_id"]]["manifest"][
         "delivered_representation"
     ] = "geometry"
+
+    objects_by_name = {candidate.name: candidate for candidate in collection.objects.items}
+    fake.data.objects.get = objects_by_name.get
+    monkeypatch.setattr(bl_import_engine, "bpy", fake)
+    failures = bl_import_engine._reverify_text_delivery_after_stack(
+        [record],
+        page_number=2,
+        stack_offset_m=0.0,
+        provenance_opts=opts,
+    )
+
+    assert len(failures) == 1
+    assert "zero_ink_delivery_manifest_digest_mismatch" in failures[0]["failures"]
+    assert opts._text_delivered_entity_counts == {
+        "glyph_curve": 5,
+        "geometry_mesh": 7,
+    }
+
+
+def test_post_stack_forged_authority_cannot_redirect_delivery_bucket(monkeypatch):
+    fake, collection = _install(monkeypatch)
+    _install_positioned_empty_conversion_host(monkeypatch, fake)
+    opts = types.SimpleNamespace(
+        import_mode="vector",
+        text_mode="glyphs",
+        _text_delivered_entity_counts={"glyph_curve": 5, "geometry_mesh": 7},
+    )
+    item = _item()
+    item.text = "A B"
+    item.normalized = "A B"
+    item.source_char_layout = _mixed_zero_ink_character_layout()
+    item.requires_individual_positioning = True
+
+    assert bl_text_builder.build_text(
+        item,
+        collection,
+        page_number=2,
+        text_mode="glyphs",
+        provenance_opts=opts,
+    ) is not None
+    record = opts._text_delivery_records[-1]
+    authority = opts._zero_ink_reconciliation_authorities[0]
+    forged_delivery = json.loads(authority.delivery_manifest_json)
+    forged_delivery["delivered_representation"] = "geometry"
+    forged_payload = json.dumps(
+        forged_delivery,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    opts._zero_ink_reconciliation_authorities = (
+        type(authority)(
+            item_id=authority.item_id,
+            source_manifest_json=authority.source_manifest_json,
+            source_manifest_sha256=authority.source_manifest_sha256,
+            delivery_manifest_json=forged_payload,
+            delivery_manifest_sha256=sha256(forged_payload.encode("utf-8")).hexdigest(),
+        ),
+    )
 
     objects_by_name = {candidate.name: candidate for candidate in collection.objects.items}
     fake.data.objects.get = objects_by_name.get
@@ -1471,6 +1579,85 @@ def test_post_stack_count_reconciliation_ignores_mutated_manifest_contribution(
 
     assert len(failures) == 1
     assert "zero_ink_delivery_manifest_digest_mismatch" in failures[0]["failures"]
+    assert failures[0]["delivered_count_contribution"] == 0
+    assert opts._text_delivered_entity_counts == {"glyph_curve": 7}
+
+
+def test_post_stack_forged_authority_cannot_change_logical_zero_contribution(
+    monkeypatch,
+):
+    fake, collection = _install(monkeypatch)
+    _install_positioned_empty_conversion_host(monkeypatch, fake)
+    opts = types.SimpleNamespace(
+        import_mode="vector",
+        text_mode="glyphs",
+        _text_delivered_entity_counts={"glyph_curve": 7},
+    )
+    item = _item()
+    item.text = "  "
+    item.normalized = ""
+    item.source_char_layout = _whitespace_only_character_layout()
+    item.requires_individual_positioning = True
+
+    assert bl_text_builder.build_text(
+        item,
+        collection,
+        page_number=2,
+        text_mode="glyphs",
+        provenance_opts=opts,
+    ) is None
+    record = opts._text_delivery_records[-1]
+    authority = opts._zero_ink_reconciliation_authorities[0]
+    forged_source = json.loads(authority.source_manifest_json)
+    forged_source["source_text"] = "A "
+    forged_source["characters"][0]["text"] = "A"
+    forged_source_payload = json.dumps(
+        forged_source,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    forged_source_digest = sha256(forged_source_payload.encode("utf-8")).hexdigest()
+    forged_delivery = json.loads(authority.delivery_manifest_json)
+    forged_delivery.update(
+        entity_ids=["ghost"],
+        physical_entity_count=1,
+        zero_ink_character_count=1,
+        logical_zero_ink_delivery=False,
+        delivered_count_contribution=1,
+        source_manifest_sha256=forged_source_digest,
+    )
+    forged_delivery_payload = json.dumps(
+        forged_delivery,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    opts._zero_ink_reconciliation_authorities = (
+        type(authority)(
+            item_id=authority.item_id,
+            source_manifest_json=forged_source_payload,
+            source_manifest_sha256=forged_source_digest,
+            delivery_manifest_json=forged_delivery_payload,
+            delivery_manifest_sha256=sha256(
+                forged_delivery_payload.encode("utf-8")
+            ).hexdigest(),
+        ),
+    )
+
+    fake.data.objects.get = lambda _name: None
+    monkeypatch.setattr(bl_import_engine, "bpy", fake)
+    failures = bl_import_engine._reverify_text_delivery_after_stack(
+        [record],
+        page_number=2,
+        stack_offset_m=0.0,
+        provenance_opts=opts,
+    )
+
+    assert len(failures) == 1
+    assert "zero_ink_source_manifest_digest_mismatch" in failures[0]["failures"]
     assert failures[0]["delivered_count_contribution"] == 0
     assert opts._text_delivered_entity_counts == {"glyph_curve": 7}
 
@@ -1963,6 +2150,37 @@ def test_zero_ink_manifest_requires_explicit_supported_baseline_alignment():
             z_offset_m=0.0,
             baseline_alignment="CENTER",
         )
+
+
+def test_positioned_baseline_probe_cleanup_failure_cannot_leak_datablock(
+    monkeypatch,
+):
+    fake, _collection = _install(monkeypatch)
+    created = []
+    original_new = fake.data.curves.new
+    remove_calls = 0
+
+    def tracked_new(name, type):
+        probe = original_new(name=name, type=type)
+        created.append(probe)
+        return probe
+
+    def transient_remove_failure(probe):
+        nonlocal remove_calls
+        remove_calls += 1
+        if remove_calls == 1:
+            raise RuntimeError("transient probe cleanup failure")
+        created.remove(probe)
+
+    monkeypatch.setattr(fake.data.curves, "new", tracked_new)
+    monkeypatch.setattr(fake.data.curves, "remove", transient_remove_failure)
+
+    try:
+        bl_text_builder._probe_positioned_baseline_alignment()
+    except RuntimeError:
+        pass
+
+    assert created == []
 
 
 def test_zero_ink_metric_verification_still_rejects_corrupt_evaluated_transform(
