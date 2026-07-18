@@ -2983,6 +2983,31 @@ def test_positioned_metric_affine_stores_exact_source_glyph_world_ink_bounds(mon
     )
 
 
+def test_exact_contour_world_bounds_solve_curve_extrema_after_shear():
+    # This cubic is the exact cubic form of the quadratic arch
+    # (0, 0) -> control (1, 2) -> (2, 0). Under x'=x-y its ink
+    # reaches x=-0.25 at t=0.25; transforming the local bounds rectangle
+    # would incorrectly claim x=-1.0.
+    contour = (((0.0, 0.0), (2.0 / 3.0, 4.0 / 3.0),
+                (4.0 / 3.0, 4.0 / 3.0), (2.0, 0.0)),)
+    metrics = {
+        "source_ink_bounds_design_units": (0.0, 0.0, 2.0, 1.0),
+        "source_ink_contours_design_units": (contour,),
+        "design_unit_scale": 1.0,
+        "local_baseline_y": 0.0,
+    }
+    matrix = (
+        (1.0, -1.0, 0.0, 0.0),
+        (0.0, 1.0, 0.0, 0.0),
+        (0.0, 0.0, 1.0, 0.0),
+        (0.0, 0.0, 0.0, 1.0),
+    )
+
+    bounds = bl_text_builder._metric_expected_world_ink_bounds(metrics, matrix)
+
+    assert bounds == pytest.approx((-0.25, 0.0, 2.0, 1.0))
+
+
 def test_positioned_metric_verification_rejects_evaluated_ink_bounds_outside_exact_source_glyph_bounds(
     monkeypatch,
 ):
@@ -3051,6 +3076,241 @@ def test_positioned_metric_verification_rejects_evaluated_ink_bounds_outside_exa
     assert evidence["evaluated_affine_matrix"] == pytest.approx(
         [value for row in identity for value in row]
     )
+
+
+def test_exact_direct_curve_verification_uses_rendered_ink_not_bezier_control_hull(
+    monkeypatch,
+):
+    """Blender CURVE bounds include Bezier handles outside rendered ink.
+
+    A direct embedded outline must be certified from its evaluated renderable
+    geometry.  Treating the control hull as ink rejects ordinary quadratic and
+    cubic font contours even though their physical curve is exact.
+    """
+    _install(monkeypatch)
+    _install_mathutils(monkeypatch)
+    identity = _AffineMatrix.Identity(4)
+    child = bl_text_builder._character_text_item(_item(), _character_layout()[0])
+    child.insertion = (0.0, 0.0)
+    child.target_quad_model = (
+        (0.0, 1000.0),
+        (1000.0, 1000.0),
+        (1000.0, 0.0),
+        (0.0, 0.0),
+    )
+    data = _CurveData("ExactDirectCurve", direct=True)
+    obj = _Object("ExactDirectCurve", data)
+    obj.matrix_world = identity
+    obj.update({
+        "pdf_exact_contour_source": "embedded_font_glyph_outline",
+        "pdf_metric_local_advance": 1.0,
+        "pdf_metric_local_line_height": 1.0,
+        "pdf_metric_local_baseline_y": 0.0,
+        "pdf_metric_zero_ink_identity": False,
+        "pdf_metric_expected_world_ink_bounds_m": [0.0, 0.0, 0.5, 1.0],
+        "pdf_affine_matrix": [value for row in identity for value in row],
+    })
+    evaluated = _Object("ExactDirectCurveEvaluated", data)
+    evaluated.matrix_world = identity
+    # Blender 5.2's CURVE bound box encloses the Bezier control hull.
+    evaluated.bound_box = (
+        (-0.1, -0.2, 0.0),
+        (0.75, -0.2, 0.0),
+        (0.75, 1.3, 0.0),
+        (-0.1, 1.3, 0.0),
+        (-0.1, -0.2, 0.0),
+        (0.75, -0.2, 0.0),
+        (0.75, 1.3, 0.0),
+        (-0.1, 1.3, 0.0),
+    )
+    rendered_mesh = types.SimpleNamespace(vertices=[
+        types.SimpleNamespace(co=(0.0, 0.0, 0.0)),
+        types.SimpleNamespace(co=(0.5, 0.0, 0.0)),
+        types.SimpleNamespace(co=(0.5, 1.0, 0.0)),
+        types.SimpleNamespace(co=(0.0, 1.0, 0.0)),
+    ])
+    cleared = []
+    evaluated.to_mesh = lambda *args, **kwargs: rendered_mesh
+    evaluated.to_mesh_clear = lambda: cleared.append(True)
+    obj.evaluated_get = lambda _depsgraph: evaluated
+
+    failures, evidence = bl_text_builder._verify_metric_character_transform(obj, child)
+
+    assert failures == []
+    assert evidence["evaluated_ink_bounds_verified"] is True
+    assert evidence["actual_world_ink_bounds_m"] == pytest.approx(
+        (0.0, 0.0, 0.5, 1.0)
+    )
+    assert evidence["evaluated_ink_bounds_source"] == "evaluated_curve_render_mesh"
+    assert evidence["evaluated_curve_render_mesh_cleared"] is True
+    assert cleared == [True]
+    assert obj.type == "CURVE"
+
+
+def test_exact_direct_curve_verification_rejects_widened_rendered_ink(monkeypatch):
+    _install(monkeypatch)
+    _install_mathutils(monkeypatch)
+    identity = _AffineMatrix.Identity(4)
+    child = bl_text_builder._character_text_item(_item(), _character_layout()[0])
+    child.insertion = (0.0, 0.0)
+    child.target_quad_model = (
+        (0.0, 1000.0),
+        (1000.0, 1000.0),
+        (1000.0, 0.0),
+        (0.0, 0.0),
+    )
+    data = _CurveData("WidenedDirectCurve", direct=True)
+    obj = _Object("WidenedDirectCurve", data)
+    obj.matrix_world = identity
+    obj.update({
+        "pdf_exact_contour_source": "embedded_font_glyph_outline",
+        "pdf_metric_local_advance": 1.0,
+        "pdf_metric_local_line_height": 1.0,
+        "pdf_metric_local_baseline_y": 0.0,
+        "pdf_metric_zero_ink_identity": False,
+        "pdf_metric_expected_world_ink_bounds_m": [0.0, 0.0, 0.5, 1.0],
+        "pdf_affine_matrix": [value for row in identity for value in row],
+    })
+    evaluated = _Object("WidenedDirectCurveEvaluated", data)
+    evaluated.matrix_world = identity
+    evaluated.bound_box = (
+        (0.0, 0.0, 0.0),
+        (0.5, 0.0, 0.0),
+        (0.5, 1.0, 0.0),
+        (0.0, 1.0, 0.0),
+        (0.0, 0.0, 0.0),
+        (0.5, 0.0, 0.0),
+        (0.5, 1.0, 0.0),
+        (0.0, 1.0, 0.0),
+    )
+    rendered_mesh = types.SimpleNamespace(vertices=[
+        types.SimpleNamespace(co=(0.0, 0.0, 0.0)),
+        types.SimpleNamespace(co=(0.75, 0.0, 0.0)),
+        types.SimpleNamespace(co=(0.75, 1.0, 0.0)),
+        types.SimpleNamespace(co=(0.0, 1.0, 0.0)),
+    ])
+    cleared = []
+    evaluated.to_mesh = lambda *args, **kwargs: rendered_mesh
+    evaluated.to_mesh_clear = lambda: cleared.append(True)
+    obj.evaluated_get = lambda _depsgraph: evaluated
+
+    failures, evidence = bl_text_builder._verify_metric_character_transform(obj, child)
+
+    assert failures == ["evaluated_ink_bounds_outside_exact_source_glyph_bounds"]
+    assert evidence["actual_world_ink_bounds_m"] == pytest.approx(
+        (0.0, 0.0, 0.75, 1.0)
+    )
+    assert evidence["evaluated_ink_bounds_source"] == "evaluated_curve_render_mesh"
+    assert evidence["evaluated_curve_render_mesh_cleared"] is True
+    assert cleared == [True]
+    assert obj.type == "CURVE"
+
+
+def test_exact_direct_curve_render_mesh_is_cleared_when_bounds_are_invalid(monkeypatch):
+    _install(monkeypatch)
+    _install_mathutils(monkeypatch)
+    identity = _AffineMatrix.Identity(4)
+    child = bl_text_builder._character_text_item(_item(), _character_layout()[0])
+    child.insertion = (0.0, 0.0)
+    child.target_quad_model = (
+        (0.0, 1000.0),
+        (1000.0, 1000.0),
+        (1000.0, 0.0),
+        (0.0, 0.0),
+    )
+    data = _CurveData("InvalidDirectCurve", direct=True)
+    obj = _Object("InvalidDirectCurve", data)
+    obj.matrix_world = identity
+    obj.update({
+        "pdf_exact_contour_source": "embedded_font_glyph_outline",
+        "pdf_metric_local_advance": 1.0,
+        "pdf_metric_local_line_height": 1.0,
+        "pdf_metric_local_baseline_y": 0.0,
+        "pdf_metric_zero_ink_identity": False,
+        "pdf_metric_expected_world_ink_bounds_m": [0.0, 0.0, 0.5, 1.0],
+        "pdf_affine_matrix": [value for row in identity for value in row],
+    })
+    evaluated = _Object("InvalidDirectCurveEvaluated", data)
+    evaluated.matrix_world = identity
+    evaluated.bound_box = (
+        (0.0, 0.0, 0.0),
+        (0.5, 0.0, 0.0),
+        (0.5, 1.0, 0.0),
+        (0.0, 1.0, 0.0),
+        (0.0, 0.0, 0.0),
+        (0.5, 0.0, 0.0),
+        (0.5, 1.0, 0.0),
+        (0.0, 1.0, 0.0),
+    )
+    rendered_mesh = types.SimpleNamespace(vertices=[
+        types.SimpleNamespace(co=("not-a-number", 0.0, 0.0)),
+    ])
+    cleared = []
+    evaluated.to_mesh = lambda *args, **kwargs: rendered_mesh
+    evaluated.to_mesh_clear = lambda: cleared.append(True)
+    obj.evaluated_get = lambda _depsgraph: evaluated
+
+    failures, evidence = bl_text_builder._verify_metric_character_transform(obj, child)
+
+    assert failures == ["evaluated_glyph_ink_bounds_unverifiable"]
+    assert evidence["actual_world_ink_bounds_m"] is None
+    assert evidence["evaluated_ink_bounds_source"] == "evaluated_curve_render_mesh"
+    assert evidence["evaluated_curve_render_mesh_cleared"] is True
+    assert cleared == [True]
+    assert obj.type == "CURVE"
+
+
+def test_exact_contour_geometry_verification_uses_mesh_vertices_not_stale_bound_box(
+    monkeypatch,
+):
+    _install(monkeypatch)
+    _install_mathutils(monkeypatch)
+    identity = _AffineMatrix.Identity(4)
+    child = bl_text_builder._character_text_item(_item(), _character_layout()[0])
+    child.insertion = (0.0, 0.0)
+    child.target_quad_model = (
+        (0.0, 1000.0),
+        (1000.0, 1000.0),
+        (1000.0, 0.0),
+        (0.0, 0.0),
+    )
+    data = _MeshData("ExactContourMesh")
+    data.vertices = [
+        types.SimpleNamespace(co=(0.0, 0.0, 0.0)),
+        types.SimpleNamespace(co=(0.5, 0.0, 0.0)),
+        types.SimpleNamespace(co=(0.5, 1.0, 0.0)),
+        types.SimpleNamespace(co=(0.0, 1.0, 0.0)),
+    ]
+    obj = _Object("ExactContourMesh", data)
+    obj.matrix_world = identity
+    obj.bound_box = (
+        (-0.1, -0.2, 0.0),
+        (0.75, -0.2, 0.0),
+        (0.75, 1.3, 0.0),
+        (-0.1, 1.3, 0.0),
+        (-0.1, -0.2, 0.0),
+        (0.75, -0.2, 0.0),
+        (0.75, 1.3, 0.0),
+        (-0.1, 1.3, 0.0),
+    )
+    obj.update({
+        "pdf_exact_contour_source": "embedded_font_glyph_outline",
+        "pdf_metric_local_advance": 1.0,
+        "pdf_metric_local_line_height": 1.0,
+        "pdf_metric_local_baseline_y": 0.0,
+        "pdf_metric_zero_ink_identity": False,
+        "pdf_metric_expected_world_ink_bounds_m": [0.0, 0.0, 0.5, 1.0],
+        "pdf_affine_matrix": [value for row in identity for value in row],
+    })
+
+    failures, evidence = bl_text_builder._verify_metric_character_transform(obj, child)
+
+    assert failures == []
+    assert evidence["actual_world_ink_bounds_m"] == pytest.approx(
+        (0.0, 0.0, 0.5, 1.0)
+    )
+    assert evidence["evaluated_ink_bounds_source"] == "evaluated_mesh_vertices"
+    assert obj.type == "MESH"
 
 
 def test_positioned_metric_verification_preserves_explicit_zero_ink_identity(monkeypatch):

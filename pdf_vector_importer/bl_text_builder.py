@@ -593,8 +593,47 @@ def _exact_glyph_cubic_contours(asset, glyph_id: int):
     return contours
 
 
+def _cubic_axis_values_at_extrema(control_values):
+    p0, p1, p2, p3 = (float(value) for value in control_values)
+    cubic = -p0 + 3.0 * p1 - 3.0 * p2 + p3
+    quadratic = 3.0 * p0 - 6.0 * p1 + 3.0 * p2
+    linear = -3.0 * p0 + 3.0 * p1
+    derivative_a = 3.0 * cubic
+    derivative_b = 2.0 * quadratic
+    derivative_c = linear
+    coefficient_scale = max(
+        1.0,
+        abs(derivative_a),
+        abs(derivative_b),
+        abs(derivative_c),
+    )
+    epsilon = coefficient_scale * 1e-14
+    roots = []
+    if abs(derivative_a) <= epsilon:
+        if abs(derivative_b) > epsilon:
+            roots.append(-derivative_c / derivative_b)
+    else:
+        discriminant = derivative_b * derivative_b - (
+            4.0 * derivative_a * derivative_c
+        )
+        discriminant_epsilon = coefficient_scale * coefficient_scale * 1e-14
+        if discriminant >= -discriminant_epsilon:
+            root = math.sqrt(max(0.0, discriminant))
+            denominator = 2.0 * derivative_a
+            roots.extend((
+                (-derivative_b - root) / denominator,
+                (-derivative_b + root) / denominator,
+            ))
+    parameters = [0.0, 1.0]
+    parameters.extend(value for value in roots if 0.0 < value < 1.0)
+    return tuple(
+        ((cubic * value + quadratic) * value + linear) * value + p0
+        for value in parameters
+    )
+
+
 def _metric_expected_world_ink_bounds(metric_evidence, matrix_values):
-    """Transform exact source glyph bounds through the intended metric affine."""
+    """Transform exact source glyph ink through the intended metric affine."""
     source_bounds = metric_evidence.get("source_ink_bounds_design_units")
     if source_bounds is None:
         return None
@@ -610,6 +649,49 @@ def _metric_expected_world_ink_bounds(metric_evidence, matrix_values):
     matrix = tuple(tuple(float(value) for value in row) for row in matrix_values)
     if len(matrix) != 4 or any(len(row) != 4 for row in matrix):
         raise ValueError("a 4x4 metric affine matrix is required for glyph bounds")
+    source_contours = metric_evidence.get("source_ink_contours_design_units")
+    if source_contours is not None:
+        world_x_values = []
+        world_y_values = []
+        for contour in tuple(source_contours):
+            for segment in tuple(contour):
+                if len(segment) != 4:
+                    raise ValueError("an exact cubic glyph segment requires four points")
+                controls = []
+                for point in segment:
+                    design_x, design_y = float(point[0]), float(point[1])
+                    local_x = design_x * unit_scale
+                    local_y = design_y * unit_scale + baseline_y
+                    controls.append((
+                        matrix[0][0] * local_x
+                        + matrix[0][1] * local_y
+                        + matrix[0][3],
+                        matrix[1][0] * local_x
+                        + matrix[1][1] * local_y
+                        + matrix[1][3],
+                    ))
+                world_x_values.extend(
+                    _cubic_axis_values_at_extrema(
+                        tuple(point[0] for point in controls)
+                    )
+                )
+                world_y_values.extend(
+                    _cubic_axis_values_at_extrema(
+                        tuple(point[1] for point in controls)
+                    )
+                )
+        if not world_x_values or not world_y_values:
+            raise ValueError("exact source glyph contours contain no ink segments")
+        values = (*world_x_values, *world_y_values)
+        if not all(math.isfinite(value) for value in values):
+            raise ValueError("computed exact glyph world bounds are non-finite")
+        return (
+            min(world_x_values),
+            min(world_y_values),
+            max(world_x_values),
+            max(world_y_values),
+        )
+
     points = tuple(
         (
             matrix[0][0] * x + matrix[0][1] * y + matrix[0][3],
@@ -854,6 +936,7 @@ def _apply_target_quad_affine(
             metric_evidence, matrix_values
         )
         metric_evidence.pop("source_ink_bounds_design_units", None)
+        metric_evidence.pop("source_ink_contours_design_units", None)
         if expected_ink_bounds is not None:
             metric_evidence["expected_world_ink_bounds_m"] = list(expected_ink_bounds)
     else:
@@ -1580,6 +1663,125 @@ def _create_font_candidate(
         )
 
 
+def _evaluated_world_ink_bounds(
+    obj,
+    evaluated,
+    matrix,
+    depsgraph,
+    vector_factory,
+) -> tuple[tuple[float, float, float, float] | None, Dict[str, Any]]:
+    """Measure physical ink without certifying a CURVE's Bezier control hull."""
+    try:
+        object_type = str(getattr(obj, "type", "") or "")
+        exact_contour = (
+            object_type in {"CURVE", "MESH"}
+            and str(obj.get("pdf_exact_contour_source", "") or "")
+            == "embedded_font_glyph_outline"
+        )
+    except (AttributeError, ReferenceError, TypeError):
+        object_type = ""
+        exact_contour = False
+
+    evidence: Dict[str, Any] = {}
+    if exact_contour and object_type == "MESH":
+        evidence["evaluated_ink_bounds_source"] = "evaluated_mesh_vertices"
+        try:
+            vertices = tuple(getattr(evaluated.data, "vertices", ()) or ())
+            if not vertices:
+                raise ValueError("evaluated exact-contour mesh has no vertices")
+            world_points = tuple(
+                matrix
+                @ vector_factory(
+                    tuple(float(value) for value in tuple(vertex.co)[:3])
+                )
+                for vertex in vertices
+            )
+            xs = tuple(float(point[0]) for point in world_points)
+            ys = tuple(float(point[1]) for point in world_points)
+            bounds = (min(xs), min(ys), max(xs), max(ys))
+            if not all(math.isfinite(value) for value in bounds):
+                raise ValueError("evaluated exact-contour mesh bounds are non-finite")
+            return bounds, evidence
+        except (AttributeError, IndexError, TypeError, ValueError):
+            return None, evidence
+
+    if exact_contour and object_type == "CURVE":
+        render_source = f"evaluated_{object_type.lower()}_render_mesh"
+        cleared_key = f"{render_source}_cleared"
+        error_key = f"{render_source}_error"
+        cleanup_error_key = f"{render_source}_cleanup_error"
+        evidence["evaluated_ink_bounds_source"] = render_source
+        evidence[cleared_key] = False
+        to_mesh = getattr(evaluated, "to_mesh", None)
+        clear_mesh = getattr(evaluated, "to_mesh_clear", None)
+        if not callable(to_mesh) or not callable(clear_mesh):
+            evidence[error_key] = (
+                "temporary render-mesh capability unavailable"
+            )
+            return None, evidence
+
+        bounds = None
+        measurement_error = None
+        try:
+            render_mesh = to_mesh(
+                preserve_all_data_layers=False,
+                depsgraph=depsgraph,
+            )
+            vertices = tuple(getattr(render_mesh, "vertices", ()) or ())
+            if not vertices:
+                raise ValueError("evaluated render mesh has no vertices")
+            world_points = tuple(
+                matrix
+                @ vector_factory(
+                    tuple(float(value) for value in tuple(vertex.co)[:3])
+                )
+                for vertex in vertices
+            )
+            xs = tuple(float(point[0]) for point in world_points)
+            ys = tuple(float(point[1]) for point in world_points)
+            bounds = (min(xs), min(ys), max(xs), max(ys))
+            if not all(math.isfinite(value) for value in bounds):
+                raise ValueError("evaluated render-mesh bounds are non-finite")
+        except Exception as exc:
+            measurement_error = exc
+            bounds = None
+        finally:
+            try:
+                clear_mesh()
+                evidence[cleared_key] = True
+            except Exception as exc:
+                bounds = None
+                evidence[cleanup_error_key] = {
+                    "exception_type": type(exc).__name__,
+                    "detail": str(exc),
+                }
+        if measurement_error is not None:
+            evidence[error_key] = {
+                "exception_type": type(measurement_error).__name__,
+                "detail": str(measurement_error),
+            }
+        return bounds, evidence
+
+    evidence["evaluated_ink_bounds_source"] = "evaluated_object_bound_box"
+    try:
+        evaluated_corners = tuple(evaluated.bound_box)
+        if not evaluated_corners:
+            raise ValueError("evaluated glyph has no bound-box corners")
+        evaluated_world_points = tuple(
+            matrix
+            @ vector_factory(tuple(float(value) for value in corner[:3]))
+            for corner in evaluated_corners
+        )
+        xs = tuple(float(point[0]) for point in evaluated_world_points)
+        ys = tuple(float(point[1]) for point in evaluated_world_points)
+        bounds = (min(xs), min(ys), max(xs), max(ys))
+        if not all(math.isfinite(value) for value in bounds):
+            raise ValueError("evaluated glyph bounds are non-finite")
+        return bounds, evidence
+    except (AttributeError, IndexError, TypeError, ValueError):
+        return None, evidence
+
+
 def _verify_metric_character_transform(obj, text_item) -> tuple[list[str], Dict[str, Any]]:
     failures: list[str] = []
     evidence: Dict[str, Any] = {
@@ -1589,7 +1791,8 @@ def _verify_metric_character_transform(obj, text_item) -> tuple[list[str], Dict[
     try:
         from mathutils import Vector
 
-        evaluated = obj.evaluated_get(bpy.context.evaluated_depsgraph_get())
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+        evaluated = obj.evaluated_get(depsgraph)
         matrix = evaluated.matrix_world
         local_advance = float(obj.get("pdf_metric_local_advance"))
         local_line_height = float(obj.get("pdf_metric_local_line_height"))
@@ -1658,26 +1861,15 @@ def _verify_metric_character_transform(obj, text_item) -> tuple[list[str], Dict[
             except (AttributeError, TypeError, ValueError):
                 expected_world_ink_bounds = None
                 failures.append("exact_source_glyph_ink_bounds_unavailable")
-            try:
-                evaluated_corners = tuple(evaluated.bound_box)
-                if not evaluated_corners:
-                    raise ValueError("evaluated glyph has no bound-box corners")
-                evaluated_world_points = tuple(
-                    matrix @ Vector(tuple(float(value) for value in corner[:3]))
-                    for corner in evaluated_corners
-                )
-                evaluated_xs = tuple(float(point[0]) for point in evaluated_world_points)
-                evaluated_ys = tuple(float(point[1]) for point in evaluated_world_points)
-                actual_world_ink_bounds = (
-                    min(evaluated_xs),
-                    min(evaluated_ys),
-                    max(evaluated_xs),
-                    max(evaluated_ys),
-                )
-                if not all(math.isfinite(value) for value in actual_world_ink_bounds):
-                    raise ValueError("evaluated glyph bounds are non-finite")
-            except (AttributeError, IndexError, TypeError, ValueError):
-                actual_world_ink_bounds = None
+            actual_world_ink_bounds, ink_bounds_evidence = _evaluated_world_ink_bounds(
+                obj,
+                evaluated,
+                matrix,
+                depsgraph,
+                Vector,
+            )
+            evidence.update(ink_bounds_evidence)
+            if actual_world_ink_bounds is None:
                 failures.append("evaluated_glyph_ink_bounds_unverifiable")
             if (
                 expected_world_ink_bounds is not None
@@ -2375,6 +2567,7 @@ def _create_exact_embedded_glyph_candidate(
                 "exact contour routing requires a visible zero-advance source glyph"
             )
         contours = _exact_glyph_cubic_contours(asset, glyph_id)
+        metrics["source_ink_contours_design_units"] = contours
         design_bounds = _exact_glyph_design_bounds(asset, glyph_id)
         if design_bounds is None:
             raise RuntimeError("visible embedded glyph has no exact design bounds")
