@@ -1099,6 +1099,82 @@ def test_post_stack_mixed_delivery_rejects_corrupt_zero_ink_child(
     assert opts._text_delivered_entity_counts["glyph_curve"] == 0
 
 
+def test_post_stack_mixed_zero_ink_proof_cannot_be_bypassed_by_record_retyping(
+    monkeypatch,
+):
+    fake, collection = _install(monkeypatch)
+    _install_positioned_empty_conversion_host(monkeypatch, fake)
+    opts = types.SimpleNamespace(import_mode="vector", text_mode="geometry")
+    item = _item()
+    item.text = "A B"
+    item.normalized = "A B"
+    item.source_char_layout = _mixed_zero_ink_character_layout()
+    item.requires_individual_positioning = True
+
+    assert bl_text_builder.build_text(
+        item,
+        collection,
+        page_number=2,
+        text_mode="geometry",
+        provenance_opts=opts,
+    ) is not None
+    record = opts._text_delivery_records[-1]
+    record["attempts"][0]["evidence"]["character_entities"][1]["verification"][
+        "evaluated_affine_matrix"
+    ][3] += 0.01
+    record["final_representation"] = "raster"
+
+    objects_by_name = {candidate.name: candidate for candidate in collection.objects.items}
+    fake.data.objects.get = objects_by_name.get
+    monkeypatch.setattr(bl_import_engine, "bpy", fake)
+    failures = bl_import_engine._reverify_text_delivery_after_stack(
+        [record],
+        page_number=2,
+        stack_offset_m=0.0,
+        provenance_opts=opts,
+    )
+
+    assert len(failures) == 1
+    assert record["status"] == "failed"
+
+
+def test_post_stack_all_zero_proof_cannot_be_bypassed_by_ghost_record_retyping(
+    monkeypatch,
+):
+    fake, collection = _install(monkeypatch)
+    _install_positioned_empty_conversion_host(monkeypatch, fake)
+    opts = types.SimpleNamespace(import_mode="vector", text_mode="glyphs")
+    item = _item()
+    item.text = "  "
+    item.normalized = ""
+    item.source_char_layout = _whitespace_only_character_layout()
+    item.requires_individual_positioning = True
+
+    assert bl_text_builder.build_text(
+        item,
+        collection,
+        page_number=2,
+        text_mode="glyphs",
+        provenance_opts=opts,
+    ) is None
+    record = opts._text_delivery_records[-1]
+    ghost = _Object("ghost", _MeshData("ghost_mesh"))
+    fake.data.objects.get = {ghost.name: ghost}.get
+    record["entity_ids"] = [ghost.name]
+    record["final_representation"] = "raster"
+    monkeypatch.setattr(bl_import_engine, "bpy", fake)
+
+    failures = bl_import_engine._reverify_text_delivery_after_stack(
+        [record],
+        page_number=2,
+        stack_offset_m=0.0,
+        provenance_opts=opts,
+    )
+
+    assert len(failures) == 1
+    assert record["status"] == "failed"
+
+
 @pytest.mark.parametrize("mode", ["glyphs", "geometry"])
 def test_positioned_whitespace_only_delivers_verified_zero_ink_without_host_entity(
     monkeypatch,
@@ -1223,6 +1299,49 @@ def test_post_stack_zero_ink_failure_does_not_decrement_preexisting_physical_cou
     assert len(failures) == 1
     assert failures[0]["delivered_count_contribution"] == 0
     assert record["status"] == "failed"
+    assert opts._text_delivered_entity_counts == {"glyph_curve": 7}
+
+
+def test_post_stack_count_reconciliation_derives_logical_zero_contribution(
+    monkeypatch,
+):
+    fake, collection = _install(monkeypatch)
+    _install_positioned_empty_conversion_host(monkeypatch, fake)
+    opts = types.SimpleNamespace(
+        import_mode="vector",
+        text_mode="glyphs",
+        _text_delivered_entity_counts={"glyph_curve": 7},
+    )
+    item = _item()
+    item.text = "  "
+    item.normalized = ""
+    item.source_char_layout = _whitespace_only_character_layout()
+    item.requires_individual_positioning = True
+
+    assert bl_text_builder.build_text(
+        item,
+        collection,
+        page_number=2,
+        text_mode="glyphs",
+        provenance_opts=opts,
+    ) is None
+    record = opts._text_delivery_records[-1]
+    assert record["delivered_count_contribution"] == 0
+    record["delivered_count_contribution"] = 1
+    record["attempts"][0]["evidence"]["character_entities"][0]["verification"][
+        "evaluated_affine_matrix"
+    ][3] += 0.01
+
+    monkeypatch.setattr(bl_import_engine, "bpy", fake)
+    failures = bl_import_engine._reverify_text_delivery_after_stack(
+        [record],
+        page_number=2,
+        stack_offset_m=0.0,
+        provenance_opts=opts,
+    )
+
+    assert len(failures) == 1
+    assert failures[0]["delivered_count_contribution"] == 0
     assert opts._text_delivered_entity_counts == {"glyph_curve": 7}
 
 
@@ -1596,6 +1715,51 @@ def test_positioned_metric_verification_preserves_explicit_zero_ink_identity(mon
     assert evidence["zero_ink_identity"] is True
     assert evidence["expected_world_ink_bounds_m"] is None
     assert evidence["actual_world_ink_bounds_m"] is None
+
+
+def test_zero_ink_manifest_affine_matches_exact_glyph_runtime_axes():
+    item = _item()
+    item.text = " "
+    item.normalized = ""
+    item.font_asset = _metric_font_asset()
+    layout = TextCharLayout(
+        text=" ",
+        glyph_id=2,
+        source_origin_pdf=(10.0, 20.0),
+        source_bbox_pdf=(10.0, 10.0, 13.0, 22.0),
+        source_quad_pdf=((10.0, 10.0), (13.0, 10.0), (13.0, 22.0), (10.0, 22.0)),
+        target_origin=(12.0, 24.0),
+        target_quad=((12.0, 30.0), (15.0, 30.0), (15.0, 24.0), (12.0, 24.0)),
+        advance_width=3.0,
+        glyph_height=6.0,
+    )
+    item.source_char_layout = (layout,)
+    child = bl_text_builder._character_text_item(item, layout)
+    manifest = bl_text_builder._positioned_zero_ink_source_manifest(
+        item,
+        item_id="page:2:text:41",
+        page_number=2,
+        requested="glyphs",
+        z_offset_m=0.0,
+    )
+    obj = _Object("ZeroInkExactGlyph", _FontData("ZeroInkExactGlyph"))
+    obj.data.size = child.font_size * 0.001
+    obj["pdf_baseline_alignment"] = "BOTTOM_BASELINE"
+
+    metrics = bl_text_builder._positioned_font_axis_metrics(obj, child)
+    runtime_matrix = bl_text_builder._metric_character_matrix_values(
+        local_advance=metrics["local_advance"],
+        local_line_height=metrics["local_line_height"],
+        local_baseline_y=metrics["local_baseline_y"],
+        target_origin=child.insertion,
+        target_quad=child.target_quad_model,
+        z=0.0,
+    )
+
+    assert metrics["zero_ink_identity"] is True
+    assert manifest["characters"][0]["intended_affine_matrix"] == pytest.approx(
+        [float(value) for row in runtime_matrix for value in row]
+    )
 
 
 def test_zero_ink_metric_verification_still_rejects_corrupt_evaluated_transform(
@@ -2420,6 +2584,54 @@ def test_unbound_generic_or_runtime_impossibility_proof_cannot_advance_ladder(
     assert record["attempts"][0]["evidence"]["proof_failures"]
 
 
+@pytest.mark.parametrize(
+    ("identity_field", "fractional_value", "expected_failure"),
+    [
+        ("page_number", 2.5, "page_identity_unbound"),
+        ("source_span_id", 41.5, "source_span_identity_unbound"),
+    ],
+)
+def test_fractional_impossibility_identity_cannot_unlock_fallback(
+    identity_field,
+    fractional_value,
+    expected_failure,
+):
+    attempted = []
+    evidence = {
+        "importer_id": "bc_pdf_vector_importer.blender",
+        "item_id": "page:2:text:41",
+        "page_number": 2,
+        "source_span_id": 41,
+        "host": "blender",
+        "host_version": [5, 2, 0],
+        "capability": "Object.to_curve",
+        "capability_present": False,
+    }
+    evidence[identity_field] = fractional_value
+
+    def attempt(representation):
+        attempted.append(representation)
+        if representation == "glyphs":
+            return AttemptOutcome.impossible(
+                "evaluated_font_to_curve_capability_absent_for_item",
+                evidence=evidence,
+            )
+        return AttemptOutcome.delivered(object(), entity_ids=("must-not-exist",))
+
+    entity, record = deliver_item(
+        item_id="page:2:text:41",
+        page_number=2,
+        source_span_id=41,
+        requested="glyphs",
+        attempt=attempt,
+        cleanup=lambda _outcome: {"status": "complete", "removed": []},
+    )
+
+    assert entity is None
+    assert attempted == ["glyphs"]
+    assert expected_failure in record["attempts"][0]["evidence"]["proof_failures"]
+
+
 def test_wrong_page_font_failure_proof_cannot_advance_the_ladder():
     attempted = []
 
@@ -2436,6 +2648,44 @@ def test_wrong_page_font_failure_proof_cannot_advance_the_ladder():
                     "reason": "no_exact_embedded_font_match",
                     "font_name": "ExactPDF",
                     "font_failure_page_number": 99,
+                    "font_failure_span_font_name": "ExactPDF",
+                },
+            )
+        return AttemptOutcome.delivered(object(), entity_ids=("must-not-exist",))
+
+    entity, record = deliver_item(
+        item_id="page:2:text:41",
+        page_number=2,
+        source_span_id=41,
+        requested="text",
+        attempt=attempt,
+        cleanup=lambda _outcome: {"status": "complete", "removed": []},
+    )
+
+    assert entity is None
+    assert attempted == ["text"]
+    assert "font_failure_page_identity_unbound" in record["attempts"][0]["evidence"][
+        "proof_failures"
+    ]
+
+
+def test_fractional_font_failure_page_cannot_unlock_fallback():
+    attempted = []
+
+    def attempt(representation):
+        attempted.append(representation)
+        if len(attempted) == 1:
+            return AttemptOutcome.impossible(
+                "exact_source_font_unavailable_for_item",
+                evidence={
+                    "importer_id": "bc_pdf_vector_importer.blender",
+                    "item_id": "page:2:text:41",
+                    "page_number": 2,
+                    "source_span_id": 41,
+                    "reason": "no_exact_embedded_font_match",
+                    "proof_category": "source_font_absent_for_item",
+                    "font_name": "ExactPDF",
+                    "font_failure_page_number": 2.5,
                     "font_failure_span_font_name": "ExactPDF",
                 },
             )
@@ -3040,6 +3290,111 @@ def test_mixed_visible_and_zero_ink_delivery_verifies_nested_logical_child():
     assert record["physical_entity_count"] == 2
     assert record["source_manifest_sha256"] == evidence["source_manifest_sha256"]
     assert record["delivered_count_contribution"] == 1
+
+
+def test_mixed_zero_ink_delivery_rejects_failed_nested_cleanup_ledger():
+    evidence = _verified_mixed_zero_ink_delivery_evidence()
+    source_manifest = _zero_ink_source_manifest_from_evidence(evidence)
+    evidence["cleanup_verified"] = False
+    evidence["cleanup"]["status"] = "failed"
+
+    delivered, record = deliver_item(
+        item_id="page:2:text:41",
+        page_number=2,
+        source_span_id=41,
+        requested="glyphs",
+        expected_zero_ink_manifest=source_manifest,
+        attempt=lambda _representation: AttemptOutcome.delivered(
+            object(),
+            entity_ids=("visible-a", "visible-b"),
+            evidence=evidence,
+        ),
+        cleanup=lambda _outcome: {"status": "complete", "removed": []},
+    )
+
+    assert delivered is None
+    assert record["status"] == "failed"
+    assert "zero_ink_cleanup_not_verified" in record["attempts"][0]["evidence"][
+        "proof_failures"
+    ]
+
+
+def test_mixed_zero_ink_delivery_rejects_incomplete_top_cleanup_ledger():
+    evidence = _verified_mixed_zero_ink_delivery_evidence()
+    source_manifest = _zero_ink_source_manifest_from_evidence(evidence)
+    evidence["cleanup"]["removed"] = []
+
+    delivered, record = deliver_item(
+        item_id="page:2:text:41",
+        page_number=2,
+        source_span_id=41,
+        requested="glyphs",
+        expected_zero_ink_manifest=source_manifest,
+        attempt=lambda _representation: AttemptOutcome.delivered(
+            object(),
+            entity_ids=("visible-a", "visible-b"),
+            evidence=evidence,
+        ),
+        cleanup=lambda _outcome: {"status": "complete", "removed": []},
+    )
+
+    assert delivered is None
+    assert record["status"] == "failed"
+    assert "zero_ink_cleanup_ledger_incomplete" in record["attempts"][0]["evidence"][
+        "proof_failures"
+    ]
+
+
+def test_mixed_zero_ink_delivery_rejects_unbound_extra_physical_entity():
+    evidence = _verified_mixed_zero_ink_delivery_evidence()
+    source_manifest = _zero_ink_source_manifest_from_evidence(evidence)
+    evidence["physical_entity_count"] = 3
+
+    delivered, record = deliver_item(
+        item_id="page:2:text:41",
+        page_number=2,
+        source_span_id=41,
+        requested="glyphs",
+        expected_zero_ink_manifest=source_manifest,
+        attempt=lambda _representation: AttemptOutcome.delivered(
+            object(),
+            entity_ids=("visible-a", "visible-b", "ghost"),
+            evidence=evidence,
+        ),
+        cleanup=lambda _outcome: {"status": "complete", "removed": []},
+    )
+
+    assert delivered is None
+    assert record["status"] == "failed"
+    assert "zero_ink_character_entity_identity_mismatch" in record["attempts"][0][
+        "evidence"
+    ]["proof_failures"]
+
+
+def test_all_zero_ink_delivery_rejects_unbound_physical_entity():
+    evidence = _verified_zero_ink_delivery_evidence()
+    source_manifest = _zero_ink_source_manifest_from_evidence(evidence)
+    evidence["physical_entity_count"] = 1
+
+    delivered, record = deliver_item(
+        item_id="page:2:text:41",
+        page_number=2,
+        source_span_id=41,
+        requested="glyphs",
+        expected_zero_ink_manifest=source_manifest,
+        attempt=lambda _representation: AttemptOutcome.delivered(
+            object(),
+            entity_ids=("ghost",),
+            evidence=evidence,
+        ),
+        cleanup=lambda _outcome: {"status": "complete", "removed": []},
+    )
+
+    assert delivered is None
+    assert record["status"] == "failed"
+    assert "zero_ink_character_entity_identity_mismatch" in record["attempts"][0][
+        "evidence"
+    ]["proof_failures"]
 
 
 def test_mixed_zero_ink_batch_can_use_next_affirmatively_proven_fallback_rung():

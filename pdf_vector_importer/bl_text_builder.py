@@ -478,14 +478,19 @@ def _metric_expected_world_ink_bounds(metric_evidence, matrix_values):
     )
 
 
-def _positioned_font_axis_metrics(obj, text_item) -> Dict[str, Any]:
+def _positioned_font_axis_metrics_values(
+    text_item,
+    *,
+    size: float,
+    baseline_alignment: str,
+) -> Dict[str, Any]:
+    """Return the exact local axes used by both source proof and runtime."""
     asset = getattr(text_item, "font_asset", None)
     glyph_id = getattr(text_item, "source_glyph_id", None)
     if glyph_id is None and not str(getattr(text_item, "text", "") or "").strip():
         try:
             local_advance = abs(float(text_item.advance_width)) * MM_TO_M
             local_line_height = abs(float(text_item.glyph_height)) * MM_TO_M
-            baseline_alignment = str(obj.get("pdf_baseline_alignment", "") or "")
             local_baseline_y = (
                 abs(float(getattr(text_item, "baseline_descent", 0.0) or 0.0))
                 * MM_TO_M
@@ -528,7 +533,7 @@ def _positioned_font_axis_metrics(obj, text_item) -> Dict[str, Any]:
         units_per_em = int(asset.units_per_em)
         advances = tuple(asset.glyph_advances)
         advance_units = int(advances[glyph_id])
-        size = float(obj.data.size)
+        size = float(size)
     except (AttributeError, IndexError, TypeError, ValueError) as exc:
         raise RuntimeError(
             "exact embedded font metrics are unavailable for positioned character"
@@ -548,7 +553,6 @@ def _positioned_font_axis_metrics(obj, text_item) -> Dict[str, Any]:
     zero_ink_identity = source_ink_bounds is None
     if zero_ink_identity and str(getattr(text_item, "text", "") or "").strip():
         raise RuntimeError("visible positioned character has no exact source glyph ink bounds")
-    baseline_alignment = str(obj.get("pdf_baseline_alignment", "") or "")
     local_baseline_y = (
         -float(descender) * design_unit_scale
         if baseline_alignment == "BOTTOM"
@@ -569,6 +573,14 @@ def _positioned_font_axis_metrics(obj, text_item) -> Dict[str, Any]:
         "metric_source": "embedded_font_glyph_metrics",
         "zero_ink_identity": zero_ink_identity,
     }
+
+
+def _positioned_font_axis_metrics(obj, text_item) -> Dict[str, Any]:
+    return _positioned_font_axis_metrics_values(
+        text_item,
+        size=float(obj.data.size),
+        baseline_alignment=str(obj.get("pdf_baseline_alignment", "") or ""),
+    )
 
 
 def _apply_target_quad_affine(
@@ -2705,10 +2717,24 @@ def _positioned_zero_ink_source_manifest(
     characters = []
     for index, layout in enumerate(layouts):
         glyph_id = getattr(layout, "glyph_id", None)
+        if str(layout.text) and not str(layout.text).strip():
+            child = _character_text_item(text_item, layout)
+            metrics = _positioned_font_axis_metrics_values(
+                child,
+                size=float(child.font_size) * MM_TO_M,
+                baseline_alignment="BOTTOM_BASELINE",
+            )
+            local_advance = metrics["local_advance"]
+            local_line_height = metrics["local_line_height"]
+            local_baseline_y = metrics["local_baseline_y"]
+        else:
+            local_advance = float(layout.advance_width) * MM_TO_M
+            local_line_height = float(layout.glyph_height) * MM_TO_M
+            local_baseline_y = 0.0
         intended_matrix = _metric_character_matrix_values(
-            local_advance=float(layout.advance_width) * MM_TO_M,
-            local_line_height=float(layout.glyph_height) * MM_TO_M,
-            local_baseline_y=0.0,
+            local_advance=local_advance,
+            local_line_height=local_line_height,
+            local_baseline_y=local_baseline_y,
             target_origin=layout.target_origin,
             target_quad=layout.target_quad,
             z=float(z_offset_m),
@@ -3811,6 +3837,10 @@ def build_text(
         cleanup=lambda outcome: _cleanup_attempt(outcome, collection),
     )
     delivered_outcome = record.pop("_delivered_outcome", None)
+    zero_ink_delivery_manifest = record.pop(
+        "_zero_ink_delivery_manifest",
+        None,
+    )
     _append_delivery_record(provenance_opts, record)
     zero_ink_delivery = (
         obj is None
@@ -3847,6 +3877,17 @@ def build_text(
                 manifests = {}
                 provenance_opts._zero_ink_source_manifests = manifests  # noqa: B010
             manifests[item_id] = zero_ink_source_manifest
+            delivery_manifests = getattr(
+                provenance_opts,
+                "_zero_ink_delivery_manifests",
+                None,
+            )
+            if not isinstance(delivery_manifests, dict):
+                delivery_manifests = {}
+                provenance_opts._zero_ink_delivery_manifests = (  # noqa: B010
+                    delivery_manifests
+                )
+            delivery_manifests[item_id] = zero_ink_delivery_manifest
 
     delivered = str(record["final_representation"])
     if delivered != requested:

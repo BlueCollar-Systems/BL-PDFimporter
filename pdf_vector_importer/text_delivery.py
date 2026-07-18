@@ -12,6 +12,7 @@ REPRESENTATIONS = ("labels", "text", "3d_text", "glyphs", "geometry", "raster")
 IMPORTER_ID = "bc_pdf_vector_importer.blender"
 ZERO_INK_SOURCE_MANIFEST_SCHEMA = "positioned_zero_ink_source_manifest_v1"
 ZERO_INK_CHARACTER_MANIFEST_SCHEMA = "positioned_zero_ink_character_manifest_v1"
+ZERO_INK_DELIVERY_MANIFEST_SCHEMA = "positioned_zero_ink_delivery_manifest_v1"
 _ZERO_INK_CHARACTER_SOURCE_FIELDS = (
     "character_item_id",
     "character_index",
@@ -168,16 +169,10 @@ def _impossibility_proof_failures(
         failures.append("importer_identity_unbound")
     if str(evidence.get("item_id") or "") != str(item_id):
         failures.append("item_identity_unbound")
-    try:
-        evidence_page = int(evidence.get("page_number"))
-    except (TypeError, ValueError):
-        evidence_page = None
+    evidence_page = _strict_int(evidence.get("page_number"))
     if evidence_page != int(page_number):
         failures.append("page_identity_unbound")
-    try:
-        evidence_span = int(evidence.get("source_span_id"))
-    except (TypeError, ValueError):
-        evidence_span = None
+    evidence_span = _strict_int(evidence.get("source_span_id"))
     if evidence_span != int(source_span_id):
         failures.append("source_span_identity_unbound")
 
@@ -218,10 +213,7 @@ def _impossibility_proof_failures(
                 failures.append("font_failure_detail_unbound")
         if not str(evidence.get("font_name") or "").strip():
             failures.append("font_name_unbound")
-        try:
-            failure_page = int(evidence.get("font_failure_page_number"))
-        except (TypeError, ValueError):
-            failure_page = None
+        failure_page = _strict_int(evidence.get("font_failure_page_number"))
         if failure_page != int(page_number):
             failures.append("font_failure_page_identity_unbound")
         failure_span_font = str(
@@ -548,9 +540,56 @@ def _zero_ink_character_proof_failures(
     if _strict_int(evidence.get("visible_character_count")) != expected_visible_count:
         failures.append("zero_ink_visible_character_count_mismatch")
     physical_count = _strict_int(evidence.get("physical_entity_count"))
-    runtime_entity_ids = [str(value) for value in tuple(outcome.entity_ids or ()) if str(value)]
+    raw_runtime_entity_ids = tuple(outcome.entity_ids or ())
+    runtime_entity_ids = [
+        value
+        for value in raw_runtime_entity_ids
+        if isinstance(value, str) and value
+    ]
+    if len(runtime_entity_ids) != len(raw_runtime_entity_ids):
+        failures.append("zero_ink_character_entity_identity_mismatch")
     if physical_count is None or physical_count != len(runtime_entity_ids):
         failures.append("zero_ink_physical_entity_count_mismatch")
+
+    visible_entity_ids: list[str] = []
+    for expected_index in range(expected_count):
+        if expected_index in zero_indices or expected_index >= len(characters):
+            continue
+        character = characters[expected_index]
+        character_entity_ids = (
+            character.get("entity_ids") if isinstance(character, dict) else None
+        )
+        if not isinstance(character_entity_ids, (list, tuple)):
+            failures.append("zero_ink_character_entity_identity_mismatch")
+            continue
+        normalized_ids = [
+            value
+            for value in character_entity_ids
+            if isinstance(value, str) and value
+        ]
+        if not normalized_ids or len(normalized_ids) != len(character_entity_ids):
+            failures.append("zero_ink_character_entity_identity_mismatch")
+        visible_entity_ids.extend(normalized_ids)
+    if (
+        len(set(visible_entity_ids)) != len(visible_entity_ids)
+        or runtime_entity_ids != visible_entity_ids
+    ):
+        failures.append("zero_ink_character_entity_identity_mismatch")
+
+    cleanup = evidence.get("cleanup")
+    if evidence.get("cleanup_verified") is not True:
+        failures.append("zero_ink_cleanup_not_verified")
+    if not isinstance(cleanup, dict) or cleanup.get("status") != "complete":
+        failures.append("zero_ink_cleanup_incomplete")
+        top_removed_values: list[str] = []
+    else:
+        removed = cleanup.get("removed")
+        top_removed_values = (
+            [str(value) for value in removed if str(value)]
+            if isinstance(removed, (list, tuple))
+            else []
+        )
+    child_removed: set[str] = set()
 
     for expected_index in zero_indices:
         if expected_index >= len(characters):
@@ -682,6 +721,17 @@ def _zero_ink_character_proof_failures(
             failures.append("zero_ink_character_cleanup_incomplete")
         elif not isinstance(character_cleanup.get("removed"), (list, tuple)) or not character_cleanup.get("removed"):
             failures.append("zero_ink_character_cleanup_ledger_missing")
+        else:
+            child_removed.update(
+                str(value)
+                for value in character_cleanup.get("removed")
+                if str(value)
+            )
+    if (
+        len(set(top_removed_values)) != len(top_removed_values)
+        or set(top_removed_values) != child_removed
+    ):
+        failures.append("zero_ink_cleanup_ledger_incomplete")
     return list(dict.fromkeys(failures))
 
 
@@ -990,6 +1040,51 @@ def zero_ink_character_proof_failures(
     )
 
 
+def _zero_ink_delivery_manifest(
+    *,
+    item_id: str,
+    page_number: int,
+    source_span_id: int,
+    requested_representation: str,
+    delivered_representation: str,
+    entity_ids: Sequence[str],
+    source_manifest: Dict[str, Any],
+    source_manifest_sha256: str,
+    logical_zero_ink_delivery: bool,
+) -> Dict[str, Any]:
+    characters = source_manifest.get("characters")
+    if not isinstance(characters, list):
+        raise ValueError("zero-ink source characters are unavailable")
+    zero_count = sum(
+        1
+        for character in characters
+        if isinstance(character, dict)
+        and isinstance(character.get("text"), str)
+        and bool(character.get("text"))
+        and not character.get("text").strip()
+    )
+    normalized_ids = [str(value) for value in entity_ids if str(value)]
+    contribution = 0 if logical_zero_ink_delivery else 1
+    manifest = {
+        "schema": ZERO_INK_DELIVERY_MANIFEST_SCHEMA,
+        "importer_id": IMPORTER_ID,
+        "item_id": str(item_id),
+        "page_number": int(page_number),
+        "source_span_id": int(source_span_id),
+        "requested_representation": str(requested_representation),
+        "delivered_representation": str(delivered_representation),
+        "entity_ids": normalized_ids,
+        "physical_entity_count": len(normalized_ids),
+        "source_character_count": len(characters),
+        "zero_ink_character_count": zero_count,
+        "logical_zero_ink_delivery": bool(logical_zero_ink_delivery),
+        "delivered_count_contribution": contribution,
+        "source_manifest_sha256": str(source_manifest_sha256 or ""),
+    }
+    snapshot, digest = freeze_zero_ink_source_manifest(manifest)
+    return {"manifest": snapshot, "sha256": digest}
+
+
 def deliver_item(
     *,
     item_id: str,
@@ -1184,6 +1279,21 @@ def deliver_item(
                     expected_manifest_sha256 or ""
                 )
                 record["delivered_count_contribution"] = 0
+                delivery_manifest = _zero_ink_delivery_manifest(
+                    item_id=str(item_id),
+                    page_number=int(page_number),
+                    source_span_id=int(source_span_id),
+                    requested_representation=requested_mode,
+                    delivered_representation=representation,
+                    entity_ids=(),
+                    source_manifest=expected_manifest,
+                    source_manifest_sha256=str(expected_manifest_sha256 or ""),
+                    logical_zero_ink_delivery=True,
+                )
+                record["zero_ink_delivery_manifest_sha256"] = delivery_manifest[
+                    "sha256"
+                ]
+                record["_zero_ink_delivery_manifest"] = delivery_manifest
                 record["_delivered_outcome"] = outcome
                 return None, record
             elif outcome.status == "delivered" and (
@@ -1219,6 +1329,22 @@ def deliver_item(
                         expected_manifest_sha256 or ""
                     )
                 record["delivered_count_contribution"] = 1
+                if nested_zero_ink_claimed:
+                    delivery_manifest = _zero_ink_delivery_manifest(
+                        item_id=str(item_id),
+                        page_number=int(page_number),
+                        source_span_id=int(source_span_id),
+                        requested_representation=requested_mode,
+                        delivered_representation=representation,
+                        entity_ids=attempt_record["entity_ids"],
+                        source_manifest=expected_manifest,
+                        source_manifest_sha256=str(expected_manifest_sha256 or ""),
+                        logical_zero_ink_delivery=False,
+                    )
+                    record["zero_ink_delivery_manifest_sha256"] = delivery_manifest[
+                        "sha256"
+                    ]
+                    record["_zero_ink_delivery_manifest"] = delivery_manifest
                 record["_delivered_outcome"] = outcome
                 return outcome.entity, record
 
@@ -1247,6 +1373,7 @@ __all__ = [
     "AttemptOutcome",
     "REPRESENTATIONS",
     "ZERO_INK_CHARACTER_MANIFEST_SCHEMA",
+    "ZERO_INK_DELIVERY_MANIFEST_SCHEMA",
     "ZERO_INK_SOURCE_MANIFEST_SCHEMA",
     "deliver_item",
     "fallback_ladder",
