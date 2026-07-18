@@ -15,6 +15,7 @@ LEGACY_ADDON_INIT_PY = REPO_ROOT / "blender_pdf_vector_importer" / "__init__.py"
 ADDON_CONFIG_PY = REPO_ROOT / "pdf_vector_importer" / "pdfcadcore" / "import_config.py"
 IMPORT_ENGINE_PY = REPO_ROOT / "pdf_vector_importer" / "bl_import_engine.py"
 TEXT_BUILDER_PY = REPO_ROOT / "pdf_vector_importer" / "bl_text_builder.py"
+TEXT_DELIVERY_PY = REPO_ROOT / "pdf_vector_importer" / "text_delivery.py"
 BUILD_RELEASE_PY = REPO_ROOT / "build_release.py"
 REPRESENTATION_FIDELITY_MD = REPO_ROOT / "REPRESENTATION_FIDELITY.md"
 
@@ -269,6 +270,40 @@ class TestRepresentationFidelityDocumentation(unittest.TestCase):
         self.assertIn("**6 Text Representation Options**", source)
         self.assertIn("[REPRESENTATION_FIDELITY.md](REPRESENTATION_FIDELITY.md)", source)
         self.assertNotIn("**4 Text Rendering Options**", source)
+
+    def test_readme_ladder_rows_match_the_controller_and_raster_can_fail(self) -> None:
+        tree = ast.parse(TEXT_DELIVERY_PY.read_text(encoding="utf-8"))
+        ladders = None
+        for node in tree.body:
+            if not isinstance(node, ast.Assign):
+                continue
+            if any(
+                isinstance(target, ast.Name) and target.id == "_LADDERS"
+                for target in node.targets
+            ):
+                ladders = ast.literal_eval(node.value)
+                break
+        self.assertIsInstance(ladders, dict)
+        display = {
+            "labels": "Labels",
+            "text": "Text",
+            "3d_text": "3D Text",
+            "glyphs": "Glyphs",
+            "geometry": "Geometry",
+            "raster": "Raster",
+        }
+        readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        for requested, ladder in ladders.items():
+            rendered = " → ".join(display[rung] for rung in ladder)
+            if tuple(ladder) == ("raster",):
+                rendered = "Raster only"
+            self.assertIn(f"| **{display[requested]}** | {rendered} |", readme)
+        normalized = " ".join(readme.split())
+        self.assertIn(
+            "If even the terminal raster patch cannot be verified, the item is "
+            "reported as failed instead of being claimed as delivered.",
+            normalized,
+        )
 
 
 class TestModel3DGeneration(unittest.TestCase):

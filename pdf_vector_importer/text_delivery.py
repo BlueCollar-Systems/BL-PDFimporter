@@ -256,6 +256,9 @@ class AttemptOutcome:
     owned_artifacts: Sequence[Dict[str, str]] = field(default_factory=tuple)
     owned_objects: Sequence[Any] = field(default_factory=tuple, repr=False)
     owned_datablocks: Sequence[Any] = field(default_factory=tuple, repr=False)
+    # Each entry is ``(absolute_file_path, importer_owned_temp_root)``. Cleanup
+    # authority is frozen here rather than recovered from mutable host metadata.
+    owned_files: Sequence[Tuple[str, str]] = field(default_factory=tuple, repr=False)
 
     @classmethod
     def delivered(
@@ -267,6 +270,7 @@ class AttemptOutcome:
         owned_artifacts=(),
         owned_objects=(),
         owned_datablocks=(),
+        owned_files=(),
     ):
         return cls(
             "delivered",
@@ -277,6 +281,7 @@ class AttemptOutcome:
             tuple(owned_artifacts),
             tuple(owned_objects),
             tuple(owned_datablocks),
+            tuple((str(path), str(root)) for path, root in owned_files),
         )
 
     @classmethod
@@ -288,6 +293,7 @@ class AttemptOutcome:
         owned_artifacts=(),
         owned_objects=(),
         owned_datablocks=(),
+        owned_files=(),
     ):
         return cls(
             "impossible",
@@ -298,6 +304,7 @@ class AttemptOutcome:
             tuple(owned_artifacts),
             tuple(owned_objects),
             tuple(owned_datablocks),
+            tuple((str(path), str(root)) for path, root in owned_files),
         )
 
     @classmethod
@@ -309,6 +316,7 @@ class AttemptOutcome:
         owned_artifacts=(),
         owned_objects=(),
         owned_datablocks=(),
+        owned_files=(),
     ):
         return cls(
             "failed",
@@ -319,6 +327,7 @@ class AttemptOutcome:
             tuple(owned_artifacts),
             tuple(owned_objects),
             tuple(owned_datablocks),
+            tuple((str(path), str(root)) for path, root in owned_files),
         )
 
 
@@ -397,6 +406,77 @@ def _impossibility_proof_failures(
             evidence.get("font_name") or ""
         ).strip():
             failures.append("font_failure_span_font_identity_unbound")
+        return failures
+
+    if reason == "exact_positioned_font_metrics_unavailable_for_item":
+        if attempted_representation not in {"text", "3d_text", "glyphs", "geometry"}:
+            failures.append("metric_proof_not_valid_for_rung")
+        if evidence.get("proof_category") != (
+            "authenticated_source_metric_validation_failed"
+        ):
+            failures.append("metric_proof_category_not_affirmative")
+        character_index = _strict_int(evidence.get("character_index"))
+        if character_index is None or character_index < 0:
+            failures.append("metric_failure_character_unbound")
+        if not isinstance(evidence.get("source_character_text"), str) or not str(
+            evidence.get("source_character_text")
+        ):
+            failures.append("metric_failure_text_unbound")
+        source_glyph_id = _strict_int(evidence.get("source_glyph_id"))
+        if source_glyph_id is None or source_glyph_id < 0:
+            failures.append("metric_failure_glyph_unbound")
+        glyph_identity = str(evidence.get("source_glyph_identity") or "")
+        if glyph_identity not in {
+            "source_trace_glyph_id",
+            "exact_source_unicode_cmap",
+        }:
+            failures.append("metric_failure_glyph_identity_unbound")
+        if glyph_identity == "exact_source_unicode_cmap":
+            code_point = _strict_int(evidence.get("source_ink_code_point"))
+            mapping_sha256 = evidence.get("source_ink_mapping_sha256")
+            if code_point is None or code_point < 0 or code_point > 0x10FFFF:
+                failures.append("metric_failure_cmap_code_point_unbound")
+            elif source_glyph_id is not None and _is_sha256_digest(
+                evidence.get("source_font_sha256")
+            ):
+                expected_mapping = source_unicode_cmap_binding_sha256(
+                    evidence["source_font_sha256"],
+                    code_point,
+                    source_glyph_id,
+                )
+                if mapping_sha256 != expected_mapping:
+                    failures.append("metric_failure_cmap_mapping_unbound")
+        if not _is_sha256_digest(evidence.get("source_font_sha256")):
+            failures.append("metric_failure_font_digest_unbound")
+        if not str(evidence.get("font_name") or "").strip():
+            failures.append("metric_failure_font_name_unbound")
+        if _strict_int(evidence.get("font_asset_page_number")) != int(page_number):
+            failures.append("metric_failure_font_page_unbound")
+        if str(evidence.get("font_asset_span_font_name") or "").strip() != str(
+            evidence.get("font_name") or ""
+        ).strip():
+            failures.append("metric_failure_span_font_unbound")
+        if str(evidence.get("error_type") or "") != "RuntimeError":
+            failures.append("metric_failure_error_type_unbound")
+        if not str(evidence.get("detail") or "").strip():
+            failures.append("metric_failure_detail_unbound")
+        return failures
+
+    if reason == "positioned_font_baseline_alignment_unavailable_for_item":
+        if attempted_representation not in {"text", "3d_text", "glyphs", "geometry"}:
+            failures.append("baseline_proof_not_valid_for_rung")
+        if evidence.get("host") != "blender":
+            failures.append("baseline_capability_host_unbound")
+        if not _host_version_is_bound(evidence.get("host_version")):
+            failures.append("baseline_capability_host_version_unbound")
+        if evidence.get("capability") != (
+            "FONT.align_y.BOTTOM_BASELINE_or_BOTTOM"
+        ):
+            failures.append("baseline_capability_identity_unbound")
+        if evidence.get("capability_present") is not False:
+            failures.append("baseline_capability_absence_unproven")
+        if evidence.get("supported_baseline_alignments") != []:
+            failures.append("baseline_capability_supported_set_unbound")
         return failures
 
     capability_proofs = {
@@ -1439,6 +1519,12 @@ def deliver_item(
             if not isinstance(outcome, AttemptOutcome):
                 raise TypeError("attempt callback did not return AttemptOutcome")
         except Exception as exc:
+            def exception_owned(error, name):
+                try:
+                    return tuple(getattr(error, name, ()) or ())
+                except Exception:
+                    return ()
+
             outcome = AttemptOutcome.failed(
                 "attempt_exception_not_impossibility_proof",
                 evidence={
@@ -1446,6 +1532,10 @@ def deliver_item(
                     "exception_type": type(exc).__name__,
                     "detail": str(exc),
                 },
+                owned_artifacts=exception_owned(exc, "owned_artifacts"),
+                owned_objects=exception_owned(exc, "owned_objects"),
+                owned_datablocks=exception_owned(exc, "owned_datablocks"),
+                owned_files=exception_owned(exc, "owned_files"),
             )
 
         if outcome.status == "impossible":
@@ -1467,6 +1557,7 @@ def deliver_item(
                     owned_artifacts=outcome.owned_artifacts,
                     owned_objects=outcome.owned_objects,
                     owned_datablocks=outcome.owned_datablocks,
+                    owned_files=outcome.owned_files,
                 )
 
         attempt_record: Dict[str, Any] = {
@@ -1567,6 +1658,7 @@ def deliver_item(
                     owned_artifacts=outcome.owned_artifacts,
                     owned_objects=outcome.owned_objects,
                     owned_datablocks=outcome.owned_datablocks,
+                    owned_files=outcome.owned_files,
                 )
                 attempt_record.update(
                     status=outcome.status,
@@ -1628,6 +1720,7 @@ def deliver_item(
                     owned_artifacts=outcome.owned_artifacts,
                     owned_objects=outcome.owned_objects,
                     owned_datablocks=outcome.owned_datablocks,
+                    owned_files=outcome.owned_files,
                 )
                 attempt_record.update(
                     status=outcome.status,
@@ -1695,6 +1788,10 @@ def deliver_item(
         attempt_record["cleanup"] = cleanup_result
         record["attempts"].append(attempt_record)
         if cleanup_result.get("status") != "complete":
+            # This private runtime handoff is removed before report
+            # serialization.  Names in ``owned_artifacts`` are evidence only;
+            # remediation must retain the exact frozen references and files.
+            record["_cleanup_failure_outcome"] = outcome
             break
         if outcome.status != "impossible":
             break

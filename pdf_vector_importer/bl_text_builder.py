@@ -2,9 +2,10 @@
 """Verified item-scoped Blender text representation delivery."""
 from __future__ import annotations
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from hashlib import sha256
 from io import BytesIO
+import json
 import logging
 import math
 import os
@@ -60,6 +61,23 @@ class _OwnedConstructionError(RuntimeError):
         super().__init__(message)
         self.owned_objects = tuple(owned_objects)
         self.owned_datablocks = tuple(owned_datablocks)
+
+
+class _PositionedBaselineCapabilityAbsent(RuntimeError):
+    """The running host cleanly rejected every supported baseline enum."""
+
+
+class _PositionedBaselineProbeError(RuntimeError):
+    """The baseline capability probe or its rollback did not complete safely."""
+
+
+@dataclass(frozen=True)
+class FinalEntityExpectationAuthority:
+    """Opaque immutable final-entity truth captured before page stacking."""
+
+    item_id: str
+    manifest_json: str
+    manifest_sha256: str
 
 
 def _proof_identity(item_id: str, page_number: int, source_span_id: int) -> Dict[str, Any]:
@@ -865,6 +883,20 @@ def _positioned_source_ink_evidence(
     glyph_identity = None
     code_point = None
     mapping_sha256 = None
+
+    def visible_without_exact_font_authority(reason: str) -> Dict[str, Any]:
+        return {
+            "zero_ink_identity": False,
+            "source_ink_classification": "visible",
+            "source_ink_evidence": reason,
+            "source_ink_glyph_id": glyph_id,
+            "source_ink_font_sha256": None,
+            "source_ink_glyph_identity": glyph_identity,
+            "source_ink_code_point": code_point,
+            "source_ink_mapping_sha256": None,
+            "source_ink_bounds_design_units": None,
+            "source_ink_contours_design_units": None,
+        }
     if raw_glyph_id is not None:
         if (
             not isinstance(raw_glyph_id, int)
@@ -899,7 +931,16 @@ def _positioned_source_ink_evidence(
                     glyph_id,
                 )
     if glyph_id is not None and require_exact_glyph:
-        source_bounds = _exact_glyph_design_bounds(asset, glyph_id)
+        if asset is None:
+            return visible_without_exact_font_authority(
+                "source_glyph_without_exact_font_authority"
+            )
+        try:
+            source_bounds = _exact_glyph_design_bounds(asset, glyph_id)
+        except RuntimeError:
+            return visible_without_exact_font_authority(
+                "exact_source_glyph_probe_unavailable"
+            )
         font_sha256 = str(getattr(asset, "usable_sha256", "") or "")
         if source_bounds is None:
             return {
@@ -914,7 +955,12 @@ def _positioned_source_ink_evidence(
                 "source_ink_bounds_design_units": None,
                 "source_ink_contours_design_units": None,
             }
-        source_contours = _exact_glyph_cubic_contours(asset, glyph_id)
+        try:
+            source_contours = _exact_glyph_cubic_contours(asset, glyph_id)
+        except RuntimeError:
+            return visible_without_exact_font_authority(
+                "exact_source_glyph_probe_unavailable"
+            )
         return {
             "zero_ink_identity": False,
             "source_ink_classification": "visible",
@@ -1294,10 +1340,13 @@ def _probe_positioned_baseline_alignment() -> str:
     new = getattr(curves, "new", None)
     remove = getattr(curves, "remove", None)
     if not callable(new) or not callable(remove):
-        raise RuntimeError("Blender FONT baseline capability probe is unavailable")
+        raise _PositionedBaselineProbeError(
+            "Blender FONT baseline capability probe is unavailable"
+        )
     probe = None
     selected = None
     probe_error = None
+    alignment_errors = []
     cleanup_error = None
     try:
         probe = new(name="BCPDF_PositionedBaselineProbe", type="FONT")
@@ -1309,10 +1358,9 @@ def _probe_positioned_baseline_alignment() -> str:
                     break
             except Exception as exc:
                 probe_error = exc
-        if selected is None:
-            raise RuntimeError(
-                "Blender supports neither required positioned baseline alignment"
-            ) from probe_error
+                alignment_errors.append(exc)
+    except Exception as exc:
+        probe_error = exc
     finally:
         if probe is not None:
             for _attempt in range(2):
@@ -1323,9 +1371,23 @@ def _probe_positioned_baseline_alignment() -> str:
                 except Exception as exc:
                     cleanup_error = exc
     if cleanup_error is not None:
-        raise RuntimeError(
+        raise _PositionedBaselineProbeError(
             "Blender FONT baseline capability probe cleanup failed"
         ) from cleanup_error
+    if probe is None:
+        raise _PositionedBaselineProbeError(
+            "Blender FONT baseline capability probe creation failed"
+        ) from probe_error
+    if selected is None:
+        if alignment_errors and not all(
+            isinstance(error, (TypeError, ValueError)) for error in alignment_errors
+        ):
+            raise _PositionedBaselineProbeError(
+                "Blender FONT baseline capability probe failed"
+            ) from probe_error
+        raise _PositionedBaselineCapabilityAbsent(
+            "Blender supports neither required positioned baseline alignment"
+        ) from probe_error
     return selected
 
 
@@ -1769,6 +1831,82 @@ def _valid_owned_ref(value) -> bool:
         return False
 
 
+def _unique_owned_datablocks(*values) -> tuple:
+    result = []
+    for value in values:
+        if _valid_owned_ref(value) and all(value is not existing for existing in result):
+            result.append(value)
+    return tuple(result)
+
+
+def _owned_datablocks_for_text_entity(obj, data) -> tuple:
+    """Freeze exact per-attempt text data/material references at construction time."""
+
+    materials = ()
+    try:
+        materials = tuple(getattr(data, "materials", ()) or ())
+    except (AttributeError, ReferenceError, TypeError):
+        pass
+    return _unique_owned_datablocks(data, *materials)
+
+
+def _raster_attempt_ownership(obj):
+    """Freeze exact raster references and importer-rooted file authority."""
+
+    if obj is None:
+        return (), (), (), ()
+    artifact = _raster_artifact(obj)
+    try:
+        data = getattr(obj, "data", None)
+    except (AttributeError, ReferenceError, RuntimeError, TypeError):
+        data = None
+    material = None
+    image = None
+    owned_files = ()
+    try:
+        material_name = str(obj.get("pdf_image_material", "") or "")
+        image_name = str(obj.get("pdf_image_datablock", "") or "")
+        material_owned = bool(obj.get("pdf_image_material_owned", False))
+        image_owned = bool(obj.get("pdf_image_datablock_owned", False))
+        image_path = str(obj.get("pdf_image_path", "") or "")
+        image_root = str(obj.get("pdf_image_owner_root", "") or "")
+    except (AttributeError, ReferenceError, TypeError):
+        material_name = image_name = image_path = image_root = ""
+        material_owned = image_owned = False
+    if material_owned and material_name:
+        try:
+            material = next(
+                (
+                    candidate
+                    for candidate in tuple(getattr(data, "materials", ()) or ())
+                    if str(getattr(candidate, "name", "") or "") == material_name
+                ),
+                None,
+            )
+        except (AttributeError, ReferenceError, RuntimeError, TypeError):
+            material = None
+    if image_owned and image_name and material is not None:
+        try:
+            image = next(
+                (
+                    candidate
+                    for node in tuple(material.node_tree.nodes)
+                    for candidate in (getattr(node, "image", None),)
+                    if candidate is not None
+                    and str(getattr(candidate, "name", "") or "") == image_name
+                ),
+                None,
+            )
+        except (AttributeError, ReferenceError, RuntimeError, TypeError):
+            image = None
+    if image_path and image_root:
+        owned_files = ((image_path, image_root),)
+    return (
+        (artifact,),
+        (obj,),
+        _unique_owned_datablocks(data, material, image),
+        owned_files,
+    )
 def _owned_objects_for_text_entity(obj) -> tuple:
     objects = [obj] if _valid_owned_ref(obj) else []
     try:
@@ -1816,7 +1954,11 @@ def _datablock_kind(data) -> str:
         return "MESH"
     if identifier == "MATERIAL":
         return "MATERIAL"
+    if identifier == "IMAGE":
+        return "IMAGE"
     class_name = type(data).__name__.upper()
+    if "IMAGE" in class_name:
+        return "IMAGE"
     if (
         "VECTORFONT" in class_name
         or (
@@ -1855,7 +1997,7 @@ def _verify_text_material(obj) -> tuple[list[str], Dict[str, Any]]:
         material_owned = bool(obj.get("pdf_text_material_owned", False))
         expected = tuple(float(value) for value in obj.get("pdf_text_expected_rgba", ()))
         assigned = list(getattr(obj.data, "materials", []) or [])
-    except (AttributeError, ReferenceError, TypeError, ValueError):
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
         material_name = ""
         material_owned = False
         expected = ()
@@ -1870,12 +2012,12 @@ def _verify_text_material(obj) -> tuple[list[str], Dict[str, Any]]:
     )
     try:
         actual = tuple(float(value) for value in material.diffuse_color)
-    except (AttributeError, ReferenceError, TypeError, ValueError):
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
         actual = ()
     try:
         nodes = list(material.node_tree.nodes)
         links = list(material.node_tree.links)
-    except (AttributeError, ReferenceError, TypeError):
+    except (AttributeError, ReferenceError, RuntimeError, TypeError):
         nodes = []
         links = []
     shaders = [
@@ -1884,23 +2026,70 @@ def _verify_text_material(obj) -> tuple[list[str], Dict[str, Any]]:
     outputs = [
         node for node in nodes if str(getattr(node, "type", "")) == "OUTPUT_MATERIAL"
     ]
+    linked_shader_values = []
     try:
-        node_rgba = tuple(
-            float(value) for value in shaders[0].inputs["Base Color"].default_value
-        )
-    except (AttributeError, IndexError, KeyError, TypeError, ValueError):
-        node_rgba = ()
-    shader_linked = any(
-        getattr(link, "from_node", None) in shaders
-        and getattr(link, "to_node", None) in outputs
-        for link in links
+        for shader in shaders:
+            try:
+                candidate_rgba = tuple(
+                    float(value)
+                    for value in _host_node_socket(
+                        shader, "inputs", "Base Color"
+                    ).default_value
+                )
+                candidate_alpha = float(
+                    _host_node_socket(shader, "inputs", "Alpha").default_value
+                )
+            except (
+                AttributeError,
+                IndexError,
+                KeyError,
+                ReferenceError,
+                RuntimeError,
+                TypeError,
+                ValueError,
+            ):
+                candidate_rgba = ()
+                candidate_alpha = math.nan
+            shader_bsdf = _host_node_socket(shader, "outputs", "BSDF")
+            for output in outputs:
+                if not bool(getattr(output, "is_active_output", True)):
+                    continue
+                output_surface = _host_node_socket(output, "inputs", "Surface")
+                if _exact_host_node_link(
+                    links,
+                    from_node=shader,
+                    from_socket=shader_bsdf,
+                    to_node=output,
+                    to_socket=output_surface,
+                ):
+                    linked_shader_values.append((candidate_rgba, candidate_alpha))
+                    break
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        linked_shader_values = []
+    shader_linked = bool(linked_shader_values)
+    matching_shader_values = next(
+        (
+            values
+            for values in linked_shader_values
+            if len(expected) == 4
+            and len(values[0]) == 4
+            and all(math.isfinite(value) for value in (*values[0], values[1]))
+            and all(
+                abs(left - right) <= 1e-6
+                for left, right in zip(values[0], expected)  # noqa: B905
+            )
+            and abs(values[1] - expected[3]) <= 1e-6
+        ),
+        linked_shader_values[0] if linked_shader_values else ((), math.nan),
     )
+    node_rgba, node_alpha = matching_shader_values
     evidence.update(
         text_material=material_name,
         text_material_owned=material_owned,
         expected_text_rgba=list(expected),
         actual_text_rgba=list(actual),
         actual_text_node_rgba=list(node_rgba),
+        actual_text_node_alpha=node_alpha,
         text_shader_to_output_linked=shader_linked,
     )
     if material is None or not material_owned:
@@ -1909,7 +2098,10 @@ def _verify_text_material(obj) -> tuple[list[str], Dict[str, Any]]:
         len(expected) != 4
         or len(actual) != 4
         or len(node_rgba) != 4
-        or any(not math.isfinite(value) for value in (*expected, *actual, *node_rgba))
+        or any(
+            not math.isfinite(value)
+            for value in (*expected, *actual, *node_rgba, node_alpha)
+        )
         or any(
             abs(left - right) > 1e-6
             for left, right in zip(actual, expected)  # noqa: B905
@@ -1918,6 +2110,7 @@ def _verify_text_material(obj) -> tuple[list[str], Dict[str, Any]]:
             abs(left - right) > 1e-6
             for left, right in zip(node_rgba, expected)  # noqa: B905
         )
+        or abs(node_alpha - expected[3]) > 1e-6
     ):
         failures.append("text_material_color_mismatch")
     if (
@@ -2782,6 +2975,71 @@ def _verify_metric_character_transform(obj, text_item) -> tuple[list[str], Dict[
     return failures, evidence
 
 
+def _finite_matrix_values(value):
+    try:
+        values = [float(part) for part in value]
+    except (TypeError, ValueError):
+        return None
+    if len(values) != 16 or not all(math.isfinite(part) for part in values):
+        return None
+    return values
+
+
+def _evaluated_world_affine_values(obj):
+    """Read the evaluated world matrix; only explicit test hosts may synthesize TRS."""
+
+    if getattr(bpy, "_bc_pdf_vector_importer_test_host", False) is True:
+        explicit = _finite_matrix_values(
+            getattr(obj, "_pdf_test_evaluated_matrix_values", None)
+        )
+        if explicit is not None:
+            return explicit
+    try:
+        evaluated = obj.evaluated_get(bpy.context.evaluated_depsgraph_get())
+        values = [float(part) for row in evaluated.matrix_world for part in row]
+    except (
+        AttributeError,
+        ReferenceError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ):
+        values = None
+    values = _finite_matrix_values(values)
+    if values is not None:
+        return values
+    if getattr(bpy, "_bc_pdf_vector_importer_test_host", False) is not True:
+        return None
+    try:
+        angle = float(obj.rotation_euler[2])
+        cosine = math.cos(angle)
+        sine = math.sin(angle)
+        scale_x, scale_y, scale_z = (float(value) for value in obj.scale)
+        location_x, location_y, location_z = (
+            float(value) for value in obj.location
+        )
+    except (AttributeError, IndexError, TypeError, ValueError):
+        return None
+    return _finite_matrix_values([
+        cosine * scale_x,
+        -sine * scale_y,
+        0.0,
+        location_x,
+        sine * scale_x,
+        cosine * scale_y,
+        0.0,
+        location_y,
+        0.0,
+        0.0,
+        scale_z,
+        location_z,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+    ])
+
+
 def _verify_full_affine_transform(obj, text_item) -> tuple[list[str], Dict[str, Any]]:
     failures: list[str] = []
     evidence: Dict[str, Any] = {"full_affine_applied": True}
@@ -2870,6 +3128,10 @@ def _verify_full_affine_transform(obj, text_item) -> tuple[list[str], Dict[str, 
         evidence["actual_rotation_rad"] = actual_rotation
     except (AttributeError, ImportError, IndexError, TypeError, ValueError):
         failures.append("evaluated_affine_transform_unverifiable")
+    world_affine = _evaluated_world_affine_values(obj)
+    evidence["evaluated_world_affine_matrix"] = world_affine
+    if world_affine is None:
+        failures.append("evaluated_world_affine_unverifiable")
     return failures, evidence
 
 
@@ -2976,12 +3238,19 @@ def _verify_transform_and_dimensions(obj, text_item) -> tuple[list[str], Dict[st
             failures.append("evaluated_height_mismatch")
     except (AttributeError, IndexError, TypeError, ValueError):
         failures.append("transform_unverifiable")
+    world_affine = _evaluated_world_affine_values(obj)
+    evidence["evaluated_world_affine_matrix"] = world_affine
+    if world_affine is None:
+        failures.append("evaluated_world_affine_unverifiable")
     return failures, evidence
 
 
 def _verify_font_candidate(obj, text_item, *, delivered: str, item_id: str):
     failures = []
-    verification_evidence: Dict[str, Any] = {"item_id": item_id}
+    verification_evidence: Dict[str, Any] = {
+        "item_id": item_id,
+        "source_text": str(getattr(text_item, "text", "") or ""),
+    }
     if str(getattr(obj, "type", "")) != "FONT":
         failures.append("actual_object_type_not_FONT")
     if str(getattr(getattr(obj, "data", None), "body", "")) != str(text_item.text):
@@ -3014,7 +3283,7 @@ def _verify_font_candidate(obj, text_item, *, delivered: str, item_id: str):
             evidence={**verification_evidence, "failures": failures},
             owned_artifacts=_owned_artifacts_for_text_entity(obj, obj.data),
             owned_objects=_owned_objects_for_text_entity(obj),
-            owned_datablocks=(obj.data,),
+            owned_datablocks=_owned_datablocks_for_text_entity(obj, obj.data),
         )
     return AttemptOutcome.delivered(
         obj,
@@ -3034,7 +3303,7 @@ def _verify_font_candidate(obj, text_item, *, delivered: str, item_id: str):
         },
         owned_artifacts=_owned_artifacts_for_text_entity(obj, obj.data),
         owned_objects=_owned_objects_for_text_entity(obj),
-        owned_datablocks=(obj.data,),
+        owned_datablocks=_owned_datablocks_for_text_entity(obj, obj.data),
     )
 
 
@@ -3043,6 +3312,7 @@ def _verify_converted_candidate(final, data, text_item, *, expected_type: str, i
     evidence: Dict[str, Any] = {
         "item_id": item_id,
         "actual_object_type": str(getattr(final, "type", "")),
+        "source_text": str(getattr(text_item, "text", "") or ""),
     }
     if evidence["actual_object_type"] != expected_type:
         failures.append(f"actual_object_type_not_{expected_type}")
@@ -3065,7 +3335,7 @@ def _verify_converted_candidate(final, data, text_item, *, expected_type: str, i
             evidence={**evidence, "failures": failures},
             owned_artifacts=_owned_artifacts_for_text_entity(final, data),
             owned_objects=_owned_objects_for_text_entity(final),
-            owned_datablocks=(data,),
+            owned_datablocks=_owned_datablocks_for_text_entity(final, data),
         ), evidence
     return None, evidence
 
@@ -3172,6 +3442,13 @@ def _copy_object_transform(source, target) -> None:
         "pdf_metric_metric_source",
         "pdf_metric_zero_ink_identity",
         "pdf_metric_zero_advance_logical_proof",
+        "pdf_metric_source_ink_classification",
+        "pdf_metric_source_ink_evidence",
+        "pdf_metric_source_ink_glyph_id",
+        "pdf_metric_source_ink_font_sha256",
+        "pdf_metric_source_ink_glyph_identity",
+        "pdf_metric_source_ink_code_point",
+        "pdf_metric_source_ink_mapping_sha256",
         "pdf_metric_expected_world_ink_bounds_m",
         "pdf_metric_target_origin_m",
         "pdf_metric_target_horizontal_axis_m",
@@ -3577,7 +3854,25 @@ def _attempt_native_font(
     )
     if failure is not None:
         return failure
-    return _verify_font_candidate(obj, text_item, delivered=delivered, item_id=item_id)
+    try:
+        return _verify_font_candidate(
+            obj,
+            text_item,
+            delivered=delivered,
+            item_id=item_id,
+        )
+    except Exception as exc:
+        return AttemptOutcome.failed(
+            "font_candidate_verification_raised",
+            evidence={
+                "item_id": item_id,
+                "exception_type": type(exc).__name__,
+                "detail": str(exc),
+            },
+            owned_artifacts=_owned_artifacts_for_text_entity(obj, obj.data),
+            owned_objects=_owned_objects_for_text_entity(obj),
+            owned_datablocks=_owned_datablocks_for_text_entity(obj, obj.data),
+        )
 
 
 def _attempt_glyphs(
@@ -3606,9 +3901,22 @@ def _attempt_glyphs(
     )
     if failure is not None:
         return failure
-    source_verification = _verify_font_candidate(
-        obj, text_item, delivered="text", item_id=item_id
-    )
+    try:
+        source_verification = _verify_font_candidate(
+            obj, text_item, delivered="text", item_id=item_id
+        )
+    except Exception as exc:
+        return AttemptOutcome.failed(
+            "glyph_source_verification_raised",
+            evidence={
+                "item_id": item_id,
+                "exception_type": type(exc).__name__,
+                "detail": str(exc),
+            },
+            owned_artifacts=_owned_artifacts_for_text_entity(obj, data),
+            owned_objects=_owned_objects_for_text_entity(obj),
+            owned_datablocks=_owned_datablocks_for_text_entity(obj, data),
+        )
     if source_verification.status != "delivered":
         return source_verification
     try:
@@ -3626,7 +3934,7 @@ def _attempt_glyphs(
                 ),
                 owned_artifacts=_owned_artifacts_for_text_entity(obj, data),
                 owned_objects=_owned_objects_for_text_entity(obj),
-                owned_datablocks=(data,),
+                owned_datablocks=_owned_datablocks_for_text_entity(obj, data),
             )
         converted = to_curve(depsgraph, apply_modifiers=False)
         try:
@@ -3644,7 +3952,10 @@ def _attempt_glyphs(
                     _artifact(None, curve_data),
                 ),
                 owned_objects=_owned_objects_for_text_entity(obj),
-                owned_datablocks=(data, curve_data),
+                owned_datablocks=_unique_owned_datablocks(
+                    *_owned_datablocks_for_text_entity(obj, data),
+                    curve_data,
+                ),
             )
         curve_data.name = f"{obj.name}_glyph_curve"
         final = bpy.data.objects.new(obj.name, curve_data)
@@ -3669,6 +3980,10 @@ def _attempt_glyphs(
             bpy.context.view_layer.update()
         except Exception:
             pass
+        attempt_owned_datablocks = _unique_owned_datablocks(
+            *_owned_datablocks_for_text_entity(obj, data),
+            *_owned_datablocks_for_text_entity(final, curve_data),
+        )
         superseded_cleanup, remaining_objects, remaining_data = _remove_object_and_data(
             obj, data, collection
         )
@@ -3681,11 +3996,14 @@ def _attempt_glyphs(
                     *_owned_artifacts_for_text_entity(final, curve_data),
                 ),
                 owned_objects=_unique_owned_objects(*remaining_objects, final),
-                owned_datablocks=tuple(remaining_data) + (curve_data,),
+                owned_datablocks=attempt_owned_datablocks,
             )
     except Exception as exc:
         owned_objects = _unique_owned_objects(obj, final)
-        owned_data = tuple(value for value in (data, curve_data) if _valid_owned_ref(value))
+        owned_data = _unique_owned_datablocks(
+            *_owned_datablocks_for_text_entity(obj, data),
+            curve_data,
+        )
         artifacts = (
             *_owned_artifacts_for_text_entity(obj, data),
             *_owned_artifacts_for_text_entity(final, curve_data),
@@ -3701,9 +4019,22 @@ def _attempt_glyphs(
             owned_objects=owned_objects,
             owned_datablocks=owned_data,
         )
-    verification_failure, verification_evidence = _verify_converted_candidate(
-        final, curve_data, text_item, expected_type="CURVE", item_id=item_id
-    )
+    try:
+        verification_failure, verification_evidence = _verify_converted_candidate(
+            final, curve_data, text_item, expected_type="CURVE", item_id=item_id
+        )
+    except Exception as exc:
+        return AttemptOutcome.failed(
+            "glyph_final_verification_raised",
+            evidence={
+                "item_id": item_id,
+                "exception_type": type(exc).__name__,
+                "detail": str(exc),
+            },
+            owned_artifacts=_owned_artifacts_for_text_entity(final, curve_data),
+            owned_objects=_owned_objects_for_text_entity(final),
+            owned_datablocks=_owned_datablocks_for_text_entity(final, curve_data),
+        )
     if verification_failure is not None:
         return verification_failure
     return AttemptOutcome.delivered(
@@ -3716,7 +4047,7 @@ def _attempt_glyphs(
         },
         owned_artifacts=_owned_artifacts_for_text_entity(final, curve_data),
         owned_objects=_owned_objects_for_text_entity(final),
-        owned_datablocks=(curve_data,),
+        owned_datablocks=_owned_datablocks_for_text_entity(final, curve_data),
     )
 
 
@@ -3757,9 +4088,22 @@ def _attempt_geometry(
     )
     if failure is not None:
         return failure
-    source_verification = _verify_font_candidate(
-        obj, text_item, delivered="text", item_id=item_id
-    )
+    try:
+        source_verification = _verify_font_candidate(
+            obj, text_item, delivered="text", item_id=item_id
+        )
+    except Exception as exc:
+        return AttemptOutcome.failed(
+            "geometry_source_verification_raised",
+            evidence={
+                "item_id": item_id,
+                "exception_type": type(exc).__name__,
+                "detail": str(exc),
+            },
+            owned_artifacts=_owned_artifacts_for_text_entity(obj, data),
+            owned_objects=_owned_objects_for_text_entity(obj),
+            owned_datablocks=_owned_datablocks_for_text_entity(obj, data),
+        )
     if source_verification.status != "delivered":
         return source_verification
     try:
@@ -3775,7 +4119,10 @@ def _attempt_geometry(
                     _artifact(None, mesh),
                 ),
                 owned_objects=_owned_objects_for_text_entity(obj),
-                owned_datablocks=(data, mesh),
+                owned_datablocks=_unique_owned_datablocks(
+                    *_owned_datablocks_for_text_entity(obj, data),
+                    mesh,
+                ),
             )
         mesh.name = f"{obj.name}_mesh"
         final = bpy.data.objects.new(obj.name, mesh)
@@ -3800,6 +4147,10 @@ def _attempt_geometry(
             bpy.context.view_layer.update()
         except Exception:
             pass
+        attempt_owned_datablocks = _unique_owned_datablocks(
+            *_owned_datablocks_for_text_entity(obj, data),
+            *_owned_datablocks_for_text_entity(final, mesh),
+        )
         superseded_cleanup, remaining_objects, remaining_data = _remove_object_and_data(
             obj, data, collection
         )
@@ -3812,11 +4163,14 @@ def _attempt_geometry(
                     *_owned_artifacts_for_text_entity(final, mesh),
                 ),
                 owned_objects=_unique_owned_objects(*remaining_objects, final),
-                owned_datablocks=tuple(remaining_data) + (mesh,),
+                owned_datablocks=attempt_owned_datablocks,
             )
     except Exception as exc:
         owned_objects = _unique_owned_objects(obj, final)
-        owned_data = tuple(value for value in (data, mesh) if _valid_owned_ref(value))
+        owned_data = _unique_owned_datablocks(
+            *_owned_datablocks_for_text_entity(obj, data),
+            mesh,
+        )
         artifacts = (
             *_owned_artifacts_for_text_entity(obj, data),
             *_owned_artifacts_for_text_entity(final, mesh),
@@ -3832,9 +4186,22 @@ def _attempt_geometry(
             owned_objects=owned_objects,
             owned_datablocks=owned_data,
         )
-    verification_failure, verification_evidence = _verify_converted_candidate(
-        final, mesh, text_item, expected_type="MESH", item_id=item_id
-    )
+    try:
+        verification_failure, verification_evidence = _verify_converted_candidate(
+            final, mesh, text_item, expected_type="MESH", item_id=item_id
+        )
+    except Exception as exc:
+        return AttemptOutcome.failed(
+            "geometry_final_verification_raised",
+            evidence={
+                "item_id": item_id,
+                "exception_type": type(exc).__name__,
+                "detail": str(exc),
+            },
+            owned_artifacts=_owned_artifacts_for_text_entity(final, mesh),
+            owned_objects=_owned_objects_for_text_entity(final),
+            owned_datablocks=_owned_datablocks_for_text_entity(final, mesh),
+        )
     if verification_failure is not None:
         return verification_failure
     return AttemptOutcome.delivered(
@@ -3847,8 +4214,133 @@ def _attempt_geometry(
         },
         owned_artifacts=_owned_artifacts_for_text_entity(final, mesh),
         owned_objects=_owned_objects_for_text_entity(final),
-        owned_datablocks=(mesh,),
+        owned_datablocks=_owned_datablocks_for_text_entity(final, mesh),
     )
+
+
+def raster_mesh_fidelity_state(obj):
+    """Return exact JSON-safe local geometry, winding, loop, and UV truth."""
+
+    try:
+        mesh = obj.data
+        vertices = [
+            [float(vertex.co[index]) for index in range(3)]
+            for vertex in tuple(mesh.vertices)
+        ]
+        loops = [int(loop.vertex_index) for loop in tuple(mesh.loops)]
+        polygons = [
+            {
+                "vertices": [int(value) for value in tuple(polygon.vertices)],
+                "loop_indices": [
+                    int(value) for value in tuple(polygon.loop_indices)
+                ],
+                "material_index": int(polygon.material_index),
+            }
+            for polygon in tuple(mesh.polygons)
+        ]
+        uv_layers = mesh.uv_layers
+        get_uv = getattr(uv_layers, "get", None)
+        uv_layer = get_uv("UVMap") if callable(get_uv) else None
+        uv_coordinates = [
+            [float(item.uv[index]) for index in range(2)]
+            for item in tuple(uv_layer.data)
+        ]
+        uv_layer_name = str(uv_layer.name or "")
+    except (
+        AttributeError,
+        IndexError,
+        ReferenceError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ):
+        return None
+    if (
+        len(vertices) < 3
+        or not loops
+        or not polygons
+        or uv_layer_name != "UVMap"
+        or len(uv_coordinates) != len(loops)
+        or not all(
+            math.isfinite(value)
+            for coordinate in (*vertices, *uv_coordinates)
+            for value in coordinate
+        )
+        or not all(0 <= vertex_index < len(vertices) for vertex_index in loops)
+    ):
+        return None
+    for polygon in polygons:
+        polygon_vertices = polygon["vertices"]
+        polygon_loops = polygon["loop_indices"]
+        if (
+            len(polygon_vertices) < 3
+            or len(polygon_vertices) != len(polygon_loops)
+            or polygon["material_index"] < 0
+            or not all(0 <= value < len(vertices) for value in polygon_vertices)
+            or not all(0 <= value < len(loops) for value in polygon_loops)
+        ):
+            return None
+    return {
+        "vertices_local": vertices,
+        "loops_vertex_indices": loops,
+        "polygons": polygons,
+        "uv_layer_name": uv_layer_name,
+        "uv_coordinates": uv_coordinates,
+    }
+
+
+def _same_host_node_identity(left, right) -> bool:
+    if left is right:
+        return True
+    try:
+        if left == right:
+            return True
+    except (ReferenceError, RuntimeError, TypeError, ValueError):
+        pass
+    try:
+        left_pointer = int(left.as_pointer())
+        right_pointer = int(right.as_pointer())
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return False
+    return left_pointer != 0 and left_pointer == right_pointer
+
+
+def _host_node_socket(node, collection_name: str, socket_name: str):
+    try:
+        sockets = getattr(node, collection_name)
+        getter = getattr(sockets, "get", None)
+        return getter(socket_name) if callable(getter) else sockets[socket_name]
+    except (
+        AttributeError,
+        IndexError,
+        KeyError,
+        ReferenceError,
+        RuntimeError,
+        TypeError,
+    ):
+        return None
+
+
+def _exact_host_node_link(
+    links,
+    *,
+    from_node,
+    from_socket,
+    to_node,
+    to_socket,
+) -> bool:
+    if from_socket is None or to_socket is None:
+        return False
+    try:
+        return any(
+            _same_host_node_identity(getattr(link, "from_node", None), from_node)
+            and _same_host_node_identity(getattr(link, "to_node", None), to_node)
+            and _same_host_node_identity(getattr(link, "from_socket", None), from_socket)
+            and _same_host_node_identity(getattr(link, "to_socket", None), to_socket)
+            for link in links
+        )
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return False
 
 
 def _attempt_raster_impl(
@@ -3875,12 +4367,22 @@ def _attempt_raster_impl(
                 "exception_type": type(exc).__name__,
                 "detail": str(exc),
             },
+            owned_artifacts=tuple(getattr(exc, "owned_artifacts", ()) or ()),
+            owned_objects=tuple(getattr(exc, "owned_objects", ()) or ()),
+            owned_datablocks=tuple(getattr(exc, "owned_datablocks", ()) or ()),
+            owned_files=tuple(getattr(exc, "owned_files", ()) or ()),
         )
     if obj is None:
         return AttemptOutcome.failed(
             "terminal_raster_not_verified",
             evidence={"item_id": item_id, "source_bbox_pdf": getattr(text_item, "source_bbox_pdf", None)},
         )
+    (
+        owned_artifacts,
+        owned_objects,
+        owned_datablocks,
+        owned_files,
+    ) = _raster_attempt_ownership(obj)
     try:
         _set_object_metadata(
             obj,
@@ -3894,17 +4396,19 @@ def _attempt_raster_impl(
         return AttemptOutcome.failed(
             "terminal_raster_identity_unverified",
             evidence={"item_id": item_id, "exception_type": type(exc).__name__, "detail": str(exc)},
-            owned_artifacts=(_raster_artifact(obj),),
-            owned_objects=(obj,),
-            owned_datablocks=(obj.data,) if getattr(obj, "data", None) is not None else (),
+            owned_artifacts=owned_artifacts,
+            owned_objects=owned_objects,
+            owned_datablocks=owned_datablocks,
+            owned_files=owned_files,
         )
     if not entity_id:
         return AttemptOutcome.failed(
             "terminal_raster_identity_unverified",
             evidence={"item_id": item_id},
-            owned_artifacts=(_raster_artifact(obj),),
-            owned_objects=(obj,),
-            owned_datablocks=(obj.data,) if getattr(obj, "data", None) is not None else (),
+            owned_artifacts=owned_artifacts,
+            owned_objects=owned_objects,
+            owned_datablocks=owned_datablocks,
+            owned_files=owned_files,
         )
     failures = []
     verification_evidence: Dict[str, Any] = {"item_id": item_id}
@@ -4018,6 +4522,10 @@ def _attempt_raster_impl(
     verification_evidence["raster_loop_count"] = loop_count
     if uv_count <= 0 or loop_count <= 0 or uv_count != loop_count:
         failures.append("raster_uv_map_unverified")
+    mesh_state = raster_mesh_fidelity_state(obj)
+    verification_evidence["raster_mesh_state"] = mesh_state
+    if mesh_state is None:
+        failures.append("raster_mesh_fidelity_unverified")
 
     try:
         node_tree = material.node_tree
@@ -4033,23 +4541,60 @@ def _attempt_raster_impl(
     output_nodes = [
         node for node in nodes if str(getattr(node, "type", "")) == "OUTPUT_MATERIAL"
     ]
-    texture_bound = any(getattr(node, "image", None) is image for node in texture_nodes)
-    texture_to_shader = any(
-        getattr(link, "from_node", None) in texture_nodes
-        and getattr(link, "to_node", None) in shader_nodes
-        for link in links
-    )
-    shader_to_output = any(
-        getattr(link, "from_node", None) in shader_nodes
-        and getattr(link, "to_node", None) in output_nodes
-        for link in links
-    )
+    bound_textures = [
+        node
+        for node in texture_nodes
+        if _same_host_node_identity(getattr(node, "image", None), image)
+    ]
+    texture_bound = bool(bound_textures)
+    texture_to_shader = False
+    shader_to_output = False
+    verified_render_chain = False
+    for texture in bound_textures:
+        texture_color = _host_node_socket(texture, "outputs", "Color")
+        texture_alpha = _host_node_socket(texture, "outputs", "Alpha")
+        for shader in shader_nodes:
+            color_linked = _exact_host_node_link(
+                links,
+                from_node=texture,
+                from_socket=texture_color,
+                to_node=shader,
+                to_socket=_host_node_socket(shader, "inputs", "Base Color"),
+            )
+            alpha_linked = _exact_host_node_link(
+                links,
+                from_node=texture,
+                from_socket=texture_alpha,
+                to_node=shader,
+                to_socket=_host_node_socket(shader, "inputs", "Alpha"),
+            )
+            if not (color_linked and alpha_linked):
+                continue
+            texture_to_shader = True
+            for output in output_nodes:
+                if not bool(getattr(output, "is_active_output", True)):
+                    continue
+                output_linked = _exact_host_node_link(
+                    links,
+                    from_node=shader,
+                    from_socket=_host_node_socket(shader, "outputs", "BSDF"),
+                    to_node=output,
+                    to_socket=_host_node_socket(output, "inputs", "Surface"),
+                )
+                if output_linked:
+                    shader_to_output = True
+                    verified_render_chain = True
+                    break
+            if verified_render_chain:
+                break
+        if verified_render_chain:
+            break
     verification_evidence["raster_texture_image_bound"] = texture_bound
     verification_evidence["raster_texture_to_shader_linked"] = texture_to_shader
     verification_evidence["raster_shader_to_output_linked"] = shader_to_output
     if not texture_bound:
         failures.append("raster_material_image_binding_unverified")
-    if not texture_to_shader or not shader_to_output:
+    if not verified_render_chain:
         failures.append("raster_material_node_links_unverified")
     try:
         tx0, ty0, tx1, ty1 = (float(value) for value in text_item.bbox[:4])
@@ -4089,6 +4634,10 @@ def _attempt_raster_impl(
             failures.append("raster_dimensions_mismatch")
     except (AttributeError, IndexError, TypeError, ValueError):
         failures.append("raster_placement_unverifiable")
+    world_affine = _evaluated_world_affine_values(obj)
+    verification_evidence["evaluated_world_affine_matrix"] = world_affine
+    if world_affine is None:
+        failures.append("raster_world_affine_unverifiable")
     try:
         if not list(getattr(getattr(obj, "data", None), "vertices", []) or []):
             failures.append("raster_plane_has_no_verified_vertices")
@@ -4098,9 +4647,10 @@ def _attempt_raster_impl(
         return AttemptOutcome.failed(
             "terminal_raster_visual_verification_failed",
             evidence={**verification_evidence, "failures": failures},
-            owned_artifacts=(_raster_artifact(obj),),
-            owned_objects=(obj,),
-            owned_datablocks=(obj.data,) if getattr(obj, "data", None) is not None else (),
+            owned_artifacts=owned_artifacts,
+            owned_objects=owned_objects,
+            owned_datablocks=owned_datablocks,
+            owned_files=owned_files,
         )
     return AttemptOutcome.delivered(
         obj,
@@ -4110,9 +4660,10 @@ def _attempt_raster_impl(
             "raster_verified": True,
             "placement_verified": True,
         },
-        owned_artifacts=(_raster_artifact(obj),),
-        owned_objects=(obj,),
-        owned_datablocks=(obj.data,) if getattr(obj, "data", None) is not None else (),
+        owned_artifacts=owned_artifacts,
+        owned_objects=owned_objects,
+        owned_datablocks=owned_datablocks,
+        owned_files=owned_files,
     )
 
 
@@ -4131,6 +4682,7 @@ def _attempt_raster(
     def _capture_callback(*args, **kwargs):
         obj = terminal_raster_callback(*args, **kwargs)
         captured["object"] = obj
+        captured["ownership"] = _raster_attempt_ownership(obj)
         return obj
 
     try:
@@ -4155,7 +4707,7 @@ def _attempt_raster(
                     "detail": str(exc),
                 },
             )
-        data = getattr(obj, "data", None)
+        ownership = captured.get("ownership") or _raster_attempt_ownership(obj)
         return AttemptOutcome.failed(
             "terminal_raster_verification_raised",
             evidence={
@@ -4163,38 +4715,20 @@ def _attempt_raster(
                 "exception_type": type(exc).__name__,
                 "detail": str(exc),
             },
-            owned_artifacts=(_raster_artifact(obj),),
-            owned_objects=(obj,),
-            owned_datablocks=(data,) if data is not None else (),
+            owned_artifacts=ownership[0],
+            owned_objects=ownership[1],
+            owned_datablocks=ownership[2],
+            owned_files=ownership[3],
         )
 
 
 def _cleanup_attempt(outcome: AttemptOutcome, collection) -> Dict[str, Any]:
     removed = []
-    raster_resources = []
     for obj in tuple(outcome.owned_objects or ()):
         if obj is None:
             continue
         try:
             obj_name = str(getattr(obj, "name", "") or "")
-            raster_resources.append({
-                "path": str(obj.get("pdf_image_path", "") or ""),
-                "material": str(obj.get("pdf_image_material", "") or ""),
-                "material_owned": bool(obj.get("pdf_image_material_owned", False)),
-                "image": str(obj.get("pdf_image_datablock", "") or ""),
-                "image_owned": bool(obj.get("pdf_image_datablock_owned", False)),
-            })
-            text_material = str(obj.get("pdf_text_material", "") or "")
-            if text_material:
-                raster_resources.append({
-                    "path": "",
-                    "material": text_material,
-                    "material_owned": bool(
-                        obj.get("pdf_text_material_owned", False)
-                    ),
-                    "image": "",
-                    "image_owned": False,
-                })
         except ReferenceError:
             removed.append("<already_removed_object>")
             continue
@@ -4228,6 +4762,8 @@ def _cleanup_attempt(outcome: AttemptOutcome, collection) -> Dict[str, Any]:
             if data_type == "CURVE"
             else getattr(bpy.data, "materials", None)
             if data_type == "MATERIAL"
+            else getattr(bpy.data, "images", None)
+            if data_type == "IMAGE"
             else getattr(bpy.data, "fonts", None)
             if data_type == "FONT"
             else None
@@ -4240,6 +4776,10 @@ def _cleanup_attempt(outcome: AttemptOutcome, collection) -> Dict[str, Any]:
                 "detail": f"no remover for owned datablock kind {data_type or '<unknown>'}",
             }
         try:
+            if data_type in {"MATERIAL", "IMAGE"} and int(
+                getattr(data, "users", 0) or 0
+            ) > 0:
+                raise RuntimeError(f"owned {data_type.lower()} datablock still has users")
             remove(data)
             removed.append(data_name)
         except Exception as exc:
@@ -4249,39 +4789,23 @@ def _cleanup_attempt(outcome: AttemptOutcome, collection) -> Dict[str, Any]:
                 "exception_type": type(exc).__name__,
                 "detail": str(exc),
             }
-    for resource in raster_resources:
-        for registry_name, name_key, owned_key in (
-            ("materials", "material", "material_owned"),
-            ("images", "image", "image_owned"),
-        ):
-            name = resource.get(name_key, "")
-            if not resource.get(owned_key) or not name:
-                continue
-            registry = getattr(bpy.data, registry_name, None)
-            get = getattr(registry, "get", None)
-            remove = getattr(registry, "remove", None)
-            block = get(name) if callable(get) else None
-            if block is None:
-                continue
+    for raw_path, raw_root in tuple(outcome.owned_files or ()):
+        try:
+            path = Path(str(raw_path)).resolve()
+            root = Path(str(raw_root)).resolve()
+            if path == root:
+                raise ValueError
+            path.relative_to(root)
+        except (OSError, TypeError, ValueError):
+            return {
+                "status": "failed",
+                "removed": removed,
+                "detail": "owned file is outside its importer temp root",
+            }
+        if path.exists():
             try:
-                if int(getattr(block, "users", 0) or 0) > 0:
-                    raise RuntimeError(f"owned {registry_name} datablock still has users")
-                if not callable(remove):
-                    raise RuntimeError(f"no {registry_name} datablock remover")
-                remove(block)
-                removed.append(name)
-            except Exception as exc:
-                return {
-                    "status": "failed",
-                    "removed": removed,
-                    "exception_type": type(exc).__name__,
-                    "detail": str(exc),
-                }
-        path = resource.get("path", "")
-        if path and os.path.exists(path):
-            try:
-                os.remove(path)
-                removed.append(path)
+                path.unlink()
+                removed.append(str(path))
             except OSError as exc:
                 return {
                     "status": "failed",
@@ -4308,6 +4832,145 @@ def _append_delivery_record(provenance_opts: Any, record: Dict[str, Any]) -> Non
     records.append(record)
 
 
+def final_entity_expectations_from_evidence(
+    attempt_evidence,
+    entity_ids,
+    representation: str,
+):
+    """Return JSON-safe entity expectations without silently repairing bad maps."""
+
+    evidence = dict(attempt_evidence or {})
+    entity_ids = [str(value) for value in tuple(entity_ids or ())]
+    characters = evidence.get("character_entities")
+    positioned_delivery = bool(
+        evidence.get("character_positioning_preserved") is True
+        or isinstance(characters, (list, tuple))
+    )
+    expectations = []
+    if positioned_delivery:
+        for character in tuple(characters or ()):
+            if not isinstance(character, dict):
+                continue
+            verification = character.get("verification")
+            if not isinstance(verification, dict):
+                verification = {}
+            for entity_id in tuple(character.get("entity_ids") or ()):
+                expectations.append({
+                    "kind": "character",
+                    "entity_id": entity_id,
+                    "text": character.get("text"),
+                    "character_index": character.get("character_index"),
+                    "glyph_id": character.get("glyph_id"),
+                    "physical_glyph_id": character.get("source_ink_glyph_id"),
+                    "source_ink_font_sha256": character.get(
+                        "source_ink_font_sha256"
+                    ),
+                    "zero_ink_identity": verification.get("zero_ink_identity"),
+                    "intended_affine_matrix": character.get(
+                        "intended_affine_matrix"
+                    ),
+                    "expected_world_ink_bounds_m": verification.get(
+                        "expected_world_ink_bounds_m"
+                    ),
+                    "packed_font_sha256": (
+                        verification.get("font_packed_sha256")
+                        or verification.get("packed_font_sha256")
+                    ),
+                    "material_name": verification.get("text_material"),
+                    "expected_rgba": verification.get("expected_text_rgba"),
+                    "extrusion_m": verification.get("extrusion_m"),
+                    "spline_count": verification.get("spline_count"),
+                    "vertex_count": verification.get("vertex_count"),
+                })
+        return expectations
+
+    if len(entity_ids) != 1:
+        return expectations
+    entity_id = entity_ids[0]
+    if representation == "raster":
+        expectations.append({
+            "kind": "raster",
+            "entity_id": entity_id,
+            "source_bbox_pdf": evidence.get("source_bbox_pdf"),
+            "packed_image_sha256": (
+                evidence.get("raster_packed_image_sha256")
+                or evidence.get("raster_clip_sha256")
+            ),
+            "image_datablock": evidence.get("image_datablock"),
+            "material_name": evidence.get("raster_material"),
+            "mesh_state": evidence.get("raster_mesh_state"),
+            "evaluated_world_affine_matrix": evidence.get(
+                "evaluated_world_affine_matrix"
+            ),
+            "expected_dimensions_m": evidence.get("expected_dimensions_m"),
+            "vertex_count": 4,
+        })
+        return expectations
+
+    expectations.append({
+        "kind": "span",
+        "entity_id": entity_id,
+        "text": evidence.get("source_text"),
+        "packed_font_sha256": (
+            evidence.get("font_packed_sha256")
+            or evidence.get("packed_font_sha256")
+        ),
+        "material_name": evidence.get("text_material"),
+        "expected_rgba": evidence.get("expected_text_rgba"),
+        "intended_affine_matrix": evidence.get("intended_affine_matrix"),
+        "evaluated_world_affine_matrix": evidence.get(
+            "evaluated_world_affine_matrix"
+        ),
+        "expected_world_ink_bounds_m": evidence.get(
+            "expected_world_ink_bounds_m"
+        ),
+        "expected_dimensions_m": (
+            evidence.get("evaluated_dimensions_m")
+            or evidence.get("actual_dimensions_m")
+        ),
+        "zero_ink_identity": evidence.get("zero_ink_identity"),
+        "extrusion_m": evidence.get("extrusion_m"),
+        "spline_count": evidence.get("spline_count"),
+        "vertex_count": evidence.get("vertex_count"),
+    })
+    return expectations
+
+
+def _seal_final_entity_expectations(record, delivered_outcome):
+    if not isinstance(delivered_outcome, AttemptOutcome):
+        return None
+    entity_ids = [str(value) for value in tuple(delivered_outcome.entity_ids or ())]
+    if not entity_ids:
+        return None
+    item_id = str(record.get("item_id") or "")
+    manifest = {
+        "schema": "blender_final_entity_expectations_v1",
+        "importer_id": IMPORTER_ID,
+        "item_id": item_id,
+        "page_number": int(record.get("page", 0) or 0),
+        "source_span_id": int(record.get("source_span_id", 0) or 0),
+        "requested_representation": str(
+            record.get("requested_representation") or ""
+        ),
+        "delivered_representation": str(record.get("final_representation") or ""),
+        "entity_ids": entity_ids,
+        "expectations": final_entity_expectations_from_evidence(
+            delivered_outcome.evidence,
+            entity_ids,
+            str(record.get("final_representation") or ""),
+        ),
+    }
+    payload = json.dumps(
+        manifest,
+        allow_nan=False,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    digest = sha256(payload.encode("utf-8")).hexdigest()
+    return FinalEntityExpectationAuthority(item_id, payload, digest)
+
+
 def _positioned_zero_ink_source_manifest(
     text_item: NormalizedText,
     *,
@@ -4325,21 +4988,13 @@ def _positioned_zero_ink_source_manifest(
     for index, layout in enumerate(layouts):
         glyph_id = getattr(layout, "glyph_id", None)
         child = _character_text_item(text_item, layout)
-        source_text = str(getattr(layout, "text", "") or "")
-        source_ink = _positioned_source_ink_evidence(
-            child,
-            require_exact_glyph=(
-                text_is_unicode_whitespace(source_text)
-                or text_is_unicode_default_ignorable(source_text)
-            ),
-        )
+        source_ink = _positioned_source_ink_evidence(child)
         zero_ink_character = bool(source_ink["zero_ink_identity"])
-        visible_zero_advance_character = bool(
-            not zero_ink_character
-            and float(layout.advance_width) == 0.0
-            and glyph_id is not None
+        exact_source_glyph = bool(
+            source_ink.get("source_ink_glyph_id") is not None
+            and source_ink.get("source_ink_font_sha256")
         )
-        if zero_ink_character or visible_zero_advance_character:
+        if exact_source_glyph:
             metrics = _positioned_font_axis_metrics_values(
                 child,
                 size=float(child.font_size) * MM_TO_M,
@@ -4481,6 +5136,13 @@ def _attempt_positioned_native_characters(
                 and isinstance(manifest_characters[index], dict)
             ):
                 manifest_character = manifest_characters[index]
+        intended_affine_matrix = _finite_matrix_values(
+            manifest_character.get("intended_affine_matrix")
+        )
+        if intended_affine_matrix is None:
+            intended_affine_matrix = _finite_matrix_values(
+                verification.get("intended_affine_matrix")
+            )
         character_manifest = None
         character_manifest_sha256 = ""
         if verification.get("zero_ink_identity") is True:
@@ -4527,9 +5189,7 @@ def _attempt_positioned_native_characters(
             "source_quad_pdf": [list(point) for point in layout.source_quad_pdf],
             "target_origin_model": list(layout.target_origin),
             "target_quad_model": [list(point) for point in layout.target_quad],
-            "intended_affine_matrix": list(
-                manifest_character.get("intended_affine_matrix", ())
-            ),
+            "intended_affine_matrix": intended_affine_matrix,
             "source_ink_classification": manifest_character.get(
                 "source_ink_classification"
             ),
@@ -4587,6 +5247,11 @@ def _attempt_positioned_native_characters(
             owned_datablocks=tuple(
                 data for candidate in outcomes for data in candidate.owned_datablocks
             ),
+            owned_files=tuple(
+                owned_file
+                for candidate in outcomes
+                for owned_file in candidate.owned_files
+            ),
         )
 
     for index, layout in enumerate(layouts):
@@ -4616,7 +5281,7 @@ def _attempt_positioned_native_characters(
             evidence={"item_id": item_id},
             owned_artifacts=_owned_artifacts_for_text_entity(obj, data),
             owned_objects=_owned_objects_for_text_entity(obj),
-            owned_datablocks=(data,),
+            owned_datablocks=_owned_datablocks_for_text_entity(obj, data),
         )
         candidates.append((index, layout, child, obj))
         ownership_outcomes.append(pending)
@@ -4651,12 +5316,28 @@ def _attempt_positioned_native_characters(
     outcomes = list(ownership_outcomes)
     character_evidence = []
     for position, (index, layout, child, obj) in enumerate(candidates):
-        outcome = _verify_font_candidate(
-            obj,
-            child,
-            delivered=delivered,
-            item_id=item_id,
-        )
+        try:
+            outcome = _verify_font_candidate(
+                obj,
+                child,
+                delivered=delivered,
+                item_id=item_id,
+            )
+        except Exception as exc:
+            failed = AttemptOutcome.failed(
+                "positioned_native_verification_raised",
+                evidence={
+                    "item_id": item_id,
+                    "exception_type": type(exc).__name__,
+                    "detail": str(exc),
+                },
+            )
+            return aggregate_failure(
+                failed,
+                index,
+                tuple(outcomes),
+                character_evidence,
+            )
         outcomes[position] = outcome
         character_evidence.append(character_record(index, layout, child, outcome))
         if outcome.status != "delivered":
@@ -4670,6 +5351,14 @@ def _attempt_positioned_native_characters(
             outcome.entity["pdf_source_char_index"] = index
             outcome.entity["pdf_source_glyph_id"] = (
                 int(layout.glyph_id) if layout.glyph_id is not None else -1
+            )
+            physical_glyph_id = character_evidence[-1].get(
+                "source_ink_glyph_id"
+            )
+            outcome.entity["pdf_physical_glyph_id"] = (
+                int(physical_glyph_id)
+                if physical_glyph_id is not None
+                else -1
             )
         except (AttributeError, ReferenceError, TypeError, ValueError):
             pass
@@ -4719,6 +5408,9 @@ def _attempt_positioned_native_characters(
         ),
         owned_datablocks=tuple(
             data for outcome in outcomes for data in outcome.owned_datablocks
+        ),
+        owned_files=tuple(
+            owned_file for outcome in outcomes for owned_file in outcome.owned_files
         ),
     )
 
@@ -4920,6 +5612,13 @@ def _attempt_positioned_converted_characters(
                 and isinstance(manifest_characters[candidate["index"]], dict)
             ):
                 manifest_character = manifest_characters[candidate["index"]]
+        intended_affine_matrix = _finite_matrix_values(
+            manifest_character.get("intended_affine_matrix")
+        )
+        if intended_affine_matrix is None:
+            intended_affine_matrix = _finite_matrix_values(
+                verification.get("intended_affine_matrix")
+            )
         character_manifest = None
         character_manifest_sha256 = ""
         if verification.get("zero_ink_identity") is True:
@@ -4968,9 +5667,7 @@ def _attempt_positioned_converted_characters(
             "source_quad_pdf": [list(point) for point in layout.source_quad_pdf],
             "target_origin_model": list(layout.target_origin),
             "target_quad_model": [list(point) for point in layout.target_quad],
-            "intended_affine_matrix": list(
-                manifest_character.get("intended_affine_matrix", ())
-            ),
+            "intended_affine_matrix": intended_affine_matrix,
             "source_ink_classification": manifest_character.get(
                 "source_ink_classification"
             ),
@@ -5015,10 +5712,9 @@ def _attempt_positioned_converted_characters(
             for value in _owned_objects_for_text_entity(obj):
                 if all(value is not existing for existing in objects):
                     objects.append(value)
-            if _valid_owned_ref(data) and all(
-                data is not existing for existing in datablocks
-            ):
-                datablocks.append(data)
+            for value in _owned_datablocks_for_text_entity(obj, data):
+                if all(value is not existing for existing in datablocks):
+                    datablocks.append(value)
 
         for candidate in candidates:
             add_entity(candidate.get("source"), candidate.get("source_data"))
@@ -5149,16 +5845,33 @@ def _attempt_positioned_converted_characters(
                     candidate["final"], candidate["final_data"]
                 ),
                 owned_objects=_owned_objects_for_text_entity(candidate["final"]),
-                owned_datablocks=(candidate["final_data"],),
+                owned_datablocks=_owned_datablocks_for_text_entity(
+                    candidate["final"], candidate["final_data"]
+                ),
             )
             source_records.append(character_record(candidate, exact_outcome))
             continue
-        source_outcome = _verify_font_candidate(
-            candidate["source"],
-            candidate["child"],
-            delivered="text",
-            item_id=item_id,
-        )
+        try:
+            source_outcome = _verify_font_candidate(
+                candidate["source"],
+                candidate["child"],
+                delivered="text",
+                item_id=item_id,
+            )
+        except Exception as exc:
+            failure = AttemptOutcome.failed(
+                "positioned_conversion_source_verification_raised",
+                evidence={
+                    "item_id": item_id,
+                    "exception_type": type(exc).__name__,
+                    "detail": str(exc),
+                },
+            )
+            return aggregate_failure(
+                failure,
+                candidate["index"],
+                source_records,
+            )
         if source_outcome.status != "delivered":
             source_records.append(character_record(candidate, source_outcome))
             return aggregate_failure(
@@ -5317,13 +6030,28 @@ def _attempt_positioned_converted_characters(
             )
             character_evidence.append(character_record(candidate, zero_ink_outcome))
             continue
-        verification_failure, verification_evidence = _verify_converted_candidate(
-            candidate["final"],
-            candidate["final_data"],
-            candidate["child"],
-            expected_type=expected_type,
-            item_id=item_id,
-        )
+        try:
+            verification_failure, verification_evidence = _verify_converted_candidate(
+                candidate["final"],
+                candidate["final_data"],
+                candidate["child"],
+                expected_type=expected_type,
+                item_id=item_id,
+            )
+        except Exception as exc:
+            failure = AttemptOutcome.failed(
+                "positioned_conversion_final_verification_raised",
+                evidence={
+                    "item_id": item_id,
+                    "exception_type": type(exc).__name__,
+                    "detail": str(exc),
+                },
+            )
+            return aggregate_failure(
+                failure,
+                candidate["index"],
+                character_evidence,
+            )
         if verification_failure is not None:
             character_evidence.append(
                 character_record(candidate, verification_failure)
@@ -5352,7 +6080,9 @@ def _attempt_positioned_converted_characters(
                 candidate["final"], candidate["final_data"]
             ),
             owned_objects=_owned_objects_for_text_entity(candidate["final"]),
-            owned_datablocks=(candidate["final_data"],),
+            owned_datablocks=_owned_datablocks_for_text_entity(
+                candidate["final"], candidate["final_data"]
+            ),
         )
         outcomes.append(outcome)
         character_evidence.append(character_record(candidate, outcome))
@@ -5361,6 +6091,14 @@ def _attempt_positioned_converted_characters(
             glyph_id = getattr(candidate["layout"], "glyph_id", None)
             outcome.entity["pdf_source_glyph_id"] = (
                 int(glyph_id) if glyph_id is not None else -1
+            )
+            physical_glyph_id = character_evidence[-1].get(
+                "source_ink_glyph_id"
+            )
+            outcome.entity["pdf_physical_glyph_id"] = (
+                int(physical_glyph_id)
+                if physical_glyph_id is not None
+                else -1
             )
         except (AttributeError, ReferenceError, TypeError, ValueError):
             pass
@@ -5481,6 +6219,8 @@ def _attempt_positioned_characters(
     source_manifest=None,
     source_manifest_sha256="",
     baseline_alignment=None,
+    baseline_capability_absent=False,
+    baseline_probe_failure=None,
 ):
     layouts = tuple(getattr(text_item, "source_char_layout", ()) or ())
     if not layouts:
@@ -5498,11 +6238,101 @@ def _attempt_positioned_characters(
                 "layout_text": reconstructed,
             },
         )
+    if baseline_probe_failure is not None:
+        return AttemptOutcome.failed(
+            "positioned_baseline_capability_probe_failed_not_impossibility_proof",
+            evidence={
+                **_proof_identity(item_id, page_number, int(text_item.id)),
+                "exception_type": type(baseline_probe_failure).__name__,
+                "detail": str(baseline_probe_failure),
+            },
+        )
+    if baseline_capability_absent:
+        return AttemptOutcome.impossible(
+            "positioned_font_baseline_alignment_unavailable_for_item",
+            evidence={
+                **_host_capability_evidence(
+                    item_id,
+                    page_number,
+                    int(text_item.id),
+                    "FONT.align_y.BOTTOM_BASELINE_or_BOTTOM",
+                ),
+                "supported_baseline_alignments": [],
+            },
+        )
     if baseline_alignment not in {"BOTTOM_BASELINE", "BOTTOM"}:
         return AttemptOutcome.failed(
             "positioned_baseline_alignment_unavailable_not_impossibility_proof",
             evidence={"item_id": item_id},
         )
+    asset = getattr(text_item, "font_asset", None)
+    if asset is not None:
+        font_bytes = bytes(getattr(asset, "usable_bytes", b"") or b"")
+        expected_sha256 = str(getattr(asset, "usable_sha256", "") or "")
+        asset_page = getattr(asset, "page_number", None)
+        asset_span_font = str(getattr(asset, "span_font_name", "") or "")
+        expected_span_font = str(getattr(text_item, "font_name", "") or "")
+        try:
+            authenticated_asset = bool(
+                len(expected_sha256) == 64
+                and font_bytes
+                and sha256(font_bytes).hexdigest() == expected_sha256
+                and int(asset_page) == int(page_number)
+                and asset_span_font == expected_span_font
+            )
+        except (TypeError, ValueError):
+            authenticated_asset = False
+        if authenticated_asset:
+            for index, layout in enumerate(layouts):
+                source_trace_glyph_id = getattr(layout, "glyph_id", None)
+                child = _character_text_item(text_item, layout)
+                source_ink = _positioned_source_ink_evidence(child)
+                source_glyph_id = source_ink.get("source_ink_glyph_id")
+                if (
+                    not isinstance(source_glyph_id, int)
+                    or isinstance(source_glyph_id, bool)
+                    or source_glyph_id < 0
+                ):
+                    continue
+                try:
+                    _positioned_font_axis_metrics_values(
+                        child,
+                        size=float(child.font_size) * MM_TO_M,
+                        baseline_alignment=baseline_alignment,
+                    )
+                except RuntimeError as exc:
+                    return AttemptOutcome.impossible(
+                        "exact_positioned_font_metrics_unavailable_for_item",
+                        evidence={
+                            **_proof_identity(
+                                item_id,
+                                page_number,
+                                int(text_item.id),
+                            ),
+                            "proof_category": (
+                                "authenticated_source_metric_validation_failed"
+                            ),
+                            "character_index": index,
+                            "source_character_text": str(layout.text),
+                            "source_glyph_id": source_glyph_id,
+                            "source_trace_glyph_id": source_trace_glyph_id,
+                            "source_glyph_identity": source_ink.get(
+                                "source_ink_glyph_identity"
+                            ),
+                            "source_ink_code_point": source_ink.get(
+                                "source_ink_code_point"
+                            ),
+                            "source_ink_mapping_sha256": source_ink.get(
+                                "source_ink_mapping_sha256"
+                            ),
+                            "source_font_sha256": expected_sha256,
+                            "font_name": expected_span_font,
+                            "font_asset_page_number": int(asset_page),
+                            "font_asset_span_font_name": asset_span_font,
+                            "error_type": type(exc).__name__,
+                            "detail": str(exc),
+                        },
+                    )
     if delivered in {"text", "3d_text"}:
         return _attempt_positioned_native_characters(
             text_item,
@@ -5573,13 +6403,19 @@ def build_text(
         getattr(text_item, "requires_individual_positioning", False)
     )
     baseline_alignment = None
+    baseline_capability_absent = False
+    baseline_probe_failure = None
     if positioned_text:
         if _positioned_item_uses_only_exact_contours(text_item, requested):
             baseline_alignment = "BOTTOM_BASELINE"
         else:
             try:
                 baseline_alignment = _probe_positioned_baseline_alignment()
-            except (AttributeError, RuntimeError, TypeError, ValueError):
+            except _PositionedBaselineCapabilityAbsent:
+                baseline_capability_absent = True
+                baseline_alignment = None
+            except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+                baseline_probe_failure = exc
                 baseline_alignment = None
     zero_ink_source_manifest = None
     zero_ink_source_manifest_sha256 = ""
@@ -5597,7 +6433,14 @@ def build_text(
                 zero_ink_source_manifest,
                 zero_ink_source_manifest_sha256,
             ) = freeze_zero_ink_source_manifest(raw_manifest)
-        except (AttributeError, IndexError, TypeError, ValueError, OverflowError):
+        except (
+            AttributeError,
+            IndexError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+            OverflowError,
+        ):
             zero_ink_source_manifest = None
             zero_ink_source_manifest_sha256 = ""
 
@@ -5608,6 +6451,22 @@ def build_text(
             representation in {"text", "3d_text", "glyphs", "geometry"}
             and positioned_text
         ):
+            attempt_baseline_alignment = baseline_alignment
+            attempt_baseline_capability_absent = baseline_capability_absent
+            attempt_baseline_probe_failure = baseline_probe_failure
+            if (
+                representation in {"glyphs", "geometry"}
+                and _positioned_item_uses_only_exact_contours(
+                    text_item,
+                    representation,
+                )
+            ):
+                # Exact embedded contours do not instantiate or evaluate a
+                # host FONT.  Baseline capability is therefore a per-rung
+                # requirement, not a global roadblock inherited from Text.
+                attempt_baseline_alignment = "BOTTOM_BASELINE"
+                attempt_baseline_capability_absent = False
+                attempt_baseline_probe_failure = None
             return _attempt_positioned_characters(
                 text_item,
                 collection,
@@ -5619,7 +6478,9 @@ def build_text(
                 z_offset_m=z_offset_m,
                 source_manifest=zero_ink_source_manifest,
                 source_manifest_sha256=zero_ink_source_manifest_sha256,
-                baseline_alignment=baseline_alignment,
+                baseline_alignment=attempt_baseline_alignment,
+                baseline_capability_absent=attempt_baseline_capability_absent,
+                baseline_probe_failure=attempt_baseline_probe_failure,
             )
         if representation in {"text", "3d_text"}:
             return _attempt_native_font(
@@ -5671,6 +6532,7 @@ def build_text(
         cleanup=lambda outcome: _cleanup_attempt(outcome, collection),
     )
     delivered_outcome = record.pop("_delivered_outcome", None)
+    cleanup_failure_outcome = record.pop("_cleanup_failure_outcome", None)
     zero_ink_delivery_manifest = record.pop(
         "_zero_ink_delivery_manifest",
         None,
@@ -5679,6 +6541,42 @@ def build_text(
         "_zero_ink_reconciliation_authority",
         None,
     )
+    final_entity_expectation_authority = None
+    if provenance_opts is not None and isinstance(
+        cleanup_failure_outcome,
+        AttemptOutcome,
+    ):
+        cleanup_outcomes = getattr(provenance_opts, "_text_cleanup_outcomes", None)
+        if not isinstance(cleanup_outcomes, dict):
+            cleanup_outcomes = {}
+            provenance_opts._text_cleanup_outcomes = cleanup_outcomes  # noqa: B010
+        cleanup_outcomes[item_id] = cleanup_failure_outcome
+    if provenance_opts is not None and record.get("status") == "delivered":
+        try:
+            final_entity_expectation_authority = _seal_final_entity_expectations(
+                record,
+                delivered_outcome,
+            )
+        except (TypeError, ValueError, OverflowError):
+            final_entity_expectation_authority = None
+        if isinstance(
+            final_entity_expectation_authority,
+            FinalEntityExpectationAuthority,
+        ):
+            authorities = getattr(
+                provenance_opts,
+                "_final_entity_expectation_authorities",
+                None,
+            )
+            if not isinstance(authorities, dict):
+                authorities = {}
+                provenance_opts._final_entity_expectation_authorities = (  # noqa: B010
+                    authorities
+                )
+            authorities[item_id] = final_entity_expectation_authority
+            record["final_entity_expectation_sha256"] = (
+                final_entity_expectation_authority.manifest_sha256
+            )
     _append_delivery_record(provenance_opts, record)
     zero_ink_delivery = (
         obj is None

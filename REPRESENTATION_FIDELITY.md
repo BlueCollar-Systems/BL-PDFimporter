@@ -44,27 +44,39 @@ program; it never substitutes a font by name.
 | Delivered representation | Required verified Blender result |
 |---|---|
 | Labels | A persistent, renderable, model-scaled native label with verified source transform. Blender currently cannot satisfy this oracle, so the capability attempt is recorded as impossible per item. |
-| Text | `Object.type == "FONT"`, exact body including edge whitespace, exact source font asset/hash, zero extrusion, source page/item identity, and verified anchor, rotation, width, and height. |
+| Text | `Object.type == "FONT"`, exact body including edge whitespace, exact source font asset/hash, zero extrusion, source page/item identity, verified anchor/rotation/width/height, exact attempt-owned material assignment, expected RGBA and shader Alpha, and an exact BSDF-to-active-Surface socket link. |
 | 3D Text | The Text oracle plus positive extrusion. |
-| Glyphs | The exact-font Text candidate first passes its oracle; conversion then yields a nonempty real `CURVE`, preserves exact source-text metadata, and independently re-verifies anchor, rotation, width, and height. |
-| Geometry | The exact-font Text candidate first passes its oracle; conversion then yields a nonempty real `MESH`, preserves exact source-text metadata, and independently re-verifies anchor, rotation, width, and height. |
-| Raster | The exact source span bbox renders nonempty pixels to a nonempty file; a real `MESH` image plane has stable item identity and the target bbox placement/dimensions. |
+| Glyphs | The exact-font Text candidate first passes its oracle; conversion then yields a nonempty real `CURVE`, preserves exact source-text metadata, and independently re-verifies anchor, rotation, width, and height. A visible zero-advance glyph may instead use its authenticated embedded outline directly, without requiring a host `FONT` baseline capability. |
+| Geometry | The exact-font Text candidate first passes its oracle; conversion then yields a nonempty real `MESH`, preserves exact source-text metadata, and independently re-verifies anchor, rotation, width, and height. A visible zero-advance glyph may instead use its authenticated embedded outline directly, without requiring a host `FONT` baseline capability. |
+| Raster | The exact source span bbox renders nonempty pixels to a nonempty file; a real `MESH` image plane has stable item identity and the target bbox placement/dimensions. Its packed image is assigned through exact Color-to-Base-Color, Alpha-to-Alpha, and BSDF-to-active-Surface socket links. |
 
-Whitespace-only source spans legitimately have no visible geometry. Text and
-3D Text still verify the exact editable body and transform without inventing
-visible characters. Structural conversions with no real splines/vertices do
-not fabricate delivery.
+The material, packed asset, physical entity, and exact socket truth are checked
+again after the acceptance `.blend` is saved and reopened. This is a per-entity
+oracle, not a representative sample per font: every physical text entity must
+retain its evaluated geometry fingerprint, world ink bounds, and affine; Glyphs
+must also retain exact editable spline/control-point state, and Geometry must
+retain exact editable vertices/connectivity/faces. Unicode whitespace or
+default-ignorable properties are never physical-ink authority. A logical
+zero-ink delivery is allowed only when exact source-glyph evidence proves that every
+mapped glyph has zero contours. Text and 3D Text still verify the exact
+editable body and transform without inventing visible characters. Structural
+conversions with no real splines/vertices do not fabricate delivery.
 
 ## Rollback ownership
 
-Every attempt records only objects and datablocks it created. Failed attempts
-unlink and remove those exact objects and their `CURVE`/`MESH` datablocks;
-conversion also removes its superseded temporary `FONT` candidate. A raster
-attempt owns its item clip, plane, and mesh: failed plane or metadata creation
-removes the owned scene artifacts and clip. Image/material/font caches are
-content-addressed or explicitly shared and are never deleted as though they
-belonged to one item. Pre-existing or unattributed user entities are never
-cleanup targets. The next rung cannot start when rollback is incomplete.
+Every attempt records only objects, datablocks, and files it created. Exact
+object/datablock references and file paths are frozen at creation time; cleanup
+never resolves a target again from mutable object metadata or a mutable name.
+Failed attempts unlink and remove those exact objects and their owned
+`FONT`/`CURVE`/`MESH`, material, and image datablocks. Conversion also removes
+its superseded temporary `FONT` candidate. A raster attempt owns its item clip,
+plane, mesh, material, and packed image only when it created them. An owned file
+can be deleted only when its frozen absolute path is contained by its frozen
+importer-owned temporary root. Shared, pre-existing, or unattributed user
+entities are never cleanup targets. Every post-mutation exception retains this
+ownership ledger. A failed item immediately loses all live-delivery and sealed
+reconciliation authority; incomplete cleanup retains exact references only in
+the remediation ledger. The next rung cannot start when rollback is incomplete.
 
 ## Loud reporting
 
@@ -95,7 +107,9 @@ erases a structural text request.
   structural-text orthogonality, report payloads, and raster rollback.
 - `tools/headless_text_representation_acceptance.py` proves the representations
   in real Blender against `Welding-Symbol-Chart.pdf` and
-  `AWSWeldSymbolchart.pdf`.
+  `AWSWeldSymbolchart.pdf`; the latter exercises the actual `import_pdf` raster-page path
+  with images enabled and verifies its packed plane after
+  save/reopen.
 
 All required paths are local and free to the user. No paid service or paid
 dependency is a required representation or fallback.

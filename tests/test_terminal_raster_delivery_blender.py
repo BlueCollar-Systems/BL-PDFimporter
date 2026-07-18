@@ -396,9 +396,12 @@ def test_item_terminal_raster_metadata_failure_cleans_created_plane(monkeypatch,
     monkeypatch.setattr(
         bl_import_engine,
         "_remove_created_image_plane",
-        lambda obj, collection: cleanup_calls.append((obj, collection)) or {
+        lambda ownership, collection: cleanup_calls.append((ownership, collection)) or {
             "status": "complete",
-            "removed": [obj.name, obj.data.name],
+            "removed": [
+                ownership["object_name"],
+                ownership["mesh_name"],
+            ],
         },
     )
     collection = object()
@@ -414,7 +417,10 @@ def test_item_terminal_raster_metadata_failure_cleans_created_plane(monkeypatch,
     )
 
     assert actual is None
-    assert cleanup_calls == [(plane, collection)]
+    assert len(cleanup_calls) == 1
+    assert cleanup_calls[0][0]["object"] is plane
+    assert cleanup_calls[0][0]["mesh"] is plane.data
+    assert cleanup_calls[0][1] is collection
     assert list(tmp_path.glob("*.png")) == []
 
 
@@ -726,7 +732,10 @@ def test_remove_created_image_plane_removes_all_owned_datablocks(monkeypatch):
     )
     monkeypatch.setattr(bl_import_engine, "bpy", fake_bpy)
 
-    cleanup = bl_import_engine._remove_created_image_plane(obj, collection)
+    ownership = bl_import_engine._freeze_created_image_plane_ownership(obj)
+    obj["pdf_image_material"] = "user-material"
+    obj["pdf_image_datablock"] = "user-image"
+    cleanup = bl_import_engine._remove_created_image_plane(ownership, collection)
 
     assert cleanup["status"] == "complete"
     assert objects.removed == [obj.name]
@@ -1168,7 +1177,8 @@ def test_post_stack_cleanup_exception_stays_reportable_and_preserves_orphan_id(
     assert failures[0]["cleanup"]["exception_type"] == "RuntimeError"
     assert record["status"] == "failed"
     assert record["entity_ids"] == [obj.name]
-    assert opts._text_delivery_outcomes[item_id] is not None
+    assert item_id not in opts._text_delivery_outcomes
+    assert opts._text_cleanup_outcomes[item_id] is not None
     assert opts._text_delivered_entity_counts["native_text"] == 0
 
 

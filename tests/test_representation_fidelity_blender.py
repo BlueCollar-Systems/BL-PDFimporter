@@ -136,9 +136,20 @@ class _MeshData:
         self.base_dimensions = base_dimensions
 
 
+class _UVLoop:
+    def __init__(self, uv):
+        self.uv = list(uv)
+
+
 class _UVLayer:
     def __init__(self):
-        self.data = [object(), object(), object(), object()]
+        self.name = "UVMap"
+        self.data = [
+            _UVLoop((0.0, 0.0)),
+            _UVLoop((1.0, 0.0)),
+            _UVLoop((1.0, 1.0)),
+            _UVLoop((0.0, 1.0)),
+        ]
 
 
 class _UVLayers:
@@ -150,8 +161,10 @@ class _UVLayers:
 
 
 class _Socket:
-    def __init__(self, node):
+    def __init__(self, node, name):
         self.node = node
+        self.name = name
+        self.identifier = name
         self.default_value = None
 
 
@@ -164,14 +177,12 @@ class _Node:
         }.get(node_type, node_type)
         self.image = image
         self.inputs = {
-            "Base Color": _Socket(self),
-            "Alpha": _Socket(self),
-            "Surface": _Socket(self),
+            name: _Socket(self, name)
+            for name in ("Base Color", "Alpha", "Surface", "Metallic")
         }
         self.outputs = {
-            "Color": _Socket(self),
-            "Alpha": _Socket(self),
-            "BSDF": _Socket(self),
+            name: _Socket(self, name)
+            for name in ("Color", "Alpha", "BSDF")
         }
 
 
@@ -183,14 +194,16 @@ class _Nodes(list):
 
 
 class _Link:
-    def __init__(self, from_node, to_node):
+    def __init__(self, from_node, to_node, from_socket=None, to_socket=None):
         self.from_node = from_node
         self.to_node = to_node
+        self.from_socket = from_socket
+        self.to_socket = to_socket
 
 
 class _Links(list):
     def new(self, source, target):
-        self.append(_Link(source.node, target.node))
+        self.append(_Link(source.node, target.node, source, target))
 
 
 class _Material:
@@ -207,7 +220,28 @@ class _Material:
             output = _Node("OUTPUT_MATERIAL")
             nodes.extend((texture, shader, output))
             if valid_links:
-                links.extend((_Link(texture, shader), _Link(shader, output)))
+                links.extend(
+                    (
+                        _Link(
+                            texture,
+                            shader,
+                            texture.outputs["Color"],
+                            shader.inputs["Base Color"],
+                        ),
+                        _Link(
+                            texture,
+                            shader,
+                            texture.outputs["Alpha"],
+                            shader.inputs["Alpha"],
+                        ),
+                        _Link(
+                            shader,
+                            output,
+                            shader.outputs["BSDF"],
+                            output.inputs["Surface"],
+                        ),
+                    )
+                )
         self.node_tree = types.SimpleNamespace(nodes=nodes, links=links)
 
 
@@ -273,6 +307,39 @@ class _Object(dict):
 
     def to_curve_clear(self):
         return None
+
+
+def _object_trs_matrix_values(obj):
+    angle = float(obj.rotation_euler[2])
+    cosine = math.cos(angle)
+    sine = math.sin(angle)
+    scale_x, scale_y, scale_z = (float(value) for value in obj.scale)
+    location_x, location_y, location_z = (float(value) for value in obj.location)
+    return [
+        cosine * scale_x,
+        -sine * scale_y,
+        0.0,
+        location_x,
+        sine * scale_x,
+        cosine * scale_y,
+        0.0,
+        location_y,
+        0.0,
+        0.0,
+        scale_z,
+        location_z,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+    ]
+
+
+def _transform_local_xy(matrix, point):
+    return [
+        matrix[0] * float(point[0]) + matrix[1] * float(point[1]) + matrix[3],
+        matrix[4] * float(point[0]) + matrix[5] * float(point[1]) + matrix[7],
+    ]
 
 
 class _AffineMatrix(tuple):
@@ -453,6 +520,7 @@ class _FakeBpy:
         baseline_available=True,
     ):
         self.view_update_count = 0
+        self._bc_pdf_vector_importer_test_host = True
 
         def update_view_layer():
             self.view_update_count += 1
@@ -711,7 +779,7 @@ def _character_layout():
     return (
         TextCharLayout(
             text="A",
-            glyph_id=37,
+            glyph_id=1,
             source_origin_pdf=(10.0, 20.0),
             source_bbox_pdf=(10.0, 10.0, 16.0, 22.0),
             source_quad_pdf=((10.0, 10.0), (16.0, 10.0), (16.0, 22.0), (10.0, 22.0)),
@@ -722,7 +790,7 @@ def _character_layout():
         ),
         TextCharLayout(
             text="B",
-            glyph_id=91,
+            glyph_id=1,
             source_origin_pdf=(18.0, 20.0),
             source_bbox_pdf=(18.0, 10.0, 24.0, 22.0),
             source_quad_pdf=((18.0, 10.0), (24.0, 10.0), (24.0, 22.0), (18.0, 22.0)),
@@ -738,7 +806,7 @@ def _mixed_zero_ink_character_layout():
     return (
         TextCharLayout(
             text="A",
-            glyph_id=37,
+            glyph_id=1,
             source_origin_pdf=(10.0, 20.0),
             source_bbox_pdf=(10.0, 10.0, 16.0, 22.0),
             source_quad_pdf=((10.0, 10.0), (16.0, 10.0), (16.0, 22.0), (10.0, 22.0)),
@@ -760,7 +828,7 @@ def _mixed_zero_ink_character_layout():
         ),
         TextCharLayout(
             text="B",
-            glyph_id=91,
+            glyph_id=1,
             source_origin_pdf=(19.0, 20.0),
             source_bbox_pdf=(19.0, 10.0, 25.0, 22.0),
             source_quad_pdf=((19.0, 10.0), (25.0, 10.0), (25.0, 22.0), (19.0, 22.0)),
@@ -839,6 +907,7 @@ def _install_positioned_empty_conversion_host(
         return not text.strip() or text in expected_zero_ink_texts
 
     def apply_metric_identity(obj, text_item, *_args, **_kwargs):
+        source_metrics = None
         try:
             zero_ink = bool(
                 bl_text_builder._positioned_source_ink_evidence(text_item)[
@@ -857,10 +926,9 @@ def _install_positioned_empty_conversion_host(
                 size=float(text_item.font_size) * 0.001,
                 baseline_alignment="BOTTOM_BASELINE",
             )
-            if source_metrics.get("source_ink_evidence") == "exact_source_glyph_empty":
-                local_advance = source_metrics["local_matrix_horizontal_extent"]
-                local_line_height = source_metrics["local_line_height"]
-                local_baseline_y = source_metrics["local_baseline_y"]
+            local_advance = source_metrics["local_matrix_horizontal_extent"]
+            local_line_height = source_metrics["local_line_height"]
+            local_baseline_y = source_metrics["local_baseline_y"]
         except (AttributeError, IndexError, RuntimeError, TypeError, ValueError):
             pass
         matrix = bl_text_builder._metric_character_matrix_values(
@@ -873,6 +941,11 @@ def _install_positioned_empty_conversion_host(
             allow_zero_advance=zero_ink,
         )
         flattened_matrix = [float(value) for row in matrix for value in row]
+        expected_ink_bounds = (
+            bl_text_builder._metric_expected_world_ink_bounds(source_metrics, matrix)
+            if source_metrics is not None and not zero_ink
+            else None
+        )
         obj["pdf_full_affine_applied"] = True
         obj["pdf_metric_affine_applied"] = True
         obj["pdf_affine_matrix"] = flattened_matrix
@@ -885,6 +958,20 @@ def _install_positioned_empty_conversion_host(
             float(text_item.insertion[0]) * 0.001,
             float(text_item.insertion[1]) * 0.001,
         ]
+        obj["pdf_metric_expected_world_ink_bounds_m"] = (
+            list(expected_ink_bounds) if expected_ink_bounds is not None else None
+        )
+        obj._pdf_test_evaluated_matrix_values = list(flattened_matrix)
+        obj._pdf_test_world_ink_points = (
+            []
+            if expected_ink_bounds is None
+            else [
+                [expected_ink_bounds[0], expected_ink_bounds[1]],
+                [expected_ink_bounds[2], expected_ink_bounds[1]],
+                [expected_ink_bounds[2], expected_ink_bounds[3]],
+                [expected_ink_bounds[0], expected_ink_bounds[3]],
+            ]
+        )
         return None
 
     def verify_metric_identity(obj, text_item):
@@ -909,6 +996,9 @@ def _install_positioned_empty_conversion_host(
                 ),
                 "intended_affine_matrix": matrix,
                 "evaluated_affine_matrix": list(matrix),
+                "expected_world_ink_bounds_m": obj.get(
+                    "pdf_metric_expected_world_ink_bounds_m"
+                ),
             },
         )
 
@@ -934,6 +1024,16 @@ def _install_positioned_empty_conversion_host(
         return curve
 
     original_to_mesh = fake.data.meshes.new_from_object
+    original_copy_object_transform = bl_text_builder._copy_object_transform
+
+    def copy_object_transform_with_test_measurements(source, target):
+        original_copy_object_transform(source, target)
+        target._pdf_test_evaluated_matrix_values = list(
+            source._pdf_test_evaluated_matrix_values
+        )
+        target._pdf_test_world_ink_points = copy.deepcopy(
+            source._pdf_test_world_ink_points
+        )
 
     def to_mesh_with_expected_empty_ink(evaluated, depsgraph=None):
         mesh = original_to_mesh(evaluated, depsgraph=depsgraph)
@@ -946,6 +1046,11 @@ def _install_positioned_empty_conversion_host(
         return mesh
 
     monkeypatch.setattr(bl_text_builder, "_apply_target_quad_affine", apply_metric_identity)
+    monkeypatch.setattr(
+        bl_text_builder,
+        "_copy_object_transform",
+        copy_object_transform_with_test_measurements,
+    )
     monkeypatch.setattr(
         bl_text_builder,
         "_verify_transform_and_dimensions",
@@ -1102,7 +1207,7 @@ def test_character_positioned_3d_text_stays_3d_text_and_records_every_entity(mon
     assert len(record["entity_ids"]) == 2
     assert len(set(record["entity_ids"])) == 2
     evidence = record["attempts"][-1]["evidence"]
-    assert [entry["glyph_id"] for entry in evidence["character_entities"]] == [37, 91]
+    assert [entry["glyph_id"] for entry in evidence["character_entities"]] == [1, 1]
     assert all(entry["positioned_character"] is True for entry in evidence["character_entities"])
     assert evidence["source_xref"] == 7
     assert evidence["source_sha256"] == "123456"
@@ -1360,6 +1465,524 @@ def test_positioned_native_font_preserves_zero_ink_space_through_final_reconcili
     assert record["final_state_verification"]["status"] == "verified"
     assert record["final_state_verification"]["logical_zero_ink_children"] == 1
     assert len(collection.objects.items) == 3
+
+
+def _positioned_mixed_delivery_for_final_state(monkeypatch, mode):
+    fake, collection = _install(monkeypatch)
+    _install_positioned_empty_conversion_host(monkeypatch, fake)
+    opts = types.SimpleNamespace(import_mode="vector", text_mode=mode)
+    item = _item()
+    item.text = "A B"
+    item.normalized = "A B"
+    item.source_char_layout = _mixed_zero_ink_character_layout()
+    item.requires_individual_positioning = True
+    obj = bl_text_builder.build_text(
+        item,
+        collection,
+        page_number=2,
+        text_mode=mode,
+        provenance_opts=opts,
+    )
+    assert obj is not None
+    record = opts._text_delivery_records[-1]
+    objects_by_name = {
+        candidate.name: candidate for candidate in collection.objects.items
+    }
+    fake.data.objects.get = objects_by_name.get
+    monkeypatch.setattr(bl_import_engine, "bpy", fake)
+    return fake, collection, opts, record, objects_by_name
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_type"),
+    [
+        ("text", "FONT"),
+        ("3d_text", "FONT"),
+        ("glyphs", "CURVE"),
+        ("geometry", "MESH"),
+    ],
+)
+def test_post_stack_proof_revalidates_live_representation_and_canonical_parent(
+    monkeypatch,
+    mode,
+    expected_type,
+):
+    _fake, _collection, opts, record, _objects = (
+        _positioned_mixed_delivery_for_final_state(monkeypatch, mode)
+    )
+
+    failures = bl_import_engine._reverify_text_delivery_after_stack(
+        [record],
+        page_number=2,
+        stack_offset_m=0.0,
+        provenance_opts=opts,
+    )
+
+    assert failures == []
+    proof = record["final_state_verification"]
+    assert proof["status"] == "verified"
+    assert proof["canonical_parent_verified"] is True
+    assert proof["provenance_parent_handle_verified"] is True
+    assert proof["entities"]
+    assert {entry["actual_object_type"] for entry in proof["entities"]} == {
+        expected_type
+    }
+    assert all(entry["object_handle_verified"] is True for entry in proof["entities"])
+    assert all(entry["source_item_verified"] is True for entry in proof["entities"])
+    assert all(
+        entry["character_identity_verified"] is True for entry in proof["entities"]
+    )
+    assert all(
+        entry["representation_fields_verified"] is True
+        for entry in proof["entities"]
+    )
+    assert all(entry["affine_verified"] is True for entry in proof["entities"])
+    assert all(
+        entry["physical_ink_continuity_verified"] is True
+        for entry in proof["entities"]
+    )
+
+
+def test_post_stack_proof_accepts_blender_idproperty_float_quantization(monkeypatch):
+    _fake, _collection, opts, record, objects = (
+        _positioned_mixed_delivery_for_final_state(monkeypatch, "3d_text")
+    )
+    entity = objects[record["entity_ids"][0]]
+    entity["pdf_affine_matrix"][0] -= 2.3e-8
+    entity["pdf_affine_matrix"][5] -= 2.3e-8
+
+    assert bl_import_engine._reverify_text_delivery_after_stack(
+        [record],
+        page_number=2,
+        stack_offset_m=0.0,
+        provenance_opts=opts,
+    ) == []
+    proof = record["final_state_verification"]["entities"][0]
+    assert proof["affine_verified"] is True
+
+
+@pytest.mark.parametrize(
+    ("corruption", "expected_failure"),
+    [
+        ("rename", "final_entity_handle_mismatch"),
+        ("wrong_body", "final_entity_body_mismatch"),
+        ("wrong_font", "final_entity_font_digest_mismatch"),
+        ("wrong_gid", "final_entity_character_glyph_mismatch"),
+        ("wrong_source_item", "final_entity_source_item_mismatch"),
+        ("wrong_representation", "final_entity_representation_mismatch"),
+        ("wrong_affine", "final_entity_affine_metadata_mismatch"),
+        ("wrong_ink", "final_entity_physical_ink_mismatch"),
+        ("missing_live_affine", "final_entity_affine_unverifiable"),
+        ("unmeasured_live_ink", "final_entity_physical_ink_unverifiable"),
+        ("replayed_object", "final_entity_runtime_parent_mismatch"),
+        ("wrong_runtime_parent", "final_entity_runtime_parent_mismatch"),
+        ("wrong_provenance_parent", "source_provenance_parent_handle_mismatch"),
+    ],
+)
+def test_post_stack_proof_rejects_live_entity_replay_and_representation_tamper(
+    monkeypatch,
+    corruption,
+    expected_failure,
+):
+    _fake, collection, opts, record, objects_by_name = (
+        _positioned_mixed_delivery_for_final_state(monkeypatch, "3d_text")
+    )
+    first_id = record["entity_ids"][0]
+    first = objects_by_name[first_id]
+    zero_id = record["entity_ids"][1]
+    zero_entity = objects_by_name[zero_id]
+    if corruption == "rename":
+        first.name = f"{first.name}_renamed"
+    elif corruption == "wrong_body":
+        first.data.body = "replayed"
+    elif corruption == "wrong_font":
+        first.data.font.packed_file.data = b"wrong-font-bytes"
+    elif corruption == "wrong_gid":
+        first["pdf_source_glyph_id"] = 999
+    elif corruption == "wrong_source_item":
+        first["pdf_source_item_id"] = "page:2:text:replayed"
+    elif corruption == "wrong_representation":
+        first["pdf_text_mode"] = "text"
+    elif corruption == "wrong_affine":
+        first["pdf_affine_matrix"][3] += 0.25
+    elif corruption == "wrong_ink":
+        zero_entity["pdf_metric_zero_ink_identity"] = False
+    elif corruption == "missing_live_affine":
+        del first._pdf_test_evaluated_matrix_values
+        first.matrix_world = None
+    elif corruption == "unmeasured_live_ink":
+        del first._pdf_test_world_ink_points
+    elif corruption == "replayed_object":
+        replay = _Object(first_id, first.data)
+        replay.update(first)
+        replay.location = first.location
+        objects_by_name[first_id] = replay
+    elif corruption == "wrong_runtime_parent":
+        opts._text_delivery_outcomes[record["item_id"]].entity = (
+            collection.objects.items[-1]
+        )
+    elif corruption == "wrong_provenance_parent":
+        opts._source_provenance_objects[-1].parent_handle = "replayed-parent"
+
+    failures = bl_import_engine._reverify_text_delivery_after_stack(
+        [record],
+        page_number=2,
+        stack_offset_m=0.0,
+        provenance_opts=opts,
+    )
+
+    assert len(failures) == 1
+    assert any(
+        failure == expected_failure or failure.startswith(f"{expected_failure}:")
+        for failure in failures[0]["failures"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("corruption", "expected_failure"),
+    [
+        ("missing_entity_map", "final_entity_expectation_missing"),
+        ("duplicate_entity_map", "final_entity_expectation_ambiguous"),
+    ],
+)
+def test_post_stack_proof_requires_exactly_one_character_expectation_per_entity(
+    monkeypatch,
+    corruption,
+    expected_failure,
+):
+    _fake, _collection, opts, record, _objects = (
+        _positioned_mixed_delivery_for_final_state(monkeypatch, "3d_text")
+    )
+    characters = record["attempts"][0]["evidence"]["character_entities"]
+    first_id = record["entity_ids"][0]
+    if corruption == "missing_entity_map":
+        characters[0]["entity_ids"] = []
+    else:
+        characters[2]["entity_ids"] = [first_id]
+
+    failures = bl_import_engine._reverify_text_delivery_after_stack(
+        [record],
+        page_number=2,
+        stack_offset_m=0.0,
+        provenance_opts=opts,
+    )
+
+    assert len(failures) == 1
+    assert any(
+        failure == expected_failure or failure.startswith(f"{expected_failure}:")
+        for failure in failures[0]["failures"]
+    )
+
+
+@pytest.mark.parametrize("corruption", ["missing", "malformed"])
+def test_post_stack_proof_rejects_missing_or_malformed_character_matrix(
+    monkeypatch,
+    corruption,
+):
+    fake, collection = _install(monkeypatch)
+    _install_positioned_empty_conversion_host(monkeypatch, fake)
+    opts = types.SimpleNamespace(import_mode="vector", text_mode="3d_text")
+    item = _item()
+    item.text = "AB"
+    item.normalized = "AB"
+    item.source_char_layout = _character_layout()
+    item.requires_individual_positioning = True
+    assert bl_text_builder.build_text(
+        item,
+        collection,
+        page_number=2,
+        text_mode="3d_text",
+        provenance_opts=opts,
+    ) is not None
+    record = opts._text_delivery_records[-1]
+    character = record["attempts"][0]["evidence"]["character_entities"][0]
+    if corruption == "missing":
+        character.pop("intended_affine_matrix", None)
+        character["verification"].pop("intended_affine_matrix", None)
+    else:
+        character["intended_affine_matrix"] = [1.0, 2.0]
+    fake.data.objects.get = {
+        candidate.name: candidate for candidate in collection.objects.items
+    }.get
+    monkeypatch.setattr(bl_import_engine, "bpy", fake)
+
+    failures = bl_import_engine._reverify_text_delivery_after_stack(
+        [record],
+        page_number=2,
+        stack_offset_m=0.0,
+        provenance_opts=opts,
+    )
+
+    assert len(failures) == 1
+    assert any(
+        failure.startswith("final_entity_affine_expectation_invalid:")
+        for failure in failures[0]["failures"]
+    )
+
+
+@pytest.mark.parametrize("mode", ["glyphs", "geometry"])
+def test_post_stack_proof_rejects_same_topology_coordinate_mutation(
+    monkeypatch,
+    mode,
+):
+    _fake, _collection, opts, record, objects = (
+        _positioned_mixed_delivery_for_final_state(monkeypatch, mode)
+    )
+    entity = objects[record["entity_ids"][0]]
+    topology_count = (
+        len(entity.data.splines) if mode == "glyphs" else len(entity.data.vertices)
+    )
+    entity._pdf_test_world_ink_points[0][0] += 0.01
+
+    failures = bl_import_engine._reverify_text_delivery_after_stack(
+        [record],
+        page_number=2,
+        stack_offset_m=0.0,
+        provenance_opts=opts,
+    )
+
+    assert len(failures) == 1
+    assert any(
+        failure.startswith("final_entity_ink_bounds_mismatch:")
+        for failure in failures[0]["failures"]
+    )
+    assert (
+        len(entity.data.splines) if mode == "glyphs" else len(entity.data.vertices)
+    ) == topology_count
+
+
+def _nonpositioned_span_delivery_for_final_state(monkeypatch):
+    fake, collection = _install(monkeypatch)
+    opts = types.SimpleNamespace(import_mode="vector", text_mode="text")
+    obj = bl_text_builder.build_text(
+        _item(),
+        collection,
+        page_number=2,
+        text_mode="text",
+        provenance_opts=opts,
+    )
+    assert obj is not None
+    matrix = _object_trs_matrix_values(obj)
+    obj._pdf_test_evaluated_matrix_values = list(matrix)
+    width, height = (float(value) for value in obj.dimensions[:2])
+    local_corners = ((0.0, 0.0), (width, 0.0), (width, height), (0.0, height))
+    obj._pdf_test_world_ink_points = [
+        _transform_local_xy(matrix, point) for point in local_corners
+    ]
+    record = opts._text_delivery_records[-1]
+    fake.data.objects.get = {
+        candidate.name: candidate for candidate in collection.objects.items
+    }.get
+    monkeypatch.setattr(bl_import_engine, "bpy", fake)
+    return fake, collection, opts, record, obj
+
+
+def test_post_stack_proof_rejects_nonpositioned_span_world_rotation(monkeypatch):
+    _fake, _collection, opts, record, obj = (
+        _nonpositioned_span_delivery_for_final_state(monkeypatch)
+    )
+    assert bl_import_engine._reverify_text_delivery_after_stack(
+        [record],
+        page_number=2,
+        stack_offset_m=0.0,
+        provenance_opts=opts,
+    ) == []
+    for index in (0, 1, 4, 5):
+        obj._pdf_test_evaluated_matrix_values[index] *= -1.0
+
+    failures = bl_import_engine._reverify_text_delivery_after_stack(
+        [record],
+        page_number=2,
+        stack_offset_m=0.0,
+        provenance_opts=opts,
+    )
+
+    assert len(failures) == 1
+    assert any(
+        failure.startswith("final_entity_affine_mismatch:")
+        for failure in failures[0]["failures"]
+    )
+
+
+def test_post_stack_affine_seal_applies_page_offset_once_for_span(monkeypatch):
+    _fake, _collection, opts, record, obj = (
+        _nonpositioned_span_delivery_for_final_state(monkeypatch)
+    )
+    stack_offset_m = 0.375
+    obj._pdf_test_evaluated_matrix_values[7] += stack_offset_m
+    obj.location = (
+        float(obj.location[0]),
+        float(obj.location[1]) + stack_offset_m,
+        float(obj.location[2]),
+    )
+    for point in obj._pdf_test_world_ink_points:
+        point[1] += stack_offset_m
+
+    assert bl_import_engine._reverify_text_delivery_after_stack(
+        [record],
+        page_number=2,
+        stack_offset_m=stack_offset_m,
+        provenance_opts=opts,
+    ) == []
+    assert record["final_state_verification"]["entities"][0][
+        "affine_verified"
+    ] is True
+
+
+def test_character_affine_seal_keeps_page_stack_offset_behavior(monkeypatch):
+    _fake, _collection, opts, record, objects = (
+        _positioned_mixed_delivery_for_final_state(monkeypatch, "3d_text")
+    )
+    stack_offset_m = 0.375
+    for entity_id in record["entity_ids"]:
+        entity = objects[entity_id]
+        entity._pdf_test_evaluated_matrix_values[7] += stack_offset_m
+        for point in entity._pdf_test_world_ink_points:
+            point[1] += stack_offset_m
+
+    assert bl_import_engine._reverify_text_delivery_after_stack(
+        [record],
+        page_number=2,
+        stack_offset_m=stack_offset_m,
+        provenance_opts=opts,
+    ) == []
+    assert all(
+        entity["affine_verified"] is True
+        for entity in record["final_state_verification"]["entities"]
+    )
+
+
+def test_labels_fallback_text_seals_verified_character_affine(monkeypatch):
+    fake, collection = _install(monkeypatch)
+    _install_positioned_empty_conversion_host(monkeypatch, fake)
+    opts = types.SimpleNamespace(import_mode="vector", text_mode="labels")
+    item = _item()
+    item.text = "AB"
+    item.normalized = "AB"
+    item.source_char_layout = _character_layout()
+    item.requires_individual_positioning = True
+    assert bl_text_builder.build_text(
+        item,
+        collection,
+        page_number=2,
+        text_mode="labels",
+        provenance_opts=opts,
+    ) is not None
+    record = opts._text_delivery_records[-1]
+    fake.data.objects.get = {
+        candidate.name: candidate for candidate in collection.objects.items
+    }.get
+    monkeypatch.setattr(bl_import_engine, "bpy", fake)
+    assert record["requested_representation"] == "labels"
+    assert record["final_representation"] == "text"
+
+    assert bl_import_engine._reverify_text_delivery_after_stack(
+        [record],
+        page_number=2,
+        stack_offset_m=0.0,
+        provenance_opts=opts,
+    ) == []
+    assert all(
+        entity["affine_verified"] is True
+        for entity in record["final_state_verification"]["entities"]
+    )
+
+
+def _raster_delivery_for_final_state(monkeypatch, tmp_path):
+    fake, collection = _install(monkeypatch)
+    clip = tmp_path / "item-41-final-state.png"
+    clip.write_bytes(b"verified-png")
+    opts = types.SimpleNamespace(import_mode="vector", text_mode="raster")
+    obj = bl_text_builder.build_text(
+        _item(),
+        collection,
+        page_number=2,
+        text_mode="raster",
+        provenance_opts=opts,
+        terminal_raster_callback=_raster_callback_for_test(clip),
+    )
+    assert obj is not None
+    record = opts._text_delivery_records[-1]
+    fake.data.objects.get = {
+        candidate.name: candidate for candidate in collection.objects.items
+    }.get
+    monkeypatch.setattr(bl_import_engine, "bpy", fake)
+    return fake, collection, opts, record, obj
+
+
+@pytest.mark.parametrize(
+    ("corruption", "expected_failure"),
+    [
+        ("material_unassigned", "final_entity_raster_material_binding_mismatch"),
+        ("node_links_disconnected", "final_entity_raster_material_binding_mismatch"),
+        ("texture_color_to_metallic", "final_entity_raster_material_binding_mismatch"),
+        ("shader_bsdf_to_alpha", "final_entity_raster_material_binding_mismatch"),
+        ("uv_missing", "final_entity_raster_uv_mismatch"),
+        ("uv_changed", "final_entity_raster_uv_mismatch"),
+        ("local_vertex_changed", "final_entity_raster_geometry_mismatch"),
+        ("world_rotation_180", "final_entity_affine_mismatch"),
+    ],
+)
+def test_post_stack_proof_rejects_raster_render_chain_and_geometry_mutation(
+    monkeypatch,
+    tmp_path,
+    corruption,
+    expected_failure,
+):
+    fake, _collection, opts, record, obj = _raster_delivery_for_final_state(
+        monkeypatch,
+        tmp_path,
+    )
+    assert bl_import_engine._reverify_text_delivery_after_stack(
+        [record],
+        page_number=2,
+        stack_offset_m=0.0,
+        provenance_opts=opts,
+    ) == []
+    material = fake.data.materials.get(str(obj["pdf_image_material"]))
+    if corruption == "material_unassigned":
+        obj.data.materials.clear()
+    elif corruption == "node_links_disconnected":
+        material.node_tree.links.clear()
+    elif corruption == "texture_color_to_metallic":
+        link = next(
+            candidate
+            for candidate in material.node_tree.links
+            if candidate.from_node.type == "TEX_IMAGE"
+            and candidate.from_socket.name == "Color"
+        )
+        shader = link.to_node
+        link.to_socket = shader.inputs["Metallic"]
+    elif corruption == "shader_bsdf_to_alpha":
+        link = next(
+            candidate
+            for candidate in material.node_tree.links
+            if candidate.from_node.type == "BSDF_PRINCIPLED"
+        )
+        output = link.to_node
+        link.to_socket = output.inputs["Alpha"]
+    elif corruption == "uv_missing":
+        obj.data.uv_layers._layer = None
+    elif corruption == "uv_changed":
+        obj.data.uv_layers.get("UVMap").data[0].uv[0] += 0.25
+    elif corruption == "local_vertex_changed":
+        obj.data.vertices[0].co[0] += 0.005
+    elif corruption == "world_rotation_180":
+        for index in (0, 1, 4, 5):
+            obj._pdf_test_evaluated_matrix_values[index] *= -1.0
+
+    failures = bl_import_engine._reverify_text_delivery_after_stack(
+        [record],
+        page_number=2,
+        stack_offset_m=0.0,
+        provenance_opts=opts,
+    )
+
+    assert len(failures) == 1
+    assert any(
+        failure.startswith(f"{expected_failure}:")
+        for failure in failures[0]["failures"]
+    )
 
 
 @pytest.mark.parametrize("mode", ["text", "3d_text"])
@@ -2466,6 +3089,245 @@ def test_positioned_whitespace_without_glyph_id_cannot_authorize_zero_ink():
         )
 
 
+def test_positioned_missing_exact_font_keeps_visible_source_truth_for_fallback():
+    item = _item(font_asset=False)
+    item.text = "AB"
+    item.normalized = "AB"
+    item.source_char_layout = _character_layout()
+    item.requires_individual_positioning = True
+
+    manifest = bl_text_builder._positioned_zero_ink_source_manifest(
+        item,
+        item_id="page:2:text:41",
+        page_number=2,
+        requested="3d_text",
+        z_offset_m=0.0,
+        baseline_alignment="BOTTOM_BASELINE",
+    )
+
+    assert [character["text"] for character in manifest["characters"]] == [
+        "A",
+        "B",
+    ]
+    assert all(
+        character["source_ink_classification"] == "visible"
+        for character in manifest["characters"]
+    )
+    assert all(
+        character["source_ink_evidence"]
+        == "source_glyph_without_exact_font_authority"
+        for character in manifest["characters"]
+    )
+    assert [
+        character["source_ink_glyph_id"] for character in manifest["characters"]
+    ] == [1, 1]
+
+
+def test_positioned_invalid_exact_metrics_advance_fallback_without_crashing(
+    monkeypatch,
+):
+    _fake, collection = _install(monkeypatch)
+    item = _item()
+    item.font_asset = _metric_font_asset()
+    item.font_asset.glyph_advances = ()
+    item.font_name = "MetricFixture"
+    item.text = "A"
+    item.normalized = "A"
+    item.source_char_layout = (_character_layout()[0],)
+    item.requires_individual_positioning = True
+    opts = types.SimpleNamespace(import_mode="vector", text_mode="3d_text")
+
+    obj = bl_text_builder.build_text(
+        item,
+        collection,
+        page_number=2,
+        text_mode="3d_text",
+        provenance_opts=opts,
+        terminal_raster_callback=lambda *_args, **_kwargs: None,
+    )
+
+    assert obj is None
+    record = opts._text_delivery_records[-1]
+    assert record["status"] == "failed"
+    assert [attempt["attempted_representation"] for attempt in record["attempts"]] == [
+        "3d_text",
+        "text",
+        "glyphs",
+        "geometry",
+        "raster",
+    ]
+    assert record["attempts"][-1]["reason"] == "terminal_raster_not_verified"
+
+
+def test_visible_positioned_source_manifest_uses_exact_font_axes():
+    item = _item()
+    item.font_asset = _metric_font_asset()
+    item.font_name = "MetricFixture"
+    item.text = "A"
+    item.normalized = "A"
+    layout = _character_layout()[0]
+    item.source_char_layout = (layout,)
+    item.requires_individual_positioning = True
+    child = bl_text_builder._character_text_item(item, layout)
+    metrics = bl_text_builder._positioned_font_axis_metrics_values(
+        child,
+        size=float(child.font_size) * bl_text_builder.MM_TO_M,
+        baseline_alignment="BOTTOM_BASELINE",
+    )
+    expected = bl_text_builder._metric_character_matrix_values(
+        local_advance=metrics["local_matrix_horizontal_extent"],
+        local_line_height=metrics["local_line_height"],
+        local_baseline_y=metrics["local_baseline_y"],
+        target_origin=layout.target_origin,
+        target_quad=layout.target_quad,
+        z=0.0,
+        allow_zero_advance=False,
+    )
+
+    manifest = bl_text_builder._positioned_zero_ink_source_manifest(
+        item,
+        item_id="page:2:text:41",
+        page_number=2,
+        requested="3d_text",
+        z_offset_m=0.0,
+        baseline_alignment="BOTTOM_BASELINE",
+    )
+
+    assert manifest["characters"][0]["intended_affine_matrix"] == pytest.approx(
+        [float(value) for row in expected for value in row]
+    )
+    assert manifest["characters"][0]["intended_affine_matrix"][5] == pytest.approx(
+        2.0 / 3.0
+    )
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_type", "expected_physical_count"),
+    [
+        ("text", "FONT", 1),
+        ("3d_text", "FONT", 1),
+        ("glyphs", None, 0),
+        ("geometry", None, 0),
+    ],
+)
+def test_ordinary_character_with_exact_empty_glyph_uses_physical_zero_ink_proof(
+    monkeypatch,
+    mode,
+    expected_type,
+    expected_physical_count,
+):
+    fake, collection = _install(monkeypatch)
+    _install_positioned_empty_conversion_host(
+        monkeypatch,
+        fake,
+        zero_ink_texts=("A",),
+    )
+    layout = _character_layout()[0]
+    layout.text = "A"
+    layout.glyph_id = 2
+    item = _item()
+    item.text = "A"
+    item.normalized = "A"
+    item.font_asset = _metric_font_asset()
+    item.font_name = "MetricFixture"
+    item.source_char_layout = (layout,)
+    item.requires_individual_positioning = True
+    opts = types.SimpleNamespace(import_mode="vector", text_mode=mode)
+
+    obj = bl_text_builder.build_text(
+        item,
+        collection,
+        page_number=2,
+        text_mode=mode,
+        provenance_opts=opts,
+    )
+
+    record = opts._text_delivery_records[-1]
+    assert record["status"] == "delivered"
+    assert record["final_representation"] == mode
+    assert record["fallback_used"] is False
+    assert record["zero_ink_character_count"] == 1
+    assert record["physical_entity_count"] == expected_physical_count
+    if expected_type is None:
+        assert obj is None
+        assert record["zero_ink_delivery"] is True
+    else:
+        assert obj is not None and obj.type == expected_type
+        assert obj.data.body == "A"
+    manifest_character = opts._zero_ink_source_manifests[record["item_id"]][
+        "characters"
+    ][0]
+    assert manifest_character["source_ink_classification"] == "zero_ink"
+    assert manifest_character["source_ink_evidence"] == "exact_source_glyph_empty"
+    assert manifest_character["source_ink_glyph_id"] == 2
+    assert manifest_character["source_ink_glyph_identity"] == "source_trace_glyph_id"
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_type", "expected_physical_count"),
+    [
+        ("text", "FONT", 3),
+        ("3d_text", "FONT", 3),
+        ("glyphs", "CURVE", 2),
+        ("geometry", "MESH", 2),
+    ],
+)
+def test_mixed_span_preserves_ordinary_exact_empty_glyph_without_retyping_siblings(
+    monkeypatch,
+    mode,
+    expected_type,
+    expected_physical_count,
+):
+    fake, collection = _install(monkeypatch)
+    _install_positioned_empty_conversion_host(
+        monkeypatch,
+        fake,
+        zero_ink_texts=("X",),
+    )
+    layouts = list(_mixed_zero_ink_character_layout())
+    layouts[1].text = "X"
+    layouts[1].glyph_id = 2
+    item = _item()
+    item.text = "AXB"
+    item.normalized = "AXB"
+    item.font_asset = _metric_font_asset()
+    item.font_name = "MetricFixture"
+    item.source_char_layout = tuple(layouts)
+    item.requires_individual_positioning = True
+    opts = types.SimpleNamespace(import_mode="vector", text_mode=mode)
+
+    obj = bl_text_builder.build_text(
+        item,
+        collection,
+        page_number=2,
+        text_mode=mode,
+        provenance_opts=opts,
+    )
+
+    record = opts._text_delivery_records[-1]
+    assert obj is not None and obj.type == expected_type
+    assert record["status"] == "delivered"
+    assert record["final_representation"] == mode
+    assert record["fallback_used"] is False
+    assert record["zero_ink_character_count"] == 1
+    assert record["physical_entity_count"] == expected_physical_count
+    evidence = record["attempts"][0]["evidence"]
+    assert [entry["text"] for entry in evidence["character_entities"]] == [
+        "A",
+        "X",
+        "B",
+    ]
+    assert evidence["character_entities"][1]["source_ink_classification"] == (
+        "zero_ink"
+    )
+    assert evidence["character_entities"][1]["source_ink_evidence"] == (
+        "exact_source_glyph_empty"
+    )
+    assert [candidate.type for candidate in collection.objects.items] == [
+        expected_type
+    ] * expected_physical_count
+
+
 @pytest.mark.parametrize(
     "text",
     ["\u00ad", "\u034f", "\u200d", "\u2061", "\ufe0f", "\U000e0100"],
@@ -2694,6 +3556,70 @@ def test_recovered_cmap_zero_ink_rejects_tampered_mapping_chain(
     assert text_delivery.source_character_is_zero_ink(character) is False
 
 
+def test_delivery_rejects_self_consistent_replayed_cmap_zero_ink_chain():
+    evidence = copy.deepcopy(_verified_zero_ink_delivery_evidence())
+    expected_manifest = _zero_ink_source_manifest_from_evidence(evidence)
+    forged = evidence["character_entities"][0]
+    forged_font_sha = sha256(b"replayed-exact-font").hexdigest()
+    forged_glyph_id = 7
+    forged["glyph_id"] = None
+    forged["source_ink_font_sha256"] = forged_font_sha
+    forged["source_ink_glyph_id"] = forged_glyph_id
+    forged["source_ink_glyph_identity"] = "exact_source_unicode_cmap"
+    forged["source_ink_code_point"] = ord(" ")
+    forged["source_ink_mapping_sha256"] = (
+        text_delivery.source_unicode_cmap_binding_sha256(
+            forged_font_sha,
+            ord(" "),
+            forged_glyph_id,
+        )
+    )
+    assert text_delivery.source_character_is_zero_ink(forged) is True
+
+    forged_manifest = _zero_ink_source_manifest_from_evidence(evidence)
+    forged_digest = _zero_ink_manifest_sha256(forged_manifest)
+    evidence["source_manifest_sha256"] = forged_digest
+    for character in evidence["character_entities"]:
+        character["source_manifest_sha256"] = forged_digest
+        character_manifest = _zero_ink_character_manifest(
+            source_manifest=forged_manifest,
+            source_manifest_sha256=forged_digest,
+            character_index=character["character_index"],
+        )
+        character_manifest_digest = _zero_ink_manifest_sha256(character_manifest)
+        character["zero_ink_character_manifest"] = character_manifest
+        character["zero_ink_character_manifest_sha256"] = (
+            character_manifest_digest
+        )
+        character["verification"].update({
+            "source_manifest_sha256": forged_digest,
+            "source_glyph_id": character["glyph_id"],
+            "zero_ink_character_manifest_sha256": character_manifest_digest,
+        })
+
+    entity, record = deliver_item(
+        item_id="page:2:text:41",
+        page_number=2,
+        source_span_id=41,
+        requested="glyphs",
+        expected_zero_ink_manifest=expected_manifest,
+        attempt=lambda _representation: AttemptOutcome.delivered(
+            None,
+            entity_ids=(),
+            evidence=evidence,
+        ),
+        cleanup=lambda _outcome: {"status": "complete", "removed": []},
+    )
+
+    assert entity is None
+    assert record["status"] == "failed"
+    attempt = record["attempts"][0]
+    assert attempt["reason"] == "delivered_attempt_zero_ink_evidence_not_verified"
+    assert "zero_ink_source_manifest_mismatch" in attempt["evidence"][
+        "proof_failures"
+    ]
+
+
 @pytest.mark.parametrize("bad_glyph_id", [1, True, "2", 2.0])
 def test_recovered_cmap_zero_ink_rejects_forged_or_noninteger_glyph_id(bad_glyph_id):
     layout = _whitespace_only_character_layout()[0]
@@ -2836,6 +3762,20 @@ def test_contoured_u0020_keeps_requested_physical_representation(
     assert record.get("zero_ink_character_count", 0) == 0
     assert character["source_ink_classification"] == "visible"
     assert character["source_ink_evidence"] == "exact_source_glyph_contours"
+    assert obj["pdf_metric_zero_ink_identity"] is False
+    assert obj["pdf_physical_glyph_id"] == 1
+    assert obj["pdf_exact_font_sha256"] == item.font_asset.usable_sha256
+
+    fake.data.objects.get = {obj.name: obj}.get
+    monkeypatch.setattr(bl_import_engine, "bpy", fake)
+    assert bl_import_engine._reverify_text_delivery_after_stack(
+        [record],
+        page_number=2,
+        stack_offset_m=0.0,
+        provenance_opts=opts,
+    ) == []
+    final_entity = record["final_state_verification"]["entities"][0]
+    assert final_entity["physical_ink_continuity_verified"] is True
 
 
 def test_nonpositioned_unicode_whitespace_cannot_bypass_required_affine(monkeypatch):
@@ -4864,6 +5804,136 @@ def test_failed_material_rollback_remains_owned_and_cannot_report_cleanup_comple
     )
 
 
+def test_cleanup_uses_frozen_owned_refs_not_mutated_entity_metadata(
+    monkeypatch,
+    tmp_path,
+):
+    fake, collection = _install(monkeypatch)
+    owned_path = tmp_path / "owned-item.png"
+    sentinel_path = tmp_path / "user-sentinel.png"
+    owned_path.write_bytes(b"owned")
+    sentinel_path.write_bytes(b"sentinel")
+
+    owned_image = fake.data.images.add_packed("owned-image", b"owned")
+    sentinel_image = fake.data.images.add_packed("user-image", b"sentinel")
+    owned_material = fake.data.materials.add(_Material("owned-material", owned_image))
+    sentinel_material = fake.data.materials.add(
+        _Material("user-material", sentinel_image)
+    )
+    plane = _Object("owned-plane", _MeshData("owned-mesh"))
+    plane.data.materials.append(owned_material)
+    plane["pdf_image_path"] = str(owned_path)
+    plane["pdf_image_material"] = owned_material.name
+    plane["pdf_image_material_owned"] = True
+    plane["pdf_image_datablock"] = owned_image.name
+    plane["pdf_image_datablock_owned"] = True
+    collection.objects.link(plane)
+    outcome = AttemptOutcome.failed(
+        "force-final-cleanup",
+        owned_objects=(plane,),
+        owned_datablocks=(plane.data, owned_material, owned_image),
+        owned_files=((str(owned_path), str(tmp_path)),),
+    )
+
+    # Mutable entity metadata is evidence only; it must never become cleanup authority.
+    plane["pdf_image_path"] = str(sentinel_path)
+    plane["pdf_image_material"] = sentinel_material.name
+    plane["pdf_image_datablock"] = sentinel_image.name
+
+    cleanup = bl_text_builder.cleanup_delivery_outcome(outcome)
+
+    assert cleanup["status"] == "complete"
+    assert not owned_path.exists()
+    assert sentinel_path.read_bytes() == b"sentinel"
+    assert fake.data.materials.get(owned_material.name) is None
+    assert fake.data.images.get(owned_image.name) is None
+    assert fake.data.materials.get(sentinel_material.name) is sentinel_material
+    assert fake.data.images.get(sentinel_image.name) is sentinel_image
+
+
+def test_owned_file_cleanup_rejects_path_outside_importer_temp_root(
+    monkeypatch,
+    tmp_path,
+):
+    _fake, _collection = _install(monkeypatch)
+    owned_root = tmp_path / "owned-root"
+    owned_root.mkdir()
+    sentinel = tmp_path / "outside-sentinel.png"
+    sentinel.write_bytes(b"sentinel")
+    outcome = AttemptOutcome.failed(
+        "unsafe-owned-file-claim",
+        owned_files=((str(sentinel), str(owned_root)),),
+    )
+
+    cleanup = bl_text_builder.cleanup_delivery_outcome(outcome)
+
+    assert cleanup["status"] == "failed"
+    assert cleanup["detail"] == "owned file is outside its importer temp root"
+    assert sentinel.read_bytes() == b"sentinel"
+
+
+def test_native_verifier_exception_retains_all_created_ownership(monkeypatch):
+    fake, collection = _install(monkeypatch)
+    opts = types.SimpleNamespace(import_mode="vector", text_mode="text")
+
+    def explode(*_args, **_kwargs):
+        raise RuntimeError("host verifier read failed")
+
+    monkeypatch.setattr(bl_text_builder, "_verify_font_candidate", explode)
+
+    obj = bl_text_builder.build_text(
+        _item(),
+        collection,
+        page_number=2,
+        text_mode="text",
+        provenance_opts=opts,
+    )
+
+    assert obj is None
+    attempt = opts._text_delivery_records[-1]["attempts"][0]
+    assert attempt["reason"] == "font_candidate_verification_raised"
+    assert attempt["cleanup"]["status"] == "complete"
+    assert collection.objects.items == []
+    assert fake.data.objects.removed
+    assert fake.data.curves.removed
+    assert fake.data.materials.removed
+
+
+def test_positioned_batch_verifier_exception_retains_every_candidate(monkeypatch):
+    fake, collection = _install(monkeypatch)
+    _install_mathutils(monkeypatch)
+    item = _item()
+    item.font_asset = _metric_font_asset()
+    item.font_name = "MetricFixture"
+    item.text = "AB"
+    item.normalized = "AB"
+    item.source_char_layout = _character_layout()
+    item.requires_individual_positioning = True
+    opts = types.SimpleNamespace(import_mode="vector", text_mode="3d_text")
+
+    def explode(*_args, **_kwargs):
+        raise RuntimeError("positioned verifier read failed")
+
+    monkeypatch.setattr(bl_text_builder, "_verify_font_candidate", explode)
+
+    obj = bl_text_builder.build_text(
+        item,
+        collection,
+        page_number=2,
+        text_mode="3d_text",
+        provenance_opts=opts,
+    )
+
+    assert obj is None
+    attempt = opts._text_delivery_records[-1]["attempts"][0]
+    assert attempt["reason"] == "positioned_native_verification_raised"
+    assert attempt["cleanup"]["status"] == "complete"
+    assert collection.objects.items == []
+    assert len(fake.data.objects.removed) == 2
+    assert sum(name.startswith("P2_text_3d_text_41_") for name in fake.data.curves.removed) == 2
+    assert len(fake.data.materials.removed) == 2
+
+
 def test_failed_exact_font_pack_removes_newly_loaded_host_datablock(monkeypatch):
     fake, collection = _install(monkeypatch)
     monkeypatch.setattr(
@@ -5085,6 +6155,8 @@ def _raster_callback_for_test(
     corrupt_packed_bytes=False,
     explode_during_verification=False,
     broken_texture_binding=False,
+    wrong_texture_socket=False,
+    wrong_output_socket=False,
     nonfinite_location=False,
 ):
     def _callback(_text_item, collection, _page_number, item_id):
@@ -5109,11 +6181,10 @@ def _raster_callback_for_test(
             else (0.012, 0.024, 0.0)
         )
         plane.scale = [2.0, 1.2, 1.0]
-        if explode_during_verification:
-            plane._explode_location = True
         plane["pdf_raster_source_item_id"] = item_id
         plane["pdf_raster_source_bbox_pdf"] = [34.0, 50.0, 147.0, 68.0]
         plane["pdf_image_path"] = str(path)
+        plane["pdf_image_owner_root"] = str(Path(path).resolve().parent)
         plane["pdf_image_material"] = ""
         image_name = "P2_text_41_raster_image"
         image_bytes = b"wrong-packed-bytes" if corrupt_packed_bytes else Path(path).read_bytes()
@@ -5125,10 +6196,53 @@ def _raster_callback_for_test(
             bl_text_builder.bpy.data.images.get(image_name),
             valid_links=not broken_texture_binding,
         )
+        if wrong_texture_socket:
+            link = next(
+                candidate
+                for candidate in material.node_tree.links
+                if candidate.from_node.type == "TEX_IMAGE"
+                and candidate.from_socket.name == "Color"
+            )
+            link.to_socket = link.to_node.inputs["Metallic"]
+        if wrong_output_socket:
+            link = next(
+                candidate
+                for candidate in material.node_tree.links
+                if candidate.from_node.type == "BSDF_PRINCIPLED"
+            )
+            link.to_socket = link.to_node.inputs["Alpha"]
         bl_text_builder.bpy.data.materials.add(material)
         plane.data.materials.append(material)
         plane.data.uv_layers = _UVLayers(valid=not broken_texture_binding)
-        plane.data.loops = [object(), object(), object(), object()]
+        local_vertices = (
+            (0.0, 0.0, 0.0),
+            (0.020, 0.0, 0.0),
+            (0.020, 0.005, 0.0),
+            (0.0, 0.005, 0.0),
+        )
+        plane.data.vertices = [
+            types.SimpleNamespace(co=list(coordinate))
+            for coordinate in local_vertices
+        ]
+        plane.data.loops = [
+            types.SimpleNamespace(vertex_index=index)
+            for index in range(4)
+        ]
+        plane.data.polygons = [
+            types.SimpleNamespace(
+                vertices=(0, 1, 2, 3),
+                loop_indices=(0, 1, 2, 3),
+                material_index=0,
+            )
+        ]
+        matrix = _object_trs_matrix_values(plane)
+        plane._pdf_test_evaluated_matrix_values = list(matrix)
+        plane._pdf_test_world_ink_points = [
+            _transform_local_xy(matrix, coordinate)
+            for coordinate in local_vertices
+        ]
+        if explode_during_verification:
+            plane._explode_location = True
         plane["pdf_image_material"] = material_name
         plane["pdf_image_material_owned"] = True
         plane["pdf_image_datablock_owned"] = True
@@ -5297,6 +6411,37 @@ def test_raster_delivery_rejects_blank_plane_without_uv_and_node_links(
     assert fake.data.images.removed == ["P2_text_41_raster_image"]
 
 
+@pytest.mark.parametrize("callback_flag", ["wrong_texture_socket", "wrong_output_socket"])
+def test_raster_delivery_rejects_node_chain_wired_to_wrong_shader_sockets(
+    monkeypatch,
+    tmp_path,
+    callback_flag,
+):
+    fake, collection = _install(monkeypatch)
+    clip = tmp_path / "item-41.png"
+    clip.write_bytes(b"verified-png")
+    opts = types.SimpleNamespace(import_mode="vector", text_mode="raster")
+
+    obj = bl_text_builder.build_text(
+        _item(),
+        collection,
+        page_number=2,
+        text_mode="raster",
+        provenance_opts=opts,
+        terminal_raster_callback=_raster_callback_for_test(
+            clip,
+            **{callback_flag: True},
+        ),
+    )
+
+    assert obj is None
+    attempt = opts._text_delivery_records[-1]["attempts"][0]
+    assert "raster_material_node_links_unverified" in attempt["evidence"]["failures"]
+    assert attempt["cleanup"]["status"] == "complete"
+    assert fake.data.materials.removed == ["P2_text_41_raster_material"]
+    assert fake.data.images.removed == ["P2_text_41_raster_image"]
+
+
 def test_nonfinite_raster_geometry_cannot_be_verified(monkeypatch, tmp_path):
     _fake, collection = _install(monkeypatch)
     clip = tmp_path / "item-41.png"
@@ -5394,6 +6539,52 @@ def test_unbound_generic_or_runtime_impossibility_proof_cannot_advance_ladder(
         "impossibility_evidence_not_affirmative"
     )
     assert record["attempts"][0]["evidence"]["proof_failures"]
+
+
+def test_negative_metric_glyph_identity_cannot_unlock_fallback():
+    attempted = []
+
+    def attempt(representation):
+        attempted.append(representation)
+        if len(attempted) == 1:
+            return AttemptOutcome.impossible(
+                "exact_positioned_font_metrics_unavailable_for_item",
+                evidence={
+                    "importer_id": "bc_pdf_vector_importer.blender",
+                    "item_id": "page:2:text:41",
+                    "page_number": 2,
+                    "source_span_id": 41,
+                    "proof_category": (
+                        "authenticated_source_metric_validation_failed"
+                    ),
+                    "character_index": 0,
+                    "source_character_text": "A",
+                    "source_glyph_id": -1,
+                    "source_font_sha256": "a" * 64,
+                    "font_name": "ExactPDF",
+                    "font_asset_page_number": 2,
+                    "font_asset_span_font_name": "ExactPDF",
+                    "error_type": "RuntimeError",
+                    "detail": "invalid exact font metrics",
+                },
+            )
+        return AttemptOutcome.delivered(object(), entity_ids=("must-not-exist",))
+
+    entity, record = deliver_item(
+        item_id="page:2:text:41",
+        page_number=2,
+        source_span_id=41,
+        requested="text",
+        attempt=attempt,
+        cleanup=lambda _outcome: {"status": "complete", "removed": []},
+    )
+
+    assert entity is None
+    assert attempted == ["text"]
+    assert record["status"] == "failed"
+    assert "metric_failure_glyph_unbound" in record["attempts"][0]["evidence"][
+        "proof_failures"
+    ]
 
 
 @pytest.mark.parametrize(

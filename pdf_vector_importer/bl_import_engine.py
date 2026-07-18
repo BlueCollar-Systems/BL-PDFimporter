@@ -9,6 +9,7 @@ optional recognition, and Blender geometry/text building.
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import os
 import re
@@ -22,13 +23,19 @@ from typing import Any, Callable, Dict, List, Optional
 import bpy
 
 from .dependency_manager import check_pymupdf, ensure_lib_path
-from .packed_assets import pack_and_verify_bytes
+from .packed_assets import PackedAssetError, pack_and_verify_bytes, verify_packed_sha256
 from .pdfcadcore import (
     ImportConfig, extract_page, iter_pages, recognition, reset_ids,
     classify_page_content, tag_hatch_primitives, cleanup_primitives,
 )
 from .bl_geometry_builder import build_page
-from .bl_text_builder import build_all_text, cleanup_delivery_outcome
+from .bl_text_builder import (
+    FinalEntityExpectationAuthority,
+    build_all_text,
+    cleanup_delivery_outcome,
+    final_entity_expectations_from_evidence,
+    raster_mesh_fidelity_state,
+)
 from .pdfcadcore.primitive_extractor import (
     _page_rotation_transform,
     _transform_pdf_point,
@@ -1302,9 +1309,9 @@ def _delivered_text_bboxes(text_items, delivery_records, page_number: int):
     return result
 
 
-def _remove_created_image_plane(obj, collection) -> Dict[str, Any]:
-    """Remove every attempt-owned datablock from one failed raster plane."""
-    removed: List[str] = []
+def _freeze_created_image_plane_ownership(obj) -> Dict[str, Any]:
+    """Freeze exact raster-plane references before later metadata can mutate."""
+
     try:
         object_name = str(getattr(obj, "name", "") or "")
         mesh = getattr(obj, "data", None)
@@ -1313,8 +1320,83 @@ def _remove_created_image_plane(obj, collection) -> Dict[str, Any]:
         material_owned = bool(obj.get("pdf_image_material_owned", False))
         image_name = str(obj.get("pdf_image_datablock", "") or "")
         image_owned = bool(obj.get("pdf_image_datablock_owned", False))
-    except ReferenceError:
-        return {"status": "complete", "removed": ["<already_removed_image_plane>"]}
+    except (AttributeError, ReferenceError, RuntimeError, TypeError):
+        object_name = ""
+        mesh = None
+        mesh_name = ""
+        material_name = ""
+        material_owned = False
+        image_name = ""
+        image_owned = False
+    material = None
+    image = None
+    if material_owned and material_name:
+        try:
+            material = next(
+                (
+                    candidate
+                    for candidate in tuple(getattr(mesh, "materials", ()) or ())
+                    if str(getattr(candidate, "name", "") or "") == material_name
+                ),
+                None,
+            )
+        except (AttributeError, ReferenceError, RuntimeError, TypeError):
+            material = None
+        if material is None:
+            try:
+                material = bpy.data.materials.get(material_name)
+            except (AttributeError, ReferenceError, RuntimeError, TypeError):
+                material = None
+    if image_owned and image_name and material is not None:
+        try:
+            image = next(
+                (
+                    candidate
+                    for node in tuple(material.node_tree.nodes)
+                    for candidate in (getattr(node, "image", None),)
+                    if candidate is not None
+                    and str(getattr(candidate, "name", "") or "") == image_name
+                ),
+                None,
+            )
+        except (AttributeError, ReferenceError, RuntimeError, TypeError):
+            image = None
+    if image_owned and image_name and image is None:
+        try:
+            image = bpy.data.images.get(image_name)
+        except (AttributeError, ReferenceError, RuntimeError, TypeError):
+            image = None
+    return {
+        "schema": "bc_bl_owned_image_plane_v1",
+        "object": obj,
+        "object_name": object_name,
+        "mesh": mesh,
+        "mesh_name": mesh_name,
+        "material": material,
+        "material_name": material_name,
+        "image": image,
+        "image_name": image_name,
+    }
+
+
+def _remove_created_image_plane(ownership, collection) -> Dict[str, Any]:
+    """Remove only exact raster-plane references frozen at construction time."""
+
+    if not isinstance(ownership, dict) or ownership.get("schema") != (
+        "bc_bl_owned_image_plane_v1"
+    ):
+        return {
+            "status": "failed",
+            "removed": [],
+            "detail": "frozen image-plane ownership is missing or invalid",
+        }
+    obj = ownership.get("object")
+    mesh = ownership.get("mesh")
+    material = ownership.get("material")
+    image = ownership.get("image")
+    object_name = str(ownership.get("object_name") or "")
+    mesh_name = str(ownership.get("mesh_name") or "")
+    removed: List[str] = []
     try:
         collection.objects.unlink(obj)
     except Exception:
@@ -1340,18 +1422,14 @@ def _remove_created_image_plane(obj, collection) -> Dict[str, Any]:
                 "exception_type": type(exc).__name__,
                 "detail": str(exc),
             }
-    for registry_name, name, owned in (
-        ("materials", material_name, material_owned),
-        ("images", image_name, image_owned),
+    for registry_name, block, name in (
+        ("materials", material, str(ownership.get("material_name") or "")),
+        ("images", image, str(ownership.get("image_name") or "")),
     ):
-        if not owned or not name:
-            continue
-        registry = getattr(bpy.data, registry_name, None)
-        get = getattr(registry, "get", None)
-        remove = getattr(registry, "remove", None)
-        block = get(name) if callable(get) else None
         if block is None:
             continue
+        registry = getattr(bpy.data, registry_name, None)
+        remove = getattr(registry, "remove", None)
         try:
             if int(getattr(block, "users", 0) or 0) > 0:
                 raise RuntimeError(
@@ -1387,10 +1465,39 @@ def _remove_owned_raster_file(path: str) -> Dict[str, Any]:
     return {"status": "complete", "removed": [str(path)]}
 
 
-def _raise_for_incomplete_raster_cleanup(*results: Dict[str, Any]) -> None:
+def _raise_for_incomplete_raster_cleanup(
+    *results: Dict[str, Any],
+    owned_objects=(),
+    owned_datablocks=(),
+    owned_files=(),
+) -> None:
     incomplete = [result for result in results if result.get("status") != "complete"]
     if incomplete:
-        raise RuntimeError(f"terminal raster attempt cleanup failed: {incomplete!r}")
+        raise _owned_raster_error(
+            f"terminal raster attempt cleanup failed: {incomplete!r}",
+            owned_objects=owned_objects,
+            owned_datablocks=owned_datablocks,
+            owned_files=owned_files,
+        )
+
+
+def _owned_raster_error(
+    message: str,
+    *,
+    owned_objects=(),
+    owned_datablocks=(),
+    owned_files=(),
+) -> RuntimeError:
+    """Return an exception that preserves exact partial-construction ownership."""
+
+    error = RuntimeError(message)
+    error.owned_objects = tuple(value for value in owned_objects if value is not None)
+    error.owned_datablocks = tuple(
+        value for value in owned_datablocks if value is not None
+    )
+    error.owned_files = tuple(owned_files)
+    error.owned_artifacts = ()
+    return error
 
 
 def _render_text_item_raster(
@@ -1438,6 +1545,7 @@ def _render_text_item_raster(
     if not safe_id:
         return None
     image_path = os.path.join(image_dir, f"{safe_id}_{dpi}dpi.png")
+    image_owner_root = str(Path(image_dir).resolve())
     try:
         pix = page.get_pixmap(matrix=matrix, clip=clip, alpha=True)
         if int(getattr(pix, "width", 0) or 0) <= 0 or int(getattr(pix, "height", 0) or 0) <= 0:
@@ -1450,7 +1558,10 @@ def _render_text_item_raster(
             return None
     except (RuntimeError, OSError, ValueError, TypeError):
         cleanup = _remove_owned_raster_file(image_path)
-        _raise_for_incomplete_raster_cleanup(cleanup)
+        _raise_for_incomplete_raster_cleanup(
+            cleanup,
+            owned_files=((image_path, image_owner_root),),
+        )
         return None
 
     source_id = int(getattr(text_item, "id", 0) or 0)
@@ -1467,26 +1578,51 @@ def _render_text_item_raster(
     }
     try:
         obj = _create_image_plane(placement, collection, z_offset_m=z_offset_m)
-    except Exception:
+    except Exception as exc:
+        if tuple(getattr(exc, "owned_objects", ()) or ()) or tuple(
+            getattr(exc, "owned_datablocks", ()) or ()
+        ):
+            exc.owned_files = tuple(getattr(exc, "owned_files", ()) or ()) + (
+                (image_path, image_owner_root),
+            )
+            raise
         cleanup = _remove_owned_raster_file(image_path)
-        _raise_for_incomplete_raster_cleanup(cleanup)
+        _raise_for_incomplete_raster_cleanup(
+            cleanup,
+            owned_files=((image_path, image_owner_root),),
+        )
         return None
     if obj is None:
         cleanup = _remove_owned_raster_file(image_path)
-        _raise_for_incomplete_raster_cleanup(cleanup)
+        _raise_for_incomplete_raster_cleanup(
+            cleanup,
+            owned_files=((image_path, image_owner_root),),
+        )
         return None
+    ownership = _freeze_created_image_plane_ownership(obj)
     try:
         obj["pdf_raster_source_item_id"] = str(item_id)
         obj["pdf_raster_source_bbox_pdf"] = list(placement["source_bbox_pdf"])
         obj["pdf_raster_dpi"] = dpi
+        obj["pdf_image_owner_root"] = image_owner_root
     except Exception:
-        plane_cleanup = _remove_created_image_plane(obj, collection)
+        plane_cleanup = _remove_created_image_plane(ownership, collection)
         file_cleanup = (
             _remove_owned_raster_file(image_path)
             if plane_cleanup.get("status") == "complete"
             else {"status": "not_attempted", "removed": []}
         )
-        _raise_for_incomplete_raster_cleanup(plane_cleanup, file_cleanup)
+        _raise_for_incomplete_raster_cleanup(
+            plane_cleanup,
+            file_cleanup,
+            owned_objects=(ownership.get("object"),),
+            owned_datablocks=(
+                ownership.get("mesh"),
+                ownership.get("material"),
+                ownership.get("image"),
+            ),
+            owned_files=((image_path, image_owner_root),),
+        )
         return None
     return obj
 
@@ -1641,27 +1777,33 @@ def _create_image_plane(
                 pass
             try:
                 bpy.data.objects.remove(obj, do_unlink=True)
+                obj = None
             except Exception as cleanup_exc:
                 cleanup_errors.append(f"object:{type(cleanup_exc).__name__}:{cleanup_exc}")
         if mesh is not None:
             try:
                 bpy.data.meshes.remove(mesh)
+                mesh = None
             except Exception as cleanup_exc:
                 cleanup_errors.append(f"mesh:{type(cleanup_exc).__name__}:{cleanup_exc}")
         if material_created and material is not None:
             try:
                 bpy.data.materials.remove(material)
+                material = None
             except Exception as cleanup_exc:
                 cleanup_errors.append(f"material:{type(cleanup_exc).__name__}:{cleanup_exc}")
         if image_created and image is not None:
             try:
                 bpy.data.images.remove(image)
+                image = None
             except Exception as cleanup_exc:
                 cleanup_errors.append(f"image:{type(cleanup_exc).__name__}:{cleanup_exc}")
         if cleanup_errors:
-            raise RuntimeError(
+            raise _owned_raster_error(
                 "image plane construction and owned-artifact cleanup failed: "
-                f"creation={type(exc).__name__}:{exc}; cleanup={cleanup_errors!r}"
+                f"creation={type(exc).__name__}:{exc}; cleanup={cleanup_errors!r}",
+                owned_objects=(obj,),
+                owned_datablocks=(mesh, material, image),
             ) from exc
         return None
 
@@ -1840,8 +1982,977 @@ def _delivery_expected_locations(attempt_evidence, entity_ids):
     return expected
 
 
+def _expectation_mapping(entries, entity_ids):
+    """Require one and only one expectation for every final physical handle."""
+
+    entity_ids = [str(value) for value in tuple(entity_ids or ())]
+    grouped = {entity_id: [] for entity_id in entity_ids}
+    failures = []
+    for entry in tuple(entries or ()):
+        if not isinstance(entry, dict):
+            failures.append("final_entity_expectation_entry_invalid")
+            continue
+        entity_id = entry.get("entity_id")
+        if not isinstance(entity_id, str) or not entity_id:
+            failures.append("final_entity_expectation_handle_invalid")
+            continue
+        if entity_id not in grouped:
+            failures.append(f"final_entity_expectation_unexpected:{entity_id}")
+            continue
+        grouped[entity_id].append(entry)
+    mapping = {}
+    for entity_id in entity_ids:
+        candidates = grouped[entity_id]
+        if not candidates:
+            failures.append(f"final_entity_expectation_missing:{entity_id}")
+        elif len(candidates) != 1:
+            failures.append(f"final_entity_expectation_ambiguous:{entity_id}")
+        else:
+            mapping[entity_id] = candidates[0]
+    return mapping, failures
+
+
+def _delivery_entity_expectations(attempt_evidence, entity_ids, representation):
+    entries = final_entity_expectations_from_evidence(
+        attempt_evidence,
+        entity_ids,
+        representation,
+    )
+    mapping, failures = _expectation_mapping(entries, entity_ids)
+    return mapping, entries, failures
+
+
+def _reject_nonfinite_json_constant(value):
+    raise ValueError(f"non-finite JSON constant: {value}")
+
+
+def _sealed_entity_expectations(
+    provenance_opts,
+    record,
+    *,
+    item_id: str,
+    page_number: int,
+    source_span_id: int,
+    requested_representation: str,
+    representation: str,
+    entity_ids,
+):
+    """Open immutable delivery-time expectations and validate every binding."""
+
+    failures = []
+    authorities = getattr(
+        provenance_opts,
+        "_final_entity_expectation_authorities",
+        None,
+    )
+    authority = authorities.get(item_id) if isinstance(authorities, dict) else None
+    if not isinstance(authority, FinalEntityExpectationAuthority):
+        return {}, [], ["final_entity_expectation_authority_missing"]
+    payload = str(authority.manifest_json or "")
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    if digest != authority.manifest_sha256:
+        failures.append("final_entity_expectation_authority_digest_mismatch")
+    if str(authority.item_id or "") != item_id:
+        failures.append("final_entity_expectation_authority_item_mismatch")
+    if record.get("final_entity_expectation_sha256") != authority.manifest_sha256:
+        failures.append("final_entity_expectation_record_digest_mismatch")
+    try:
+        manifest = json.loads(
+            payload,
+            parse_constant=_reject_nonfinite_json_constant,
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}, [], [*failures, "final_entity_expectation_authority_invalid"]
+    if not isinstance(manifest, dict):
+        return {}, [], [*failures, "final_entity_expectation_authority_invalid"]
+    if manifest.get("schema") != "blender_final_entity_expectations_v1":
+        failures.append("final_entity_expectation_schema_mismatch")
+    if manifest.get("importer_id") != "bc_pdf_vector_importer.blender":
+        failures.append("final_entity_expectation_importer_mismatch")
+    if str(manifest.get("item_id") or "") != item_id:
+        failures.append("final_entity_expectation_item_mismatch")
+    if _strict_manifest_int(manifest.get("page_number")) != int(page_number):
+        failures.append("final_entity_expectation_page_mismatch")
+    if _strict_manifest_int(manifest.get("source_span_id")) != int(source_span_id):
+        failures.append("final_entity_expectation_span_mismatch")
+    if manifest.get("requested_representation") != requested_representation:
+        failures.append("final_entity_expectation_requested_mode_mismatch")
+    if manifest.get("delivered_representation") != representation:
+        failures.append("final_entity_expectation_delivered_mode_mismatch")
+    sealed_ids = manifest.get("entity_ids")
+    expected_ids = [str(value) for value in tuple(entity_ids or ())]
+    if sealed_ids != expected_ids:
+        failures.append("final_entity_expectation_entity_ids_mismatch")
+    entries = manifest.get("expectations")
+    if not isinstance(entries, list):
+        entries = []
+        failures.append("final_entity_expectation_entries_invalid")
+    mapping, mapping_failures = _expectation_mapping(entries, expected_ids)
+    failures.extend(mapping_failures)
+    return mapping, entries, failures
+
+
+def _finite_matrix_values(value):
+    try:
+        values = [float(part) for part in value]
+    except (TypeError, ValueError):
+        return None
+    if len(values) != 16 or not all(math.isfinite(part) for part in values):
+        return None
+    return values
+
+
+def _evaluated_matrix_values(obj):
+    if getattr(bpy, "_bc_pdf_vector_importer_test_host", False) is True:
+        test_values = getattr(obj, "_pdf_test_evaluated_matrix_values", None)
+        values = _finite_matrix_values(test_values)
+        if values is not None:
+            return values
+    try:
+        evaluated = obj.evaluated_get(bpy.context.evaluated_depsgraph_get())
+        values = [float(part) for row in evaluated.matrix_world for part in row]
+    except (
+        AttributeError,
+        ReferenceError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ):
+        return None
+    return values if len(values) == 16 and all(math.isfinite(v) for v in values) else None
+
+
+def _bounds_from_world_points(points):
+    try:
+        finite_points = [
+            (float(point[0]), float(point[1]))
+            for point in tuple(points or ())
+        ]
+    except (AttributeError, IndexError, TypeError, ValueError):
+        return None
+    if not finite_points or not all(
+        math.isfinite(value) for point in finite_points for value in point
+    ):
+        return None
+    xs = [point[0] for point in finite_points]
+    ys = [point[1] for point in finite_points]
+    return (min(xs), min(ys), max(xs), max(ys))
+
+
+def _live_world_ink_measurement(obj):
+    """Measure evaluated physical ink; production paths never assume success."""
+
+    if getattr(bpy, "_bc_pdf_vector_importer_test_host", False) is True:
+        test_points = getattr(obj, "_pdf_test_world_ink_points", None)
+        if isinstance(test_points, (list, tuple)):
+            if not test_points:
+                return 0, None, "explicit_test_host_points"
+            bounds = _bounds_from_world_points(test_points)
+            if bounds is None:
+                return None, None, "explicit_test_host_points_invalid"
+            return len(test_points), bounds, "explicit_test_host_points"
+
+    evaluated = None
+    mesh = None
+    try:
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+        evaluated = obj.evaluated_get(depsgraph)
+        to_mesh = getattr(evaluated, "to_mesh", None)
+        if not callable(to_mesh):
+            return None, None, "evaluated_to_mesh_unavailable"
+        try:
+            mesh = to_mesh(
+                preserve_all_data_layers=False,
+                depsgraph=depsgraph,
+            )
+        except TypeError:
+            mesh = to_mesh()
+        vertices = tuple(getattr(mesh, "vertices", ()) or ())
+        if not vertices:
+            return 0, None, "evaluated_mesh_vertices"
+        matrix = evaluated.matrix_world
+        points = [matrix @ vertex.co for vertex in vertices]
+        bounds = _bounds_from_world_points(points)
+        if bounds is None:
+            return None, None, "evaluated_mesh_bounds_invalid"
+        return len(vertices), bounds, "evaluated_mesh_vertices"
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return None, None, "evaluated_mesh_measurement_failed"
+    finally:
+        try:
+            clear = getattr(evaluated, "to_mesh_clear", None)
+            if mesh is not None and callable(clear):
+                clear()
+        except (AttributeError, ReferenceError, RuntimeError):
+            pass
+
+
+def _object_property(obj, name, default=None):
+    try:
+        return obj.get(name, default)
+    except (AttributeError, ReferenceError, TypeError):
+        return default
+
+
+def _finite_pair(value):
+    try:
+        result = tuple(float(part) for part in value)
+    except (TypeError, ValueError):
+        return None
+    return result if len(result) == 2 and all(math.isfinite(v) for v in result) else None
+
+
+def _finite_bounds(value):
+    try:
+        result = tuple(float(part) for part in value)
+    except (TypeError, ValueError):
+        return None
+    if (
+        len(result) != 4
+        or not all(math.isfinite(v) for v in result)
+        or result[0] > result[2]
+        or result[1] > result[3]
+    ):
+        return None
+    return result
+
+
+def _finite_coordinate_rows(value, width: int):
+    if not isinstance(value, list):
+        return None
+    rows = []
+    for raw_row in value:
+        if not isinstance(raw_row, list):
+            return None
+        try:
+            row = [float(part) for part in raw_row]
+        except (TypeError, ValueError):
+            return None
+        if len(row) != width or not all(math.isfinite(part) for part in row):
+            return None
+        rows.append(row)
+    return rows
+
+
+def _coordinate_rows_match(expected, actual, width: int) -> bool:
+    expected_rows = _finite_coordinate_rows(expected, width)
+    actual_rows = _finite_coordinate_rows(actual, width)
+    return bool(
+        expected_rows is not None
+        and actual_rows is not None
+        and len(expected_rows) == len(actual_rows)
+        and all(
+            abs(left - right) <= 1e-12
+            for expected_row, actual_row in zip(  # noqa: B905
+                expected_rows,
+                actual_rows,
+            )
+            for left, right in zip(expected_row, actual_row)  # noqa: B905
+        )
+    )
+
+
+def _raster_mesh_state_matches(expected, actual):
+    if not isinstance(expected, dict) or not isinstance(actual, dict):
+        return False, False
+    geometry_matches = bool(
+        _coordinate_rows_match(
+            expected.get("vertices_local"),
+            actual.get("vertices_local"),
+            3,
+        )
+        and expected.get("loops_vertex_indices")
+        == actual.get("loops_vertex_indices")
+        and expected.get("polygons") == actual.get("polygons")
+    )
+    uv_matches = bool(
+        expected.get("uv_layer_name") == "UVMap"
+        and actual.get("uv_layer_name") == "UVMap"
+        and _coordinate_rows_match(
+            expected.get("uv_coordinates"),
+            actual.get("uv_coordinates"),
+            2,
+        )
+    )
+    return geometry_matches, uv_matches
+
+
+def _same_host_identity(left, right) -> bool:
+    if left is right:
+        return True
+    try:
+        if left == right:
+            return True
+    except (ReferenceError, RuntimeError, TypeError, ValueError):
+        pass
+    try:
+        left_pointer = int(left.as_pointer())
+        right_pointer = int(right.as_pointer())
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return False
+    return left_pointer != 0 and left_pointer == right_pointer
+
+
+def _host_node_socket(node, collection_name: str, socket_name: str):
+    try:
+        sockets = getattr(node, collection_name)
+        getter = getattr(sockets, "get", None)
+        socket = getter(socket_name) if callable(getter) else sockets[socket_name]
+    except (
+        AttributeError,
+        IndexError,
+        KeyError,
+        ReferenceError,
+        RuntimeError,
+        TypeError,
+    ):
+        return None
+    return socket
+
+
+def _exact_host_node_link(
+    links,
+    *,
+    from_node,
+    from_socket,
+    to_node,
+    to_socket,
+) -> bool:
+    if from_socket is None or to_socket is None:
+        return False
+    try:
+        return any(
+            _same_host_identity(getattr(link, "from_node", None), from_node)
+            and _same_host_identity(getattr(link, "to_node", None), to_node)
+            and _same_host_identity(getattr(link, "from_socket", None), from_socket)
+            and _same_host_identity(getattr(link, "to_socket", None), to_socket)
+            for link in links
+        )
+    except (AttributeError, ReferenceError, RuntimeError, TypeError, ValueError):
+        return False
+
+
+def _finite_rgba(value):
+    try:
+        rgba = tuple(float(part) for part in value)
+    except (ReferenceError, RuntimeError, TypeError, ValueError):
+        return None
+    if len(rgba) != 4 or not all(math.isfinite(part) for part in rgba):
+        return None
+    return rgba
+
+
+def _text_material_binding_verified(
+    obj,
+    *,
+    material_name: str,
+    expected_rgba,
+) -> bool:
+    """Prove exact assignment, color, alpha, and active Surface shader routing."""
+
+    expected = _finite_rgba(expected_rgba)
+    if not material_name or expected is None:
+        return False
+    try:
+        material = bpy.data.materials.get(material_name)
+        assigned_materials = tuple(obj.data.materials)
+        actual = _finite_rgba(material.diffuse_color)
+        if (
+            material is None
+            or not bool(material.use_nodes)
+            or actual is None
+            or not any(
+                _same_host_identity(candidate, material)
+                for candidate in assigned_materials
+            )
+            or any(
+                abs(left - right) > 1e-6
+                for left, right in zip(actual, expected)  # noqa: B905
+            )
+        ):
+            return False
+        nodes = tuple(material.node_tree.nodes)
+        links = tuple(material.node_tree.links)
+    except (
+        AttributeError,
+        IndexError,
+        ReferenceError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ):
+        return False
+    shaders = [
+        node
+        for node in nodes
+        if str(getattr(node, "type", "") or "") == "BSDF_PRINCIPLED"
+    ]
+    outputs = [
+        node
+        for node in nodes
+        if str(getattr(node, "type", "") or "") == "OUTPUT_MATERIAL"
+    ]
+    try:
+        for shader in shaders:
+            base_color = _finite_rgba(
+                _host_node_socket(shader, "inputs", "Base Color").default_value
+            )
+            shader_alpha = float(
+                _host_node_socket(shader, "inputs", "Alpha").default_value
+            )
+            shader_bsdf = _host_node_socket(shader, "outputs", "BSDF")
+            if (
+                base_color is None
+                or not math.isfinite(shader_alpha)
+                or any(
+                    abs(left - right) > 1e-6
+                    for left, right in zip(base_color, expected)  # noqa: B905
+                )
+                or abs(shader_alpha - expected[3]) > 1e-6
+            ):
+                continue
+            for output in outputs:
+                if not bool(getattr(output, "is_active_output", True)):
+                    continue
+                output_surface = _host_node_socket(output, "inputs", "Surface")
+                if _exact_host_node_link(
+                    links,
+                    from_node=shader,
+                    from_socket=shader_bsdf,
+                    to_node=output,
+                    to_socket=output_surface,
+                ):
+                    return True
+    except (
+        AttributeError,
+        ReferenceError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ):
+        return False
+    return False
+
+
+def _raster_material_binding_verified(
+    obj,
+    *,
+    material_name: str,
+    image_name: str,
+) -> bool:
+    """Prove the final mesh renders the expected packed image through one chain."""
+
+    try:
+        material = bpy.data.materials.get(material_name)
+        image = bpy.data.images.get(image_name)
+        assigned_materials = list(obj.data.materials)
+        polygons = tuple(obj.data.polygons)
+        if (
+            material is None
+            or image is None
+            or not bool(material.use_nodes)
+            or not any(
+                _same_host_identity(candidate, material)
+                for candidate in assigned_materials
+            )
+            or not polygons
+        ):
+            return False
+        for polygon in polygons:
+            material_index = int(polygon.material_index)
+            if (
+                material_index < 0
+                or material_index >= len(assigned_materials)
+                or not _same_host_identity(
+                    assigned_materials[material_index],
+                    material,
+                )
+            ):
+                return False
+        nodes = tuple(material.node_tree.nodes)
+        links = tuple(material.node_tree.links)
+    except (
+        AttributeError,
+        IndexError,
+        ReferenceError,
+        RuntimeError,
+        TypeError,
+        ValueError,
+    ):
+        return False
+    bound_textures = [
+        node
+        for node in nodes
+        if str(getattr(node, "type", "") or "") == "TEX_IMAGE"
+        and _same_host_identity(getattr(node, "image", None), image)
+    ]
+    shaders = [
+        node
+        for node in nodes
+        if str(getattr(node, "type", "") or "") == "BSDF_PRINCIPLED"
+    ]
+    outputs = [
+        node
+        for node in nodes
+        if str(getattr(node, "type", "") or "") == "OUTPUT_MATERIAL"
+    ]
+    for texture in bound_textures:
+        texture_color = _host_node_socket(texture, "outputs", "Color")
+        texture_alpha = _host_node_socket(texture, "outputs", "Alpha")
+        for shader in shaders:
+            shader_base_color = _host_node_socket(shader, "inputs", "Base Color")
+            shader_alpha = _host_node_socket(shader, "inputs", "Alpha")
+            shader_bsdf = _host_node_socket(shader, "outputs", "BSDF")
+            if not (
+                _exact_host_node_link(
+                    links,
+                    from_node=texture,
+                    from_socket=texture_color,
+                    to_node=shader,
+                    to_socket=shader_base_color,
+                )
+                and _exact_host_node_link(
+                    links,
+                    from_node=texture,
+                    from_socket=texture_alpha,
+                    to_node=shader,
+                    to_socket=shader_alpha,
+                )
+            ):
+                continue
+            for output in outputs:
+                if not bool(getattr(output, "is_active_output", True)):
+                    continue
+                output_surface = _host_node_socket(output, "inputs", "Surface")
+                if _exact_host_node_link(
+                    links,
+                    from_node=shader,
+                    from_socket=shader_bsdf,
+                    to_node=output,
+                    to_socket=output_surface,
+                ):
+                    return True
+    return False
+
+
 def _strict_manifest_int(value):
     return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _live_entity_continuity_failures(
+    obj,
+    *,
+    entity_id: str,
+    item_id: str,
+    source_span_id: int,
+    requested_representation: str,
+    representation: str,
+    expectation,
+    stack_offset_m: float,
+):
+    """Fail-closed final-object verification against one sealed expectation."""
+
+    failures = []
+    proof = {
+        "object_handle_verified": False,
+        "source_item_verified": False,
+        "character_identity_verified": False,
+        "representation_fields_verified": False,
+        "text_material_binding_verified": None,
+        "affine_verified": False,
+        "physical_ink_continuity_verified": False,
+    }
+    proof["object_handle_verified"] = (
+        str(getattr(obj, "name", "") or "") == entity_id
+    )
+    if not proof["object_handle_verified"]:
+        failures.append(f"final_entity_handle_mismatch:{entity_id}")
+    source_item_matches = (
+        str(_object_property(obj, "pdf_source_item_id", "") or "") == item_id
+    )
+    source_span_matches = (
+        _strict_manifest_int(_object_property(obj, "pdf_source_span_id"))
+        == int(source_span_id)
+    )
+    proof["source_item_verified"] = source_item_matches and source_span_matches
+    if not source_item_matches:
+        failures.append(f"final_entity_source_item_mismatch:{entity_id}")
+    if not source_span_matches:
+        failures.append(f"final_entity_source_span_mismatch:{entity_id}")
+
+    expected = dict(expectation or {})
+    if not expected:
+        failures.append(f"final_entity_expectation_missing:{entity_id}")
+        return proof, failures
+    kind = str(expected.get("kind") or "")
+    proof["expectation_kind"] = kind
+    if kind not in {"character", "span", "raster"}:
+        failures.append(f"final_entity_expectation_kind_invalid:{entity_id}")
+        return proof, failures
+
+    actual_type = str(getattr(obj, "type", "") or "")
+    expected_type = {
+        "text": "FONT",
+        "3d_text": "FONT",
+        "glyphs": "CURVE",
+        "geometry": "MESH",
+        "raster": "MESH",
+    }.get(representation)
+    representation_ok = bool(
+        expected_type is not None
+        and actual_type == expected_type
+        and str(_object_property(obj, "pdf_text_mode", "") or "")
+        == representation
+        and str(_object_property(obj, "pdf_text_requested_mode", "") or "")
+        == requested_representation
+    )
+    if actual_type != expected_type:
+        failures.append(f"final_entity_type_mismatch:{entity_id}")
+    if (
+        str(_object_property(obj, "pdf_text_mode", "") or "") != representation
+        or str(_object_property(obj, "pdf_text_requested_mode", "") or "")
+        != requested_representation
+    ):
+        failures.append(f"final_entity_representation_mismatch:{entity_id}")
+
+    if kind == "character":
+        character_ok = True
+        expected_index = _strict_manifest_int(expected.get("character_index"))
+        if expected_index is None:
+            failures.append(f"final_entity_character_expectation_invalid:{entity_id}")
+            character_ok = False
+        elif _strict_manifest_int(
+            _object_property(obj, "pdf_source_char_index")
+        ) != expected_index:
+            failures.append(f"final_entity_character_index_mismatch:{entity_id}")
+            character_ok = False
+        for expected_key, property_name, failure_name in (
+            ("glyph_id", "pdf_source_glyph_id", "final_entity_character_glyph_mismatch"),
+            (
+                "physical_glyph_id",
+                "pdf_physical_glyph_id",
+                "final_entity_physical_glyph_mismatch",
+            ),
+        ):
+            if expected_key not in expected:
+                failures.append(f"final_entity_character_expectation_invalid:{entity_id}")
+                character_ok = False
+                continue
+            raw_value = expected.get(expected_key)
+            expected_value = -1 if raw_value is None else _strict_manifest_int(raw_value)
+            if (
+                expected_value is None
+                or _strict_manifest_int(_object_property(obj, property_name))
+                != expected_value
+            ):
+                failures.append(f"{failure_name}:{entity_id}")
+                character_ok = False
+        proof["character_identity_verified"] = character_ok
+    else:
+        proof["character_identity_verified"] = None
+
+    if kind in {"character", "span"}:
+        expected_text = expected.get("text")
+        if not isinstance(expected_text, str) or not expected_text:
+            failures.append(f"final_entity_text_expectation_invalid:{entity_id}")
+            representation_ok = False
+        else:
+            actual_text = (
+                str(getattr(getattr(obj, "data", None), "body", ""))
+                if actual_type == "FONT"
+                else str(_object_property(obj, "pdf_text_source", "") or "")
+            )
+            if actual_text != expected_text:
+                failures.append(f"final_entity_body_mismatch:{entity_id}")
+                representation_ok = False
+        expected_font_sha = str(
+            expected.get("packed_font_sha256")
+            or expected.get("source_ink_font_sha256")
+            or ""
+        )
+        if re.fullmatch(r"[0-9a-f]{64}", expected_font_sha) is None:
+            failures.append(f"final_entity_font_expectation_invalid:{entity_id}")
+            representation_ok = False
+        else:
+            font_ok = (
+                str(_object_property(obj, "pdf_exact_font_sha256", "") or "")
+                == expected_font_sha
+            )
+            if actual_type == "FONT":
+                try:
+                    font_ok = bool(
+                        font_ok
+                        and verify_packed_sha256(obj.data.font, expected_font_sha)
+                        == expected_font_sha
+                    )
+                except (AttributeError, PackedAssetError, ReferenceError, TypeError):
+                    font_ok = False
+            if not font_ok:
+                failures.append(f"final_entity_font_digest_mismatch:{entity_id}")
+                representation_ok = False
+        if actual_type == "FONT":
+            try:
+                actual_extrusion = float(obj.data.extrude)
+                expected_extrusion = float(expected.get("extrusion_m"))
+            except (AttributeError, ReferenceError, TypeError, ValueError):
+                actual_extrusion = expected_extrusion = math.nan
+            if (
+                not math.isfinite(actual_extrusion)
+                or not math.isfinite(expected_extrusion)
+                or abs(actual_extrusion - expected_extrusion) > 1e-12
+            ):
+                failures.append(f"final_entity_extrusion_mismatch:{entity_id}")
+                representation_ok = False
+        material_binding_verified = _text_material_binding_verified(
+            obj,
+            material_name=str(expected.get("material_name") or ""),
+            expected_rgba=expected.get("expected_rgba"),
+        )
+        proof["text_material_binding_verified"] = material_binding_verified
+        if not material_binding_verified:
+            failures.append(
+                f"final_entity_text_material_binding_mismatch:{entity_id}"
+            )
+            representation_ok = False
+
+    topology_field = {
+        "CURVE": ("spline_count", "splines"),
+        "MESH": ("vertex_count", "vertices"),
+    }.get(actual_type)
+    if topology_field is not None:
+        expected_count = _strict_manifest_int(expected.get(topology_field[0]))
+        try:
+            topology_count = len(tuple(getattr(obj.data, topology_field[1])))
+        except (AttributeError, ReferenceError, RuntimeError, TypeError):
+            topology_count = None
+        if expected_count is None or topology_count != expected_count:
+            failures.append(f"final_entity_topology_mismatch:{entity_id}")
+            representation_ok = False
+
+    if kind == "character":
+        expected_matrix = _finite_matrix_values(expected.get("intended_affine_matrix"))
+        affine_ok = expected_matrix is not None
+        if expected_matrix is None:
+            failures.append(f"final_entity_affine_expectation_invalid:{entity_id}")
+        else:
+            metadata_matrix = _finite_matrix_values(
+                _object_property(obj, "pdf_affine_matrix", ())
+            )
+            metadata_tolerance = max(
+                1e-9,
+                max(abs(value) for value in expected_matrix) * 2e-7,
+            )
+            if metadata_matrix is None or any(
+                abs(actual - canonical) > metadata_tolerance
+                for actual, canonical in zip(  # noqa: B905
+                    metadata_matrix,
+                    expected_matrix,
+                )
+            ):
+                failures.append(f"final_entity_affine_metadata_mismatch:{entity_id}")
+                affine_ok = False
+            evaluated_matrix = _evaluated_matrix_values(obj)
+            if evaluated_matrix is None:
+                failures.append(f"final_entity_affine_unverifiable:{entity_id}")
+                affine_ok = False
+            else:
+                stacked_matrix = list(expected_matrix)
+                stacked_matrix[7] += float(stack_offset_m)
+                tolerance = max(
+                    1e-6,
+                    max(abs(value) for value in stacked_matrix) * 2e-7,
+                )
+                if any(
+                    abs(actual - canonical) > tolerance
+                    for actual, canonical in zip(  # noqa: B905
+                        evaluated_matrix,
+                        stacked_matrix,
+                    )
+                ):
+                    failures.append(f"final_entity_affine_mismatch:{entity_id}")
+                    affine_ok = False
+        proof["affine_verified"] = affine_ok
+    else:
+        expected_matrix = _finite_matrix_values(
+            expected.get("evaluated_world_affine_matrix")
+        )
+        affine_ok = expected_matrix is not None
+        if expected_matrix is None:
+            failures.append(f"final_entity_affine_expectation_invalid:{entity_id}")
+        else:
+            evaluated_matrix = _evaluated_matrix_values(obj)
+            if evaluated_matrix is None:
+                failures.append(f"final_entity_affine_unverifiable:{entity_id}")
+                affine_ok = False
+            else:
+                stacked_matrix = list(expected_matrix)
+                stacked_matrix[7] += float(stack_offset_m)
+                tolerance = max(
+                    1e-6,
+                    max(abs(value) for value in stacked_matrix) * 2e-7,
+                )
+                if any(
+                    abs(actual - canonical) > tolerance
+                    for actual, canonical in zip(  # noqa: B905
+                        evaluated_matrix,
+                        stacked_matrix,
+                    )
+                ):
+                    failures.append(f"final_entity_affine_mismatch:{entity_id}")
+                    affine_ok = False
+        proof["affine_verified"] = affine_ok
+
+    ink_count, actual_bounds, measurement = _live_world_ink_measurement(obj)
+    proof["live_ink_element_count"] = ink_count
+    proof["live_ink_measurement"] = measurement
+    ink_ok = ink_count is not None
+    if ink_count is None:
+        failures.append(f"final_entity_physical_ink_unverifiable:{entity_id}")
+    if kind == "character":
+        expected_zero_ink = expected.get("zero_ink_identity")
+        metadata_zero_ink = _object_property(
+            obj,
+            "pdf_metric_zero_ink_identity",
+            None,
+        )
+        if not isinstance(expected_zero_ink, bool):
+            failures.append(f"final_entity_ink_expectation_invalid:{entity_id}")
+            ink_ok = False
+        elif (
+            not isinstance(metadata_zero_ink, bool)
+            or metadata_zero_ink is not expected_zero_ink
+            or (
+                ink_count is not None
+                and ((ink_count == 0) is not expected_zero_ink)
+            )
+        ):
+            failures.append(f"final_entity_physical_ink_mismatch:{entity_id}")
+            ink_ok = False
+        expected_bounds = _finite_bounds(expected.get("expected_world_ink_bounds_m"))
+        if expected_zero_ink is True:
+            if expected.get("expected_world_ink_bounds_m") is not None:
+                failures.append(f"final_entity_ink_expectation_invalid:{entity_id}")
+                ink_ok = False
+            if actual_bounds is not None:
+                failures.append(f"final_entity_physical_ink_mismatch:{entity_id}")
+                ink_ok = False
+        elif expected_bounds is None:
+            failures.append(f"final_entity_ink_bounds_expectation_invalid:{entity_id}")
+            ink_ok = False
+        elif actual_bounds is None:
+            failures.append(f"final_entity_ink_bounds_unverifiable:{entity_id}")
+            ink_ok = False
+        else:
+            stacked_bounds = list(expected_bounds)
+            stacked_bounds[1] += float(stack_offset_m)
+            stacked_bounds[3] += float(stack_offset_m)
+            proof["expected_world_ink_bounds_m"] = stacked_bounds
+            proof["actual_world_ink_bounds_m"] = list(actual_bounds)
+            if any(
+                abs(actual - canonical) > 6e-5
+                for actual, canonical in zip(  # noqa: B905
+                    actual_bounds,
+                    stacked_bounds,
+                )
+            ):
+                failures.append(f"final_entity_ink_bounds_mismatch:{entity_id}")
+                ink_ok = False
+    elif kind == "raster":
+        expected_bbox = _finite_bounds(expected.get("source_bbox_pdf"))
+        expected_sha = str(expected.get("packed_image_sha256") or "")
+        image_name = str(expected.get("image_datablock") or "")
+        material_name = str(expected.get("material_name") or "")
+        live_mesh_state = raster_mesh_fidelity_state(obj)
+        geometry_matches, uv_matches = _raster_mesh_state_matches(
+            expected.get("mesh_state"),
+            live_mesh_state,
+        )
+        material_binding_verified = _raster_material_binding_verified(
+            obj,
+            material_name=material_name,
+            image_name=image_name,
+        )
+        proof["raster_geometry_verified"] = geometry_matches
+        proof["raster_uv_verified"] = uv_matches
+        proof["raster_material_binding_verified"] = material_binding_verified
+        if not geometry_matches:
+            failures.append(f"final_entity_raster_geometry_mismatch:{entity_id}")
+        if not uv_matches:
+            failures.append(f"final_entity_raster_uv_mismatch:{entity_id}")
+        if not material_binding_verified:
+            failures.append(
+                f"final_entity_raster_material_binding_mismatch:{entity_id}"
+            )
+        raster_ok = bool(
+            expected_bbox is not None
+            and _finite_bounds(
+                _object_property(obj, "pdf_raster_source_bbox_pdf", ())
+            )
+            == expected_bbox
+            and re.fullmatch(r"[0-9a-f]{64}", expected_sha)
+            and str(_object_property(obj, "pdf_image_sha256", "") or "")
+            == expected_sha
+            and str(_object_property(obj, "pdf_image_datablock", "") or "")
+            == image_name
+            and ink_count is not None
+            and ink_count > 0
+            and geometry_matches
+            and uv_matches
+            and material_binding_verified
+        )
+        try:
+            image = bpy.data.images.get(image_name)
+            raster_ok = bool(
+                raster_ok
+                and verify_packed_sha256(image, expected_sha) == expected_sha
+            )
+        except (
+            AttributeError,
+            PackedAssetError,
+            ReferenceError,
+            RuntimeError,
+            TypeError,
+        ):
+            raster_ok = False
+        if not raster_ok:
+            failures.append(f"final_entity_raster_continuity_mismatch:{entity_id}")
+        ink_ok = bool(ink_ok and raster_ok)
+    elif ink_count is not None and ink_count <= 0:
+        failures.append(f"final_entity_physical_ink_mismatch:{entity_id}")
+        ink_ok = False
+
+    if kind in {"span", "raster"}:
+        expected_dimensions = _finite_pair(expected.get("expected_dimensions_m"))
+        try:
+            actual_dimensions = (
+                abs(float(obj.dimensions[0])),
+                abs(float(obj.dimensions[1])),
+            )
+        except (
+            AttributeError,
+            IndexError,
+            ReferenceError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ):
+            actual_dimensions = None
+        if expected_dimensions is None:
+            failures.append(f"final_entity_dimensions_expectation_invalid:{entity_id}")
+            representation_ok = False
+        elif actual_dimensions is None or any(
+            abs(actual - canonical) > max(1e-7, abs(canonical) * 1e-3)
+            for actual, canonical in zip(  # noqa: B905
+                actual_dimensions or (),
+                expected_dimensions,
+            )
+        ):
+            failures.append(f"final_entity_dimensions_mismatch:{entity_id}")
+            representation_ok = False
+
+    proof["representation_fields_verified"] = representation_ok
+    proof["physical_ink_continuity_verified"] = ink_ok
+    return proof, list(dict.fromkeys(failures))
 
 
 def _evidence_has_positioned_zero_ink(evidence) -> bool:
@@ -2069,8 +3180,13 @@ def _reverify_text_delivery_after_stack(
         bpy.context.view_layer.update()
     except (AttributeError, ReferenceError, RuntimeError):
         pass
-    registry = getattr(getattr(bpy, "data", None), "objects", None)
-    getter = getattr(registry, "get", None)
+    registry_getter_failure = None
+    try:
+        registry = getattr(getattr(bpy, "data", None), "objects", None)
+        getter = getattr(registry, "get", None)
+    except Exception as exc:
+        getter = None
+        registry_getter_failure = type(exc).__name__
     for record in tuple(delivery_records or ()):
         if (
             int(record.get("page", 0) or 0) != int(page_number)
@@ -2314,6 +3430,33 @@ def _reverify_text_delivery_after_stack(
             proof_page_number = int(record.get("page", 0) or 0)
             proof_source_span_id = int(record.get("source_span_id", 0) or 0)
 
+        final_objects = {}
+        for entity_id in entity_ids:
+            if registry_getter_failure is not None:
+                final_objects[entity_id] = None
+                record_failures.append(
+                    "final_entity_registry_lookup_unreadable:"
+                    f"{entity_id}:{registry_getter_failure}"
+                )
+                continue
+            try:
+                final_objects[entity_id] = (
+                    getter(entity_id) if callable(getter) else None
+                )
+            except Exception as exc:
+                final_objects[entity_id] = None
+                record_failures.append(
+                    "final_entity_registry_lookup_unreadable:"
+                    f"{entity_id}:{type(exc).__name__}"
+                )
+
+        entity_expectations, mutable_expectation_entries, expectation_failures = (
+            _delivery_entity_expectations(
+                prior_evidence,
+                entity_ids,
+                representation,
+            )
+        )
         expected_locations = _delivery_expected_locations(prior_evidence, entity_ids)
         expected_type = expected_types.get(representation)
         if isinstance(canonical_delivery, dict):
@@ -2327,6 +3470,100 @@ def _reverify_text_delivery_after_stack(
                 or prior_evidence.get("proof_kind")
                 == "positioned_zero_ink_delivery_v1"
             )
+        strict_continuity_enabled = provenance_opts is not None
+        canonical_parent_verified = None
+        provenance_parent_handle_verified = None
+        if strict_continuity_enabled:
+            if entity_ids:
+                record_failures.extend(expectation_failures)
+                (
+                    sealed_expectations,
+                    sealed_expectation_entries,
+                    sealed_expectation_failures,
+                ) = _sealed_entity_expectations(
+                    provenance_opts,
+                    record,
+                    item_id=item_id,
+                    page_number=proof_page_number,
+                    source_span_id=proof_source_span_id,
+                    requested_representation=requested_representation,
+                    representation=representation,
+                    entity_ids=entity_ids,
+                )
+                record_failures.extend(sealed_expectation_failures)
+                if mutable_expectation_entries != sealed_expectation_entries:
+                    record_failures.append(
+                        "final_entity_expectation_detector_mismatch"
+                    )
+                for entry in mutable_expectation_entries:
+                    if (
+                        isinstance(entry, dict)
+                        and entry.get("kind") == "character"
+                        and _finite_matrix_values(
+                            entry.get("intended_affine_matrix")
+                        )
+                        is None
+                    ):
+                        record_failures.append(
+                            "final_entity_affine_expectation_invalid:"
+                            + str(entry.get("entity_id") or "<unbound>")
+                        )
+                if sealed_expectations:
+                    entity_expectations = sealed_expectations
+            canonical_parent_verified = True
+            provenance_parent_handle_verified = True
+            canonical_parent = None
+            if entity_ids:
+                canonical_parent = final_objects.get(entity_ids[0])
+                if canonical_parent is None:
+                    canonical_parent_verified = False
+                    record_failures.append(
+                        f"missing_final_entity:{entity_ids[0]}"
+                    )
+                if (
+                    not isinstance(runtime_outcome, AttemptOutcome)
+                    or runtime_outcome.entity is not canonical_parent
+                ):
+                    canonical_parent_verified = False
+                    record_failures.append("final_entity_runtime_parent_mismatch")
+            elif logical_zero_ink_claimed:
+                if (
+                    not isinstance(runtime_outcome, AttemptOutcome)
+                    or runtime_outcome.entity is not None
+                    or tuple(runtime_outcome.entity_ids or ())
+                ):
+                    canonical_parent_verified = False
+                    record_failures.append("final_entity_runtime_parent_mismatch")
+
+            expected_parent_handle = (
+                str(record.get("logical_delivery_id") or "")
+                if logical_zero_ink_claimed
+                else (entity_ids[0] if entity_ids else "")
+            )
+            provenance_objects = getattr(
+                provenance_opts,
+                "_source_provenance_objects",
+                None,
+            )
+            provenance_matches = []
+            if isinstance(provenance_objects, list):
+                provenance_matches = [
+                    candidate
+                    for candidate in provenance_objects
+                    if _strict_manifest_int(getattr(candidate, "page", None))
+                    == int(proof_page_number)
+                    and _strict_manifest_int(getattr(candidate, "span_id", None))
+                    == int(proof_source_span_id)
+                    and str(getattr(candidate, "source_kind", "") or "")
+                    == "text_span"
+                ]
+            if (
+                len(provenance_matches) != 1
+                or str(getattr(provenance_matches[0], "parent_handle", "") or "")
+                != expected_parent_handle
+            ):
+                provenance_parent_handle_verified = False
+                record_failures.append("source_provenance_parent_handle_mismatch")
         evidence_zero_count = prior_evidence.get("zero_ink_character_count")
         raw_manifest_characters = (
             expected_manifest.get("characters")
@@ -2493,7 +3730,7 @@ def _reverify_text_delivery_after_stack(
             record_failures = list(dict.fromkeys(record_failures))
             nested_zero_ink_verified = not record_failures
         for entity_id in entity_ids:
-            obj = getter(entity_id) if callable(getter) else None
+            obj = final_objects.get(entity_id)
             if obj is None:
                 record_failures.append(f"missing_final_entity:{entity_id}")
                 continue
@@ -2526,6 +3763,36 @@ def _reverify_text_delivery_after_stack(
                     )
                 ):
                     record_failures.append(f"final_entity_location_mismatch:{entity_id}")
+            if strict_continuity_enabled:
+                try:
+                    continuity_proof, continuity_failures = (
+                        _live_entity_continuity_failures(
+                            obj,
+                            entity_id=entity_id,
+                            item_id=item_id,
+                            source_span_id=proof_source_span_id,
+                            requested_representation=requested_representation,
+                            representation=representation,
+                            expectation=entity_expectations.get(entity_id),
+                            stack_offset_m=stack_offset_m,
+                        )
+                    )
+                except Exception as exc:
+                    continuity_proof = {
+                        "object_handle_verified": False,
+                        "source_item_verified": False,
+                        "character_identity_verified": False,
+                        "representation_fields_verified": False,
+                        "text_material_binding_verified": False,
+                        "affine_verified": False,
+                        "physical_ink_continuity_verified": False,
+                    }
+                    continuity_failures = [
+                        "final_entity_continuity_unreadable:"
+                        f"{entity_id}:{type(exc).__name__}"
+                    ]
+                proof.update(continuity_proof)
+                record_failures.extend(continuity_failures)
             entity_proofs.append(proof)
         if not entity_ids and not logical_zero_ink_claimed:
             record_failures.append("final_entity_identity_missing")
@@ -2534,6 +3801,8 @@ def _reverify_text_delivery_after_stack(
             "page_number": int(page_number),
             "stack_offset_m": float(stack_offset_m),
             "representation": representation,
+            "canonical_parent_verified": canonical_parent_verified,
+            "provenance_parent_handle_verified": provenance_parent_handle_verified,
             "entities": entity_proofs,
             "failures": record_failures,
         }
@@ -2582,42 +3851,66 @@ def _reverify_text_delivery_after_stack(
                         "exception_type": type(exc).__name__,
                         "detail": str(exc),
                     }
-                if cleanup.get("status") == "complete" and isinstance(outcomes, dict):
-                    outcomes.pop(item_id, None)
-            if cleanup.get("status") == "complete":
-                source_manifests = getattr(
-                    provenance_opts,
-                    "_zero_ink_source_manifests",
-                    None,
-                )
-                if isinstance(source_manifests, dict):
-                    source_manifests.pop(item_id, None)
-                zero_ink_delivery_manifests = getattr(
-                    provenance_opts,
-                    "_zero_ink_delivery_manifests",
-                    None,
-                )
-                if isinstance(zero_ink_delivery_manifests, dict):
-                    zero_ink_delivery_manifests.pop(item_id, None)
-                authorities = getattr(
-                    provenance_opts,
-                    "_zero_ink_reconciliation_authorities",
-                    (),
-                )
-                if isinstance(authorities, tuple):
-                    provenance_opts._zero_ink_reconciliation_authorities = (  # noqa: B010
-                        tuple(
-                            candidate
-                            for candidate in authorities
-                            if not (
-                                isinstance(
-                                    candidate,
-                                    ZeroInkReconciliationAuthority,
-                                )
-                                and candidate.item_id == item_id
+            cleanup_outcomes = getattr(
+                provenance_opts,
+                "_text_cleanup_outcomes",
+                None,
+            )
+            if outcome is not None and cleanup.get("status") != "complete":
+                if not isinstance(cleanup_outcomes, dict):
+                    cleanup_outcomes = {}
+                    provenance_opts._text_cleanup_outcomes = (  # noqa: B010
+                        cleanup_outcomes
+                    )
+                cleanup_outcomes[item_id] = outcome
+            elif isinstance(cleanup_outcomes, dict):
+                cleanup_outcomes.pop(item_id, None)
+            if isinstance(outcomes, dict):
+                # A failed item is never live-delivery authority.  Exact refs
+                # needed after incomplete cleanup live only in the remediation
+                # ledger above.
+                outcomes.pop(item_id, None)
+
+            source_manifests = getattr(
+                provenance_opts,
+                "_zero_ink_source_manifests",
+                None,
+            )
+            if isinstance(source_manifests, dict):
+                source_manifests.pop(item_id, None)
+            zero_ink_delivery_manifests = getattr(
+                provenance_opts,
+                "_zero_ink_delivery_manifests",
+                None,
+            )
+            if isinstance(zero_ink_delivery_manifests, dict):
+                zero_ink_delivery_manifests.pop(item_id, None)
+            authorities = getattr(
+                provenance_opts,
+                "_zero_ink_reconciliation_authorities",
+                (),
+            )
+            if provenance_opts is not None and isinstance(authorities, tuple):
+                provenance_opts._zero_ink_reconciliation_authorities = (  # noqa: B010
+                    tuple(
+                        candidate
+                        for candidate in authorities
+                        if not (
+                            isinstance(
+                                candidate,
+                                ZeroInkReconciliationAuthority,
                             )
+                            and candidate.item_id == item_id
                         )
                     )
+                )
+            final_entity_authorities = getattr(
+                provenance_opts,
+                "_final_entity_expectation_authorities",
+                None,
+            )
+            if isinstance(final_entity_authorities, dict):
+                final_entity_authorities.pop(item_id, None)
             final_proof["cleanup"] = cleanup
             if canonical_state_present:
                 if canonical_detector_maps_bound:
