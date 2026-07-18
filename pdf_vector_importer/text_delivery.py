@@ -61,6 +61,8 @@ _ZERO_INK_CHARACTER_SOURCE_FIELDS = (
     "target_origin_model",
     "target_quad_model",
     "intended_affine_matrix",
+    "source_ink_classification",
+    "source_ink_evidence",
 )
 _LADDERS = {
     "labels": ("labels", "text", "3d_text", "glyphs", "geometry", "raster"),
@@ -108,21 +110,19 @@ def _is_white_space_code_point(code_point: int) -> bool:
 
 
 def classify_text_ink(value: Any) -> str:
-    """Classify nonempty text as visible or semantically zero ink.
+    """Conservatively classify text without font or rendered-source evidence.
 
-    Whitespace and Unicode Default_Ignorable_Code_Point characters carry layout
-    identity but no standalone visible ink. Any other code point keeps the whole
-    string visible, including ordinary combining marks and visible format glyphs.
+    Unicode White_Space is intrinsically zero ink. Default_Ignorable_Code_Point
+    is only a semantic hint: real fonts can map those characters to visible
+    contours, so a Unicode-only call must preserve them until source evidence
+    proves otherwise.
     """
     text = value if isinstance(value, str) else "" if value is None else str(value)
     if not text:
         return "empty"
     for character in text:
         code_point = ord(character)
-        if (
-            _is_white_space_code_point(code_point)
-            or _is_default_ignorable_code_point(code_point)
-        ):
+        if _is_white_space_code_point(code_point):
             continue
         return "visible"
     return "zero_ink"
@@ -139,6 +139,23 @@ def text_is_zero_ink(value: Any) -> bool:
 def text_is_unicode_whitespace(value: Any) -> bool:
     text = value if isinstance(value, str) else "" if value is None else str(value)
     return bool(text) and all(_is_white_space_code_point(ord(char)) for char in text)
+
+
+def text_is_unicode_default_ignorable(value: Any) -> bool:
+    text = value if isinstance(value, str) else "" if value is None else str(value)
+    return bool(text) and all(
+        _is_default_ignorable_code_point(ord(char)) for char in text
+    )
+
+
+def source_character_is_zero_ink(character: Any) -> bool:
+    """Read source-bound ink authority, falling back only for legacy manifests."""
+    if not isinstance(character, dict):
+        return False
+    classification = character.get("source_ink_classification")
+    if classification in {"zero_ink", "visible"}:
+        return classification == "zero_ink"
+    return text_is_zero_ink(character.get("text"))
 
 
 @dataclass(frozen=True)
@@ -497,8 +514,6 @@ def _zero_ink_manifest_contract_failures(
     source_text = manifest.get("source_text")
     if not isinstance(source_text, str) or not source_text:
         failures.append("zero_ink_source_manifest_text_missing")
-    elif require_all_zero_ink and not text_is_zero_ink(source_text):
-        failures.append("zero_ink_source_manifest_text_not_zero_ink")
     characters = manifest.get("characters")
     if not isinstance(characters, list):
         failures.append("zero_ink_source_manifest_characters_invalid")
@@ -528,8 +543,16 @@ def _zero_ink_manifest_contract_failures(
         character_text = character.get("text")
         if not isinstance(character_text, str) or not character_text:
             failures.append("zero_ink_source_manifest_character_text_missing")
-        elif require_all_zero_ink and not text_is_zero_ink(character_text):
+        elif require_all_zero_ink and not source_character_is_zero_ink(character):
             failures.append("zero_ink_source_manifest_character_text_not_zero_ink")
+        classification = character.get("source_ink_classification")
+        if classification is not None and classification not in {"zero_ink", "visible"}:
+            failures.append("zero_ink_source_manifest_ink_classification_invalid")
+        source_ink_evidence = character.get("source_ink_evidence")
+        if classification is not None and (
+            not isinstance(source_ink_evidence, str) or not source_ink_evidence
+        ):
+            failures.append("zero_ink_source_manifest_ink_evidence_missing")
         glyph_id = character.get("glyph_id")
         if glyph_id is not None and _strict_int(glyph_id) is None:
             failures.append("zero_ink_source_manifest_glyph_identity_invalid")
@@ -585,6 +608,8 @@ def _zero_ink_source_manifest_from_evidence(evidence: Dict[str, Any]):
             {
                 field_name: character.get(field_name)
                 for field_name in _ZERO_INK_CHARACTER_SOURCE_FIELDS
+                if field_name not in {"source_ink_classification", "source_ink_evidence"}
+                or field_name in character
             }
             if isinstance(character, dict)
             else {field_name: None for field_name in _ZERO_INK_CHARACTER_SOURCE_FIELDS}
@@ -646,7 +671,9 @@ def _zero_ink_character_proof_failures(
     """Verify every logical-zero child, including children in mixed batches."""
     evidence = dict(outcome.evidence or {})
     failures: list[str] = []
-    if attempted_representation not in {"glyphs", "geometry"}:
+    native_font_representation = attempted_representation in {"text", "3d_text"}
+    converted_representation = attempted_representation in {"glyphs", "geometry"}
+    if not native_font_representation and not converted_representation:
         failures.append("zero_ink_character_representation_not_convertible")
     if evidence.get("importer_id") != IMPORTER_ID:
         failures.append("zero_ink_importer_identity_unbound")
@@ -715,7 +742,7 @@ def _zero_ink_character_proof_failures(
         for index, character in enumerate(expected_characters)
         if isinstance(character, dict)
         and isinstance(character.get("text"), str)
-        and text_is_zero_ink(character.get("text"))
+        and source_character_is_zero_ink(character)
     ]
     if not zero_indices:
         failures.append("zero_ink_character_source_identity_missing")
@@ -736,9 +763,11 @@ def _zero_ink_character_proof_failures(
     if physical_count is None or physical_count != len(runtime_entity_ids):
         failures.append("zero_ink_physical_entity_count_mismatch")
 
-    visible_entity_ids: list[str] = []
+    verified_entity_ids: list[str] = []
     for expected_index in range(expected_count):
-        if expected_index in zero_indices or expected_index >= len(characters):
+        if expected_index >= len(characters):
+            continue
+        if expected_index in zero_indices and not native_font_representation:
             continue
         character = characters[expected_index]
         character_entity_ids = (
@@ -754,24 +783,27 @@ def _zero_ink_character_proof_failures(
         ]
         if not normalized_ids or len(normalized_ids) != len(character_entity_ids):
             failures.append("zero_ink_character_entity_identity_mismatch")
-        visible_entity_ids.extend(normalized_ids)
+        verified_entity_ids.extend(normalized_ids)
     if (
-        len(set(visible_entity_ids)) != len(visible_entity_ids)
-        or runtime_entity_ids != visible_entity_ids
+        len(set(verified_entity_ids)) != len(verified_entity_ids)
+        or runtime_entity_ids != verified_entity_ids
     ):
         failures.append("zero_ink_character_entity_identity_mismatch")
 
     cleanup = evidence.get("cleanup")
-    if evidence.get("cleanup_verified") is not True:
-        failures.append("zero_ink_cleanup_not_verified")
-    if not isinstance(cleanup, dict) or cleanup.get("status") != "complete":
-        failures.append("zero_ink_cleanup_incomplete")
+    if native_font_representation:
         top_removed_values: list[str] = []
     else:
-        top_removed_values = _strict_cleanup_identities(cleanup.get("removed"))
-        if top_removed_values is None:
+        if evidence.get("cleanup_verified") is not True:
+            failures.append("zero_ink_cleanup_not_verified")
+        if not isinstance(cleanup, dict) or cleanup.get("status") != "complete":
+            failures.append("zero_ink_cleanup_incomplete")
             top_removed_values = []
-            failures.append("zero_ink_cleanup_ledger_incomplete")
+        else:
+            top_removed_values = _strict_cleanup_identities(cleanup.get("removed"))
+            if top_removed_values is None:
+                top_removed_values = []
+                failures.append("zero_ink_cleanup_ledger_incomplete")
     child_removed: set[str] = set()
 
     for expected_index in zero_indices:
@@ -796,7 +828,7 @@ def _zero_ink_character_proof_failures(
         if (
             not isinstance(character_text, str)
             or not character_text
-            or not text_is_zero_ink(character_text)
+            or not source_character_is_zero_ink(character)
         ):
             failures.append("zero_ink_character_has_visible_text")
         if character.get("requested_representation") != requested_representation:
@@ -806,7 +838,17 @@ def _zero_ink_character_proof_failures(
         if character.get("positioned_character") is not True:
             failures.append("zero_ink_character_positioning_unverified")
         character_entity_ids = character.get("entity_ids")
-        if not isinstance(character_entity_ids, (list, tuple)) or character_entity_ids:
+        if native_font_representation:
+            if (
+                not isinstance(character_entity_ids, (list, tuple))
+                or not character_entity_ids
+                or any(
+                    not isinstance(value, str) or not value
+                    for value in character_entity_ids
+                )
+            ):
+                failures.append("zero_ink_character_entity_identity_mismatch")
+        elif not isinstance(character_entity_ids, (list, tuple)) or character_entity_ids:
             failures.append("zero_ink_character_has_physical_entity_identity")
 
         canonical_matrix = expected_character.get("intended_affine_matrix")
@@ -824,10 +866,14 @@ def _zero_ink_character_proof_failures(
         ):
             failures.append("zero_advance_logical_proof_unverified")
         intended_matrix = verification.get("intended_affine_matrix")
+        source_affine_matrix = verification.get(
+            "source_affine_matrix",
+            intended_matrix,
+        )
         evaluated_matrix = verification.get("evaluated_affine_matrix")
         if not _finite_sequence(intended_matrix, 16):
             failures.append("zero_ink_character_intended_affine_matrix_unverified")
-        elif _matrix_mismatch(intended_matrix, canonical_matrix, 1e-12):
+        elif _matrix_mismatch(source_affine_matrix, canonical_matrix, 1e-12):
             failures.append("zero_ink_character_intended_affine_matrix_mismatch")
         if not _finite_sequence(evaluated_matrix, 16):
             failures.append("zero_ink_character_evaluated_affine_matrix_unverified")
@@ -835,12 +881,24 @@ def _zero_ink_character_proof_failures(
             evaluated_matrix, intended_matrix, 1e-6
         ):
             failures.append("zero_ink_character_evaluated_affine_matrix_mismatch")
-        if (
-            verification.get("zero_ink_identity") is not True
-            or verification.get("evaluated_ink_bounds_verified") is not True
-            or verification.get("conversion_outcome")
-            != "verified_zero_ink_no_physical_entity"
-        ):
+        identity_verified = bool(
+            verification.get("zero_ink_identity") is True
+            and verification.get("evaluated_ink_bounds_verified") is True
+        )
+        if native_font_representation:
+            identity_verified = bool(
+                identity_verified
+                and verification.get("native_zero_ink_entity_verified") is True
+                and verification.get("actual_object_type") == "FONT"
+                and verification.get("body_verified") is True
+            )
+        else:
+            identity_verified = bool(
+                identity_verified
+                and verification.get("conversion_outcome")
+                == "verified_zero_ink_no_physical_entity"
+            )
+        if not identity_verified:
             failures.append("zero_ink_character_identity_unverified")
         if (
             verification.get("item_id") != str(item_id)
@@ -903,21 +961,22 @@ def _zero_ink_character_proof_failures(
             ):
                 failures.append("zero_ink_character_manifest_identity_unbound")
 
-        character_cleanup = verification.get("cleanup")
-        if (
-            not isinstance(character_cleanup, dict)
-            or character_cleanup.get("status") != "complete"
-            or verification.get("zero_ink_source_font_cleaned") is not True
-            or verification.get("empty_conversion_datablock_cleaned") is not True
-        ):
-            failures.append("zero_ink_character_cleanup_incomplete")
-        elif not _strict_cleanup_identities(character_cleanup.get("removed")):
-            failures.append("zero_ink_character_cleanup_ledger_missing")
-        else:
-            child_removed.update(
-                _strict_cleanup_identities(character_cleanup.get("removed")) or ()
-            )
-    if (
+        if not native_font_representation:
+            character_cleanup = verification.get("cleanup")
+            if (
+                not isinstance(character_cleanup, dict)
+                or character_cleanup.get("status") != "complete"
+                or verification.get("zero_ink_source_font_cleaned") is not True
+                or verification.get("empty_conversion_datablock_cleaned") is not True
+            ):
+                failures.append("zero_ink_character_cleanup_incomplete")
+            elif not _strict_cleanup_identities(character_cleanup.get("removed")):
+                failures.append("zero_ink_character_cleanup_ledger_missing")
+            else:
+                child_removed.update(
+                    _strict_cleanup_identities(character_cleanup.get("removed")) or ()
+                )
+    if not native_font_representation and (
         len(set(top_removed_values)) != len(top_removed_values)
         or set(top_removed_values) != child_removed
     ):
@@ -1068,7 +1127,7 @@ def _zero_ink_delivery_proof_failures(
         character_text = character.get("text")
         if not isinstance(character_text, str) or not character_text:
             failures.append("zero_ink_character_text_missing")
-        elif not text_is_zero_ink(character_text):
+        elif not source_character_is_zero_ink(character):
             failures.append("zero_ink_character_has_visible_text")
         if character.get("requested_representation") != requested_representation:
             failures.append("zero_ink_character_requested_representation_unbound")
@@ -1250,7 +1309,7 @@ def _zero_ink_delivery_manifest(
         for character in characters
         if isinstance(character, dict)
         and isinstance(character.get("text"), str)
-        and text_is_zero_ink(character.get("text"))
+        and source_character_is_zero_ink(character)
     )
     normalized_ids = [str(value) for value in entity_ids if str(value)]
     contribution = 0 if logical_zero_ink_delivery else 1
@@ -1367,12 +1426,12 @@ def deliver_item(
                 else None
             )
             expected_zero_child = bool(
-                representation in {"glyphs", "geometry"}
+                representation in {"text", "3d_text", "glyphs", "geometry"}
                 and isinstance(manifest_characters, list)
                 and any(
                     isinstance(character, dict)
                     and isinstance(character.get("text"), str)
-                    and text_is_zero_ink(character.get("text"))
+                    and source_character_is_zero_ink(character)
                     for character in manifest_characters
                 )
             )
@@ -1390,14 +1449,14 @@ def deliver_item(
                         is True
                         or (
                             isinstance(character.get("text"), str)
-                            and text_is_zero_ink(character.get("text"))
+                            and source_character_is_zero_ink(character)
                         )
                     )
                     for character in evidence_characters
                 )
             )
             nested_zero_ink_claimed = bool(
-                representation in {"glyphs", "geometry"}
+                representation in {"text", "3d_text", "glyphs", "geometry"}
                 and (
                     expected_zero_child
                     or evidence_zero_child
@@ -1586,8 +1645,10 @@ __all__ = [
     "freeze_zero_ink_source_manifest",
     "make_zero_ink_character_manifest",
     "normalize_representation",
+    "source_character_is_zero_ink",
     "text_has_visible_ink",
     "text_is_unicode_whitespace",
+    "text_is_unicode_default_ignorable",
     "text_is_zero_ink",
     "zero_ink_character_proof_failures",
     "zero_ink_delivery_proof_failures",

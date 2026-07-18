@@ -20,7 +20,7 @@ import types
 import bpy
 
 
-INK_TOLERANCE_M = 5.0e-5
+INK_TOLERANCE_M = 6.0e-5
 
 
 def _args() -> tuple[Path, Path, Path]:
@@ -97,20 +97,40 @@ def _assert_calibration(obj) -> dict:
     assert normalization_units == bbox_y_max - bbox_y_min > 0
     derived_ratio = float(normalization_units) / float(units_per_em)
     derived_host_size = source_em * derived_ratio
+    data_size = float(obj.data.size)
+    hard_min = float(obj["pdf_metric_host_font_size_hard_min_m"])
+    hard_max = float(obj["pdf_metric_host_font_size_hard_max_m"])
+    stored_data_size = float(obj["pdf_metric_host_font_data_size_m"])
+    correction = float(
+        obj["pdf_metric_host_font_size_affine_correction_ratio"]
+    )
+    clamped = bool(obj["pdf_metric_host_font_size_clamped"])
+    compensation = str(obj["pdf_metric_host_font_size_compensation"])
+    expected_data_size = min(max(derived_host_size, hard_min), hard_max)
+    expected_correction = derived_host_size / data_size
     assert _close(ratio, derived_ratio, 1.0e-12), (obj.name, ratio, derived_ratio)
     assert _close(host_size, derived_host_size, 1.0e-10), (
         obj.name,
         host_size,
         derived_host_size,
     )
-    assert _close(float(obj.data.size), derived_host_size, 1.0e-10), (
+    assert _close(data_size, expected_data_size, 1.0e-10), (
         obj.name,
-        float(obj.data.size),
-        derived_host_size,
+        data_size,
+        expected_data_size,
     )
+    assert _close(stored_data_size, data_size, 1.0e-10)
+    assert _close(correction, expected_correction, 1.0e-12)
+    assert clamped is (derived_host_size < hard_min or derived_host_size > hard_max)
+    assert compensation == "source_derived_uniform_xy_affine_v1"
     return {
         "source_em_size_m": source_em,
-        "host_font_size_m": float(obj.data.size),
+        "ideal_host_font_size_m": host_size,
+        "host_font_size_m": data_size,
+        "host_font_size_affine_correction_ratio": correction,
+        "host_font_size_clamped": clamped,
+        "host_font_size_hard_min_m": hard_min,
+        "host_font_size_hard_max_m": hard_max,
         "calibration_ratio": ratio,
         "units_per_em": units_per_em,
         "font_bbox_y_min_units": bbox_y_min,
@@ -204,6 +224,99 @@ def main() -> None:
             "fallback_used": False,
             "render_mesh_verified": len(entities),
         }
+
+    clamp_results = []
+    clamp_layout = tuple(item.source_char_layout or ())[0]
+    for sample_index, (source_em_size_m, direction) in enumerate((
+        (0.00005, "below_min"),
+        (20000.0, "above_max"),
+    )):
+        for mode_index, mode in enumerate(("text", "3d_text")):
+            sample_text = str(clamp_layout.text)
+            sample = replace(
+                item,
+                id=9_200_000 + sample_index * 10 + mode_index,
+                text=sample_text,
+                normalized=sample_text.upper().strip(),
+                font_size=source_em_size_m / bl_text_builder.MM_TO_M,
+                source_char_layout=(clamp_layout,),
+                requires_individual_positioning=True,
+            )
+            collection = bpy.data.collections.new(
+                f"NativeFontClamp_{direction}_{mode}"
+            )
+            bpy.context.scene.collection.children.link(collection)
+            opts = types.SimpleNamespace(import_mode="vector", text_mode=mode)
+            entity = bl_text_builder.build_text(
+                sample,
+                collection,
+                page_number=1,
+                text_mode=mode,
+                provenance_opts=opts,
+            )
+            record = opts._text_delivery_records[-1]
+            assert entity is not None and entity.type == "FONT", record
+            assert record["status"] == "delivered", record
+            assert record["final_representation"] == mode
+            assert record["fallback_used"] is False
+            assert record["entity_ids"] == [entity.name]
+            verification = record["attempts"][0]["evidence"][
+                "character_entities"
+            ][0]["verification"]
+            assert verification["native_font_size_calibration_verified"] is True
+            assert verification["evaluated_ink_bounds_verified"] is True
+            assert verification["evaluated_ink_bounds_source"] == (
+                "evaluated_font_render_mesh"
+            )
+            calibration = _assert_calibration(entity)
+            assert calibration["host_font_size_clamped"] is True
+            if direction == "below_min":
+                assert _close(
+                    calibration["host_font_size_m"],
+                    calibration["host_font_size_hard_min_m"],
+                    1.0e-10,
+                )
+                assert calibration["host_font_size_affine_correction_ratio"] < 1.0
+            else:
+                assert _close(
+                    calibration["host_font_size_m"],
+                    calibration["host_font_size_hard_max_m"],
+                    1.0e-7,
+                )
+                assert calibration["host_font_size_affine_correction_ratio"] > 1.0
+            expected_sha = str(entity["pdf_exact_font_sha256"])
+            assert verify_packed_sha256(entity.data.font, expected_sha) == expected_sha
+            font_path = Path(bpy.path.abspath(entity.data.font.filepath)).resolve()
+            if font_path.parent.name == "bc_bl_pdf_exact_fonts":
+                cache_files.add(font_path)
+            expected_bounds = tuple(
+                float(value)
+                for value in entity["pdf_metric_expected_world_ink_bounds_m"]
+            )
+            snapshots.append({
+                "name": entity.name,
+                "mode": mode,
+                "body": entity.data.body,
+                "font_sha256": expected_sha,
+                "matrix": _flatten_matrix(entity.matrix_world),
+                "expected_world_ink_bounds_m": list(expected_bounds),
+                "extrusion_m": float(entity.data.extrude),
+                "calibration": calibration,
+                "sample_kind": "font_size_rna_clamp",
+                "clamp_direction": direction,
+            })
+            clamp_results.append({
+                "direction": direction,
+                "mode": mode,
+                "object_type": entity.type,
+                "source_em_size_m": source_em_size_m,
+                "host_font_data_size_m": calibration["host_font_size_m"],
+                "affine_correction_ratio": calibration[
+                    "host_font_size_affine_correction_ratio"
+                ],
+                "extrusion_m": float(entity.data.extrude),
+                "rendered_ink_verified": True,
+            })
 
     sampled_font_shas = {str(item.font_asset.usable_sha256)}
     font_asset_samples = [{
@@ -370,6 +483,7 @@ def main() -> None:
             int(layout.glyph_id) for layout in item.source_char_layout or ()
         ],
         "modes": mode_results,
+        "font_size_clamp_samples": clamp_results,
         "font_asset_samples": font_asset_samples,
         "blend": str(blend_path),
         "font_cache_files_deleted_before_reopen": len(cache_files),

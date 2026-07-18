@@ -37,11 +37,13 @@ class _MaterialList(list):
 
 class _FontData:
     type = "FONT"
+    size_hard_min = 0.0001
+    size_hard_max = 10000.0
 
     def __init__(self, name: str, *, baseline_available: bool = True):
         self.name = name
         self.body = ""
-        self.size = 0.0
+        self._size = 0.0
         self.extrude = 0.0
         self.resolution_u = 12
         self.align_x = ""
@@ -49,6 +51,17 @@ class _FontData:
         self._baseline_available = baseline_available
         self.materials = _MaterialList()
         self.font = None
+
+    @property
+    def size(self):
+        return self._size
+
+    @size.setter
+    def size(self, value):
+        self._size = min(
+            max(float(value), self.size_hard_min),
+            self.size_hard_max,
+        )
 
     @property
     def align_y(self):
@@ -567,6 +580,44 @@ def _visible_zero_advance_metric_font_asset():
     return asset
 
 
+def _visible_default_ignorable_metric_font_asset():
+    from fontTools.ttLib import TTFont
+
+    asset = _metric_font_asset()
+    font = TTFont(BytesIO(asset.usable_bytes))
+    for cmap in font["cmap"].tables:
+        if cmap.isUnicode():
+            cmap.cmap[0x00AD] = "A"
+    stream = BytesIO()
+    font.save(stream)
+    font.close()
+    asset.usable_bytes = stream.getvalue()
+    asset.usable_sha256 = sha256(asset.usable_bytes).hexdigest()
+    asset.asset_id = f"sha256:{asset.usable_sha256}"
+    return asset
+
+
+def _empty_default_ignorable_metric_font_asset(character, *, zero_advance=False):
+    from fontTools.ttLib import TTFont
+
+    asset = _metric_font_asset()
+    font = TTFont(BytesIO(asset.usable_bytes))
+    for cmap in font["cmap"].tables:
+        if cmap.isUnicode():
+            cmap.cmap[ord(character)] = "space"
+    if zero_advance:
+        font["hmtx"].metrics["space"] = (0, 0)
+    stream = BytesIO()
+    font.save(stream)
+    font.close()
+    asset.usable_bytes = stream.getvalue()
+    asset.usable_sha256 = sha256(asset.usable_bytes).hexdigest()
+    asset.asset_id = f"sha256:{asset.usable_sha256}"
+    if zero_advance:
+        asset.glyph_advances = (500, 500, 0)
+    return asset
+
+
 def _visible_zero_advance_item():
     item = _item()
     item.font_asset = _visible_zero_advance_metric_font_asset()
@@ -744,10 +795,25 @@ def _install_positioned_empty_conversion_host(
     def apply_metric_identity(obj, text_item, *_args, **_kwargs):
         zero_ink = zero_ink_text(text_item.text)
         z_offset_m = float(_args[0]) if _args else 0.0
+        local_advance = float(text_item.advance_width) * 0.001
+        local_line_height = float(text_item.glyph_height) * 0.001
+        local_baseline_y = 0.0
+        try:
+            source_metrics = bl_text_builder._positioned_font_axis_metrics_values(
+                text_item,
+                size=float(text_item.font_size) * 0.001,
+                baseline_alignment="BOTTOM_BASELINE",
+            )
+            if source_metrics.get("source_ink_evidence") == "exact_source_glyph_empty":
+                local_advance = source_metrics["local_matrix_horizontal_extent"]
+                local_line_height = source_metrics["local_line_height"]
+                local_baseline_y = source_metrics["local_baseline_y"]
+        except (AttributeError, IndexError, RuntimeError, TypeError, ValueError):
+            pass
         matrix = bl_text_builder._metric_character_matrix_values(
-            local_advance=float(text_item.advance_width) * 0.001,
-            local_line_height=float(text_item.glyph_height) * 0.001,
-            local_baseline_y=0.0,
+            local_advance=local_advance,
+            local_line_height=local_line_height,
+            local_baseline_y=local_baseline_y,
             target_origin=text_item.insertion,
             target_quad=text_item.target_quad_model,
             z=z_offset_m,
@@ -761,9 +827,9 @@ def _install_positioned_empty_conversion_host(
         obj["pdf_metric_metric_source"] = (
             "source_layout_zero_ink" if zero_ink else "embedded_font_glyph_metrics"
         )
-        obj["pdf_metric_local_advance"] = float(text_item.advance_width) * 0.001
-        obj["pdf_metric_local_line_height"] = float(text_item.glyph_height) * 0.001
-        obj["pdf_metric_local_baseline_y"] = 0.0
+        obj["pdf_metric_local_advance"] = local_advance
+        obj["pdf_metric_local_line_height"] = local_line_height
+        obj["pdf_metric_local_baseline_y"] = local_baseline_y
         obj["pdf_metric_target_origin_m"] = [
             float(text_item.insertion[0]) * 0.001,
             float(text_item.insertion[1]) * 0.001,
@@ -785,9 +851,10 @@ def _install_positioned_empty_conversion_host(
                 "evaluated_bounds_verified": True,
                 "evaluated_ink_bounds_verified": True,
                 "zero_ink_identity": zero_ink,
-                "local_advance_m": float(text_item.advance_width) * 0.001,
+                "local_advance_m": float(obj.get("pdf_metric_local_advance", 0.0)),
                 "zero_advance_logical_proof": (
-                    zero_ink and abs(float(text_item.advance_width)) <= 1e-12
+                    zero_ink
+                    and abs(float(obj.get("pdf_metric_local_advance", 0.0))) <= 1e-12
                 ),
                 "intended_affine_matrix": matrix,
                 "evaluated_affine_matrix": list(matrix),
@@ -1168,6 +1235,129 @@ def test_positioned_conversion_preserves_zero_ink_space_and_delivers_visible_sib
     assert failures == []
     assert record["final_state_verification"]["status"] == "verified"
     assert record["final_state_verification"]["logical_zero_ink_children"] == 1
+
+
+@pytest.mark.parametrize("mode", ["text", "3d_text"])
+def test_positioned_native_font_preserves_zero_ink_space_through_final_reconciliation(
+    monkeypatch,
+    mode,
+):
+    fake, collection = _install(monkeypatch)
+    _install_positioned_empty_conversion_host(monkeypatch, fake)
+    opts = types.SimpleNamespace(import_mode="vector", text_mode=mode)
+    item = _item()
+    item.text = "A B"
+    item.normalized = "A B"
+    item.source_char_layout = _mixed_zero_ink_character_layout()
+    item.requires_individual_positioning = True
+
+    obj = bl_text_builder.build_text(
+        item,
+        collection,
+        page_number=2,
+        text_mode=mode,
+        provenance_opts=opts,
+    )
+
+    assert obj is not None and obj.type == "FONT"
+    assert len(collection.objects.items) == 3
+    assert [candidate.data.body for candidate in collection.objects.items] == [
+        "A",
+        " ",
+        "B",
+    ]
+    assert {candidate.type for candidate in collection.objects.items} == {"FONT"}
+    assert all(
+        (candidate.data.extrude > 0.0) is (mode == "3d_text")
+        for candidate in collection.objects.items
+    )
+    record = opts._text_delivery_records[-1]
+    assert record["status"] == "delivered"
+    assert record["final_representation"] == mode
+    assert record["fallback_used"] is False
+    assert record["zero_ink_character_count"] == 1
+    assert record["physical_entity_count"] == 3
+    assert record["delivered_count_contribution"] == 1
+    assert len(record["entity_ids"]) == 3
+    evidence = record["attempts"][0]["evidence"]
+    assert evidence["source_character_count"] == 3
+    assert evidence["visible_character_count"] == 2
+    assert evidence["zero_ink_character_count"] == 1
+    assert evidence["physical_entity_count"] == 3
+    space = evidence["character_entities"][1]
+    assert space["text"] == " "
+    assert len(space["entity_ids"]) == 1
+    assert space["verification"]["actual_object_type"] == "FONT"
+    assert space["verification"]["zero_ink_identity"] is True
+    assert space["verification"]["evaluated_ink_bounds_verified"] is True
+    assert space["verification"]["native_zero_ink_entity_verified"] is True
+    assert len(space["zero_ink_character_manifest_sha256"]) == 64
+    assert len(opts._zero_ink_reconciliation_authorities) == 1
+
+    objects_by_name = {candidate.name: candidate for candidate in collection.objects.items}
+    fake.data.objects.get = objects_by_name.get
+    monkeypatch.setattr(bl_import_engine, "bpy", fake)
+    failures = bl_import_engine._reverify_text_delivery_after_stack(
+        [record],
+        page_number=2,
+        stack_offset_m=0.0,
+        provenance_opts=opts,
+    )
+
+    assert failures == []
+    assert record["status"] == "delivered"
+    assert record["final_state_verification"]["status"] == "verified"
+    assert record["final_state_verification"]["logical_zero_ink_children"] == 1
+    assert len(collection.objects.items) == 3
+
+
+@pytest.mark.parametrize("mode", ["text", "3d_text"])
+def test_positioned_native_font_all_zero_ink_spaces_remain_editable_font_entities(
+    monkeypatch,
+    mode,
+):
+    fake, collection = _install(monkeypatch)
+    _install_positioned_empty_conversion_host(monkeypatch, fake)
+    opts = types.SimpleNamespace(import_mode="vector", text_mode=mode)
+    item = _item()
+    item.text = "  "
+    item.normalized = ""
+    item.source_char_layout = _whitespace_only_character_layout()
+    item.requires_individual_positioning = True
+
+    obj = bl_text_builder.build_text(
+        item,
+        collection,
+        page_number=2,
+        text_mode=mode,
+        provenance_opts=opts,
+    )
+
+    assert obj is not None and obj.type == "FONT"
+    assert len(collection.objects.items) == 2
+    assert all(candidate.type == "FONT" for candidate in collection.objects.items)
+    assert all(candidate.data.body == " " for candidate in collection.objects.items)
+    record = opts._text_delivery_records[-1]
+    assert record["status"] == "delivered"
+    assert record.get("zero_ink_delivery") is not True
+    assert record["zero_ink_character_count"] == 2
+    assert record["physical_entity_count"] == 2
+    assert record["delivered_count_contribution"] == 1
+
+    objects_by_name = {candidate.name: candidate for candidate in collection.objects.items}
+    fake.data.objects.get = objects_by_name.get
+    monkeypatch.setattr(bl_import_engine, "bpy", fake)
+    failures = bl_import_engine._reverify_text_delivery_after_stack(
+        [record],
+        page_number=2,
+        stack_offset_m=0.0,
+        provenance_opts=opts,
+    )
+
+    assert failures == []
+    assert record["status"] == "delivered"
+    assert record["final_state_verification"]["status"] == "verified"
+    assert len(collection.objects.items) == 2
 
 
 @pytest.mark.parametrize(
@@ -2222,10 +2412,109 @@ def test_positioned_whitespace_without_glyph_id_uses_source_layout_identity_metr
 
 @pytest.mark.parametrize(
     "text",
-    [" ", "\u034f", "\u200d", "\u2061", "\ufe0f", "\U000e0100"],
+    ["\u00ad", "\u034f", "\u200d", "\u2061", "\ufe0f", "\U000e0100"],
 )
-def test_text_ink_classifier_recognizes_unicode_default_ignorables(text):
-    assert text_delivery.classify_text_ink(text) == "zero_ink"
+def test_text_ink_classifier_does_not_use_unicode_default_ignorable_as_ink_authority(
+    text,
+):
+    assert text_delivery.classify_text_ink(text) == "visible"
+
+
+def test_exact_source_contour_overrides_soft_hyphen_default_ignorable_hint():
+    asset = _visible_default_ignorable_metric_font_asset()
+    layout = _whitespace_only_character_layout()[0]
+    layout.text = "\u00ad"
+    layout.glyph_id = 1
+    layout.advance_width = 3.0
+    item = _item()
+    item.font_asset = asset
+    item.font_name = "MetricFixture"
+    item.text = "\u00ad"
+    item.normalized = "\u00ad"
+    item.source_char_layout = (layout,)
+    item.requires_individual_positioning = True
+    child = bl_text_builder._character_text_item(item, layout)
+
+    metrics = bl_text_builder._positioned_font_axis_metrics_values(
+        child,
+        size=0.006,
+        baseline_alignment="BOTTOM_BASELINE",
+    )
+    manifest = bl_text_builder._positioned_zero_ink_source_manifest(
+        item,
+        item_id="page:2:text:41",
+        page_number=2,
+        requested="glyphs",
+        z_offset_m=0.0,
+        baseline_alignment="BOTTOM_BASELINE",
+    )
+
+    assert metrics["zero_ink_identity"] is False
+    assert metrics["source_ink_bounds_design_units"] == pytest.approx(
+        (100.0, -200.0, 500.0, 700.0)
+    )
+    assert metrics["source_ink_evidence"] == "exact_source_glyph_contours"
+    assert manifest["characters"][0]["source_ink_classification"] == "visible"
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_type"),
+    [
+        ("text", "FONT"),
+        ("3d_text", "FONT"),
+        ("glyphs", "CURVE"),
+        ("geometry", "MESH"),
+    ],
+)
+def test_mapped_soft_hyphen_keeps_requested_physical_representation(
+    monkeypatch,
+    mode,
+    expected_type,
+):
+    fake, collection = _install(monkeypatch)
+    _install_positioned_empty_conversion_host(monkeypatch, fake)
+    layout = _whitespace_only_character_layout()[0]
+    layout.text = "\u00ad"
+    layout.glyph_id = 1
+    item = _item()
+    item.font_asset = _visible_default_ignorable_metric_font_asset()
+    item.font_name = "MetricFixture"
+    item.text = "\u00ad"
+    item.normalized = "\u00ad"
+    item.source_char_layout = (layout,)
+    item.requires_individual_positioning = True
+    opts = types.SimpleNamespace(import_mode="vector", text_mode=mode)
+
+    obj = bl_text_builder.build_text(
+        item,
+        collection,
+        page_number=2,
+        text_mode=mode,
+        provenance_opts=opts,
+    )
+
+    record = opts._text_delivery_records[-1]
+    character = record["attempts"][0]["evidence"]["character_entities"][0]
+    assert obj is not None and obj.type == expected_type
+    assert record["status"] == "delivered"
+    assert record["final_representation"] == mode
+    assert record.get("zero_ink_character_count", 0) == 0
+    assert character["source_ink_classification"] == "visible"
+    assert character["source_ink_evidence"] == "exact_source_glyph_contours"
+
+
+def test_missing_glyph_default_ignorable_cannot_create_zero_ink_authority():
+    layout = _whitespace_only_character_layout()[0]
+    layout.text = "\ufe0f"
+    layout.glyph_id = None
+    child = bl_text_builder._character_text_item(_item(), layout)
+
+    source_ink = bl_text_builder._positioned_source_ink_evidence(child)
+
+    assert source_ink["source_ink_classification"] == "visible"
+    assert source_ink["source_ink_evidence"] == (
+        "unicode_default_ignorable_without_source_ink_authority"
+    )
 
 
 @pytest.mark.parametrize(
@@ -2337,7 +2626,10 @@ def test_positioned_default_ignorable_character_delivers_zero_ink_without_notdef
     )
     layout = _whitespace_only_character_layout()[0]
     layout.text = character
+    layout.glyph_id = 2
     item = _item()
+    item.font_asset = _empty_default_ignorable_metric_font_asset(character)
+    item.font_name = "MetricFixture"
     item.text = character
     item.normalized = character
     item.source_char_layout = (layout,)
@@ -2391,7 +2683,10 @@ def test_positioned_default_ignorable_discards_host_notdef_placeholder(
     )
     layout = _whitespace_only_character_layout()[0]
     layout.text = character
+    layout.glyph_id = 2
     item = _item()
+    item.font_asset = _empty_default_ignorable_metric_font_asset(character)
+    item.font_name = "MetricFixture"
     item.text = character
     item.normalized = character
     item.source_char_layout = (layout,)
@@ -2433,7 +2728,13 @@ def test_positioned_variation_selector_zero_advance_keeps_finite_logical_proof(
         zero_ink_texts=(character,),
     )
     layout = _zero_advance_variation_selector_layout()
+    layout.glyph_id = 2
     item = _item()
+    item.font_asset = _empty_default_ignorable_metric_font_asset(
+        character,
+        zero_advance=True,
+    )
+    item.font_name = "MetricFixture"
     item.text = character
     item.normalized = character
     item.source_char_layout = (layout,)
@@ -2480,12 +2781,13 @@ def test_positioned_variation_selector_zero_advance_keeps_finite_logical_proof(
     ) == []
 
 
-def test_zero_advance_zero_ink_metric_affine_uses_singular_logical_matrix(
+def test_zero_advance_whitespace_metric_affine_uses_singular_logical_matrix(
     monkeypatch,
 ):
     _fake, collection = _install(monkeypatch)
     _install_mathutils(monkeypatch)
     layout = _zero_advance_variation_selector_layout()
+    layout.text = " "
     child = bl_text_builder._character_text_item(_item(), layout)
     data = _FontData("ZeroAdvanceLogicalProof")
     data.size = 0.006
@@ -2535,7 +2837,7 @@ def test_visible_zero_advance_combining_glyph_is_not_rejected_or_collapsed(
     layout.glyph_id = 1
     child = bl_text_builder._character_text_item(item, layout)
     data = _FontData("VisibleZeroAdvanceCombining")
-    data.size = child.font_size * 0.001
+    data.size = child.font_size * 0.001 * 0.9
     obj = _Object("VisibleZeroAdvanceCombining", data)
     obj["pdf_baseline_alignment"] = "BOTTOM_BASELINE"
 
@@ -3032,6 +3334,166 @@ def test_positioned_native_font_creation_separates_source_metrics_from_host_size
     assert obj.get("pdf_metric_local_line_height") == pytest.approx(0.009)
 
 
+@pytest.mark.parametrize("delivered", ["text", "3d_text"])
+@pytest.mark.parametrize(
+    ("source_em_size_m", "expected_data_size_m", "expected_affine_correction"),
+    [
+        (0.00005, 0.0001, 0.45),
+        (20000.0, 10000.0, 1.8),
+    ],
+    ids=["below_curve_size_min", "above_curve_size_max"],
+)
+def test_positioned_native_font_compensates_curve_size_clamp_with_source_affine(
+    monkeypatch,
+    delivered,
+    source_em_size_m,
+    expected_data_size_m,
+    expected_affine_correction,
+):
+    _install(monkeypatch)
+    _install_mathutils(monkeypatch)
+    layout = _character_layout()[0]
+    layout.glyph_id = 1
+    parent = _item()
+    parent.font_asset = _metric_font_asset()
+    parent.font_size = source_em_size_m / bl_text_builder.MM_TO_M
+    child = bl_text_builder._character_text_item(parent, layout)
+    packed_font = types.SimpleNamespace(name="PackedMetricFixture")
+    monkeypatch.setattr(
+        bl_text_builder,
+        "_load_exact_font",
+        lambda *_args, **_kwargs: (packed_font, None),
+    )
+
+    obj, data, outcome = bl_text_builder._create_font_candidate(
+        child,
+        _Collection(),
+        page_number=2,
+        requested=delivered,
+        delivered=delivered,
+        item_id="page:2:text:41:char:0",
+        visual_style="source",
+        z_offset_m=0.0,
+        baseline_alignment="BOTTOM_BASELINE",
+    )
+
+    assert outcome is None
+    assert obj is not None and obj.type == "FONT"
+    assert data.type == "FONT"
+    assert data.size == pytest.approx(expected_data_size_m)
+    expected_unclamped_size = source_em_size_m * 0.9
+    assert obj.get("pdf_metric_source_em_size_m") == pytest.approx(source_em_size_m)
+    assert obj.get("pdf_metric_host_font_size_m") == pytest.approx(
+        expected_unclamped_size
+    )
+    assert obj.get("pdf_metric_host_font_data_size_m") == pytest.approx(
+        expected_data_size_m
+    )
+    assert obj.get("pdf_metric_host_font_size_affine_correction_ratio") == pytest.approx(
+        expected_affine_correction
+    )
+    assert obj.get("pdf_metric_host_font_size_clamped") is True
+    assert obj.get("pdf_metric_host_font_size_compensation") == (
+        "source_derived_uniform_xy_affine_v1"
+    )
+    source_metrics = bl_text_builder._positioned_font_axis_metrics_values(
+        child,
+        size=source_em_size_m,
+        baseline_alignment="BOTTOM_BASELINE",
+    )
+    source_matrix = bl_text_builder._metric_character_matrix_values(
+        local_advance=source_metrics["local_matrix_horizontal_extent"],
+        local_line_height=source_metrics["local_line_height"],
+        local_baseline_y=source_metrics["local_baseline_y"],
+        target_origin=child.insertion,
+        target_quad=child.target_quad_model,
+        z=0.0,
+    )
+    actual_matrix = tuple(
+        tuple(obj.get("pdf_affine_matrix")[row * 4 + column] for column in range(4))
+        for row in range(4)
+    )
+    assert obj.get("pdf_metric_source_affine_matrix") == pytest.approx(
+        [float(value) for row in source_matrix for value in row]
+    )
+    for row in range(2):
+        assert actual_matrix[row][0] == pytest.approx(
+            source_matrix[row][0] * expected_affine_correction
+        )
+        assert actual_matrix[row][1] == pytest.approx(
+            source_matrix[row][1] * expected_affine_correction
+        )
+        assert actual_matrix[row][3] == pytest.approx(source_matrix[row][3])
+    expected_extrusion = (
+        max(source_em_size_m * 0.12, 0.00025)
+        if delivered == "3d_text"
+        else 0.0
+    )
+    assert data.extrude == pytest.approx(expected_extrusion)
+
+    failures, evidence = bl_text_builder._verify_native_font_size_calibration(
+        obj,
+        child,
+        zero_ink_identity=False,
+    )
+    assert failures == []
+    assert evidence["native_font_size_calibration_verified"] is True
+    assert evidence["host_font_size_clamped"] is True
+
+
+def test_blender_evaluated_affine_comparison_accepts_float32_factorization_noise_only():
+    intended = [
+        50.242645423264456,
+        0.0,
+        0.0,
+        0.009,
+        -12.017316181026946,
+        45.25935004170082,
+        0.0,
+        0.021,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+    ]
+    evaluated = [
+        50.24264907836914,
+        7.62939453125e-06,
+        0.0,
+        0.009,
+        -12.017322540283203,
+        45.25934982299805,
+        0.0,
+        0.021,
+        0.0,
+        0.0,
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+    ]
+
+    matches, tolerance = bl_text_builder._blender_affine_matrices_close(
+        evaluated,
+        intended,
+    )
+
+    assert matches is True
+    assert tolerance >= 7.62939453125e-06
+    evaluated[1] = 0.001
+    matches, _tolerance = bl_text_builder._blender_affine_matrices_close(
+        evaluated,
+        intended,
+    )
+    assert matches is False
+
+
 def test_positioned_zero_ink_native_font_bypasses_physical_size_calibration(
     monkeypatch,
 ):
@@ -3109,7 +3571,7 @@ def test_positioned_metric_affine_stores_exact_source_glyph_world_ink_bounds(mon
     parent.font_asset = _metric_font_asset()
     child = bl_text_builder._character_text_item(parent, layout)
     data = _FontData("SourceBounds")
-    data.size = 0.006
+    data.size = 0.0054
     obj = _Object("SourceBounds", data)
     obj["pdf_baseline_alignment"] = "BOTTOM_BASELINE"
 
@@ -3243,7 +3705,15 @@ def _native_font_metric_verification_fixture(*, data_size=0.0054, rendered_xmax=
         "pdf_metric_host_font_normalization_units": 900,
         "pdf_metric_source_em_size_m": 0.006,
         "pdf_metric_host_font_size_m": 0.0054,
+        "pdf_metric_host_font_data_size_m": 0.0054,
         "pdf_metric_host_font_size_calibration_ratio": 0.9,
+        "pdf_metric_host_font_size_affine_correction_ratio": 1.0,
+        "pdf_metric_host_font_size_hard_min_m": 0.0001,
+        "pdf_metric_host_font_size_hard_max_m": 10000.0,
+        "pdf_metric_host_font_size_clamped": False,
+        "pdf_metric_host_font_size_compensation": (
+            "source_derived_uniform_xy_affine_v1"
+        ),
         "pdf_metric_host_font_size_calibration": (
             "blender_font_bbox_normalization_v1"
         ),

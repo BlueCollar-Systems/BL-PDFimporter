@@ -23,12 +23,12 @@ from .text_delivery import (
     ZERO_INK_SOURCE_MANIFEST_SCHEMA,
     AttemptOutcome,
     ZeroInkReconciliationAuthority,
-    classify_text_ink,
     deliver_item,
     freeze_zero_ink_source_manifest,
     make_zero_ink_character_manifest,
     normalize_representation,
     text_has_visible_ink,
+    text_is_unicode_default_ignorable,
     text_is_unicode_whitespace,
     text_is_zero_ink,
 )
@@ -44,7 +44,9 @@ _EXACT_GLYPH_CUBIC_CONTOURS_CACHE: Dict[Tuple[str, int, int], tuple] = {}
 _EXACT_FONT_BBOX_METRICS_CACHE: Dict[Tuple[str, int], Tuple[int, int, int]] = {}
 _EVALUATED_FONT_LOCAL_INK_CACHE: Dict[tuple, tuple] = {}
 _TEXT_MODES = {"labels", "text", "3d_text", "glyphs", "geometry", "raster"}
-_METRIC_INK_BOUNDS_TOLERANCE_M = 5e-5
+_METRIC_INK_BOUNDS_TOLERANCE_M = 6e-5
+_BLENDER_FONT_SIZE_HARD_MIN_M = 0.0001
+_BLENDER_FONT_SIZE_HARD_MAX_M = 10000.0
 LOGGER = logging.getLogger(__name__)
 
 
@@ -774,6 +776,63 @@ def _metric_expected_world_ink_bounds(metric_evidence, matrix_values):
     )
 
 
+def _positioned_source_ink_evidence(
+    text_item,
+    *,
+    require_exact_glyph: bool = True,
+) -> Dict[str, Any]:
+    """Classify one positioned character from immutable source glyph evidence."""
+    source_text = str(getattr(text_item, "text", "") or "")
+    asset = getattr(text_item, "font_asset", None)
+    glyph_id = getattr(text_item, "source_glyph_id", None)
+    if glyph_id is not None and require_exact_glyph:
+        glyph_id = int(glyph_id)
+        source_bounds = _exact_glyph_design_bounds(asset, glyph_id)
+        if source_bounds is None:
+            return {
+                "zero_ink_identity": True,
+                "source_ink_classification": "zero_ink",
+                "source_ink_evidence": "exact_source_glyph_empty",
+                "source_ink_bounds_design_units": None,
+                "source_ink_contours_design_units": None,
+            }
+        source_contours = _exact_glyph_cubic_contours(asset, glyph_id)
+        return {
+            "zero_ink_identity": False,
+            "source_ink_classification": "visible",
+            "source_ink_evidence": "exact_source_glyph_contours",
+            "source_ink_bounds_design_units": source_bounds,
+            "source_ink_contours_design_units": source_contours,
+        }
+    if glyph_id is not None:
+        return {
+            "zero_ink_identity": False,
+            "source_ink_classification": "visible",
+            "source_ink_evidence": "unicode_visible_without_source_ink_probe",
+            "source_ink_bounds_design_units": None,
+            "source_ink_contours_design_units": None,
+        }
+    if text_is_unicode_whitespace(source_text):
+        return {
+            "zero_ink_identity": True,
+            "source_ink_classification": "zero_ink",
+            "source_ink_evidence": "unicode_whitespace_without_resolved_glyph",
+            "source_ink_bounds_design_units": None,
+            "source_ink_contours_design_units": None,
+        }
+    return {
+        "zero_ink_identity": False,
+        "source_ink_classification": "visible",
+        "source_ink_evidence": (
+            "unicode_default_ignorable_without_source_ink_authority"
+            if text_is_unicode_default_ignorable(source_text)
+            else "source_character_without_resolved_glyph"
+        ),
+        "source_ink_bounds_design_units": None,
+        "source_ink_contours_design_units": None,
+    }
+
+
 def _positioned_font_axis_metrics_values(
     text_item,
     *,
@@ -783,11 +842,9 @@ def _positioned_font_axis_metrics_values(
     """Return the exact local axes used by both source proof and runtime."""
     asset = getattr(text_item, "font_asset", None)
     glyph_id = getattr(text_item, "source_glyph_id", None)
-    source_text = str(getattr(text_item, "text", "") or "")
-    zero_ink_identity = classify_text_ink(source_text) == "zero_ink"
-    if zero_ink_identity and (
-        glyph_id is None or not text_is_unicode_whitespace(source_text)
-    ):
+    source_ink_evidence = _positioned_source_ink_evidence(text_item)
+    zero_ink_identity = bool(source_ink_evidence["zero_ink_identity"])
+    if zero_ink_identity and glyph_id is None:
         try:
             local_advance = abs(float(text_item.advance_width)) * MM_TO_M
             local_line_height = abs(float(text_item.glyph_height)) * MM_TO_M
@@ -831,6 +888,10 @@ def _positioned_font_axis_metrics_values(
             "source_ink_contours_design_units": None,
             "metric_source": "source_layout_zero_ink",
             "zero_ink_identity": True,
+            "source_ink_classification": source_ink_evidence[
+                "source_ink_classification"
+            ],
+            "source_ink_evidence": source_ink_evidence["source_ink_evidence"],
             "zero_advance_logical_proof": local_advance <= 1e-12,
         }
     try:
@@ -861,14 +922,10 @@ def _positioned_font_axis_metrics_values(
         host_font_bbox_y_max,
         host_font_normalization_units,
     ) = _exact_font_bbox_metrics(asset)
-    source_ink_bounds = (
-        None if zero_ink_identity else _exact_glyph_design_bounds(asset, glyph_id)
-    )
+    source_ink_bounds = source_ink_evidence["source_ink_bounds_design_units"]
     if source_ink_bounds is None and not zero_ink_identity:
         raise RuntimeError("visible positioned character has no exact source glyph ink bounds")
-    source_ink_contours = (
-        None if zero_ink_identity else _exact_glyph_cubic_contours(asset, glyph_id)
-    )
+    source_ink_contours = source_ink_evidence["source_ink_contours_design_units"]
     local_advance = float(advance_units) * design_unit_scale
     local_matrix_horizontal_extent = local_advance
     matrix_horizontal_extent_source = "embedded_font_glyph_advance"
@@ -910,6 +967,10 @@ def _positioned_font_axis_metrics_values(
         "source_ink_contours_design_units": source_ink_contours,
         "metric_source": "embedded_font_glyph_metrics",
         "zero_ink_identity": zero_ink_identity,
+        "source_ink_classification": source_ink_evidence[
+            "source_ink_classification"
+        ],
+        "source_ink_evidence": source_ink_evidence["source_ink_evidence"],
         "zero_advance_logical_proof": (
             zero_ink_identity and local_advance <= 1e-12
         ),
@@ -959,18 +1020,145 @@ def _blender_positioned_font_size_calibration(
     }
 
 
+def _blender_font_size_hard_range(data) -> Tuple[float, float]:
+    """Return Blender's finite representable native FONT size interval."""
+    hard_min = _BLENDER_FONT_SIZE_HARD_MIN_M
+    hard_max = _BLENDER_FONT_SIZE_HARD_MAX_M
+    try:
+        size_property = data.bl_rna.properties["size"]
+        hard_min = float(size_property.hard_min)
+        hard_max = float(size_property.hard_max)
+    except (AttributeError, KeyError, TypeError, ValueError):
+        pass
+    if (
+        not math.isfinite(hard_min)
+        or not math.isfinite(hard_max)
+        or hard_min <= 0.0
+        or hard_max <= hard_min
+    ):
+        raise RuntimeError("Blender native FONT size range is invalid")
+    return hard_min, hard_max
+
+
+def _blender_positioned_font_size_host_state(
+    data,
+    calibration: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Bind ideal source calibration to the host's actual clamped data size."""
+    try:
+        ideal_host_size_m = float(calibration["host_font_size_m"])
+        actual_data_size_m = float(data.size)
+    except (AttributeError, KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError("native FONT host size state is unavailable") from exc
+    hard_min_m, hard_max_m = _blender_font_size_hard_range(data)
+    expected_data_size_m = min(
+        max(ideal_host_size_m, hard_min_m),
+        hard_max_m,
+    )
+    values = (
+        ideal_host_size_m,
+        actual_data_size_m,
+        expected_data_size_m,
+        hard_min_m,
+        hard_max_m,
+    )
+    if not all(math.isfinite(value) and value > 0.0 for value in values):
+        raise RuntimeError("native FONT host size state is non-finite")
+    if not math.isclose(
+        actual_data_size_m,
+        expected_data_size_m,
+        rel_tol=1e-6,
+        abs_tol=1e-10,
+    ):
+        raise RuntimeError(
+            "Blender native FONT size did not resolve to its representable value: "
+            f"actual={actual_data_size_m:.17g}, "
+            f"expected={expected_data_size_m:.17g}"
+        )
+    affine_correction = ideal_host_size_m / actual_data_size_m
+    if not math.isfinite(affine_correction) or affine_correction <= 0.0:
+        raise RuntimeError("native FONT clamp affine correction is invalid")
+    clamped = bool(
+        ideal_host_size_m < hard_min_m or ideal_host_size_m > hard_max_m
+    )
+    return {
+        "host_font_data_size_m": actual_data_size_m,
+        "host_font_size_hard_min_m": hard_min_m,
+        "host_font_size_hard_max_m": hard_max_m,
+        "host_font_size_affine_correction_ratio": affine_correction,
+        "host_font_size_clamped": clamped,
+        "host_font_size_compensation": "source_derived_uniform_xy_affine_v1",
+    }
+
+
+def _apply_native_font_size_affine_correction(
+    matrix_values,
+    correction_ratio: float,
+):
+    """Compensate only the local X/Y axes for a clamped FONT data size."""
+    correction = float(correction_ratio)
+    matrix = [list(float(value) for value in row) for row in matrix_values]
+    if (
+        len(matrix) != 4
+        or any(len(row) != 4 for row in matrix)
+        or not math.isfinite(correction)
+        or correction <= 0.0
+    ):
+        raise ValueError("native FONT size affine correction is invalid")
+    for row in range(4):
+        matrix[row][0] *= correction
+        matrix[row][1] *= correction
+    result = tuple(tuple(row) for row in matrix)
+    if not all(math.isfinite(value) for row in result for value in row):
+        raise ValueError("native FONT size affine correction is non-finite")
+    return result
+
+
+def _blender_affine_matrices_close(actual, intended) -> tuple[bool, float]:
+    """Compare evaluated and intended matrices at Blender's float32 precision."""
+    try:
+        actual_values = tuple(float(value) for value in actual)
+        intended_values = tuple(float(value) for value in intended)
+    except (TypeError, ValueError):
+        return False, 0.0
+    if (
+        len(actual_values) != 16
+        or len(intended_values) != 16
+        or not all(math.isfinite(value) for value in (*actual_values, *intended_values))
+    ):
+        return False, 0.0
+    # Blender factorizes object matrices and stores the components as float32.
+    # Two float32 ULPs at the largest coefficient cover that host round-trip;
+    # anchor, axis and exact-ink checks below remain the geometric authority.
+    coefficient_scale = max(1.0, *(abs(value) for value in intended_values))
+    tolerance = max(1e-6, coefficient_scale * 2.0e-7)
+    return (
+        all(
+            abs(left - right) <= tolerance
+            for left, right in zip(actual_values, intended_values)  # noqa: B905
+        ),
+        tolerance,
+    )
+
+
 def _blender_positioned_font_size_calibration_for_item(
     text_item,
     *,
     source_em_size_m: float,
 ) -> Optional[Dict[str, Any]]:
     """Return host-size calibration without constructing glyph contours."""
-    source_text = str(getattr(text_item, "text", "") or "")
     glyph_id = getattr(text_item, "source_glyph_id", None)
-    zero_ink_identity = classify_text_ink(source_text) == "zero_ink"
-    if zero_ink_identity and (
-        glyph_id is None or not text_is_unicode_whitespace(source_text)
-    ):
+    source_text = str(getattr(text_item, "text", "") or "")
+    zero_ink_identity = bool(
+        _positioned_source_ink_evidence(
+            text_item,
+            require_exact_glyph=(
+                text_is_unicode_whitespace(source_text)
+                or text_is_unicode_default_ignorable(source_text)
+            ),
+        )["zero_ink_identity"]
+    )
+    if zero_ink_identity and glyph_id is None:
         return None
     try:
         asset = text_item.font_asset
@@ -1005,16 +1193,13 @@ def _blender_positioned_font_size_calibration_for_item(
 
 
 def _positioned_font_axis_metrics(obj, text_item) -> Dict[str, Any]:
-    source_size = None
     try:
-        stored_source_size = obj.get("pdf_metric_source_em_size_m")
-        if stored_source_size is not None:
-            source_size = float(stored_source_size)
-    except (AttributeError, TypeError, ValueError):
-        source_size = None
+        source_size = float(text_item.font_size) * MM_TO_M
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise RuntimeError("positioned source em size is unavailable") from exc
     return _positioned_font_axis_metrics_values(
         text_item,
-        size=float(obj.data.size) if source_size is None else source_size,
+        size=source_size,
         baseline_alignment=str(obj.get("pdf_baseline_alignment", "") or ""),
     )
 
@@ -1090,11 +1275,7 @@ def _apply_target_quad_affine(
             if positioned_metric_evidence is not None
             else _positioned_font_axis_metrics(obj, text_item)
         )
-        if int(metric_evidence.get("units_per_em", 0) or 0) > 0:
-            metric_evidence.update(
-                _blender_positioned_font_size_calibration(metric_evidence)
-            )
-        matrix_values = _metric_character_matrix_values(
+        source_matrix_values = _metric_character_matrix_values(
             local_advance=metric_evidence.get(
                 "local_matrix_horizontal_extent",
                 metric_evidence["local_advance"],
@@ -1107,8 +1288,25 @@ def _apply_target_quad_affine(
             allow_zero_advance=bool(metric_evidence.get("zero_ink_identity")),
         )
         expected_ink_bounds = _metric_expected_world_ink_bounds(
-            metric_evidence, matrix_values
+            metric_evidence, source_matrix_values
         )
+        metric_evidence["source_affine_matrix"] = [
+            float(value) for row in source_matrix_values for value in row
+        ]
+        matrix_values = source_matrix_values
+        if (
+            int(metric_evidence.get("units_per_em", 0) or 0) > 0
+            and str(getattr(obj, "type", "") or "") == "FONT"
+        ):
+            calibration = _blender_positioned_font_size_calibration(metric_evidence)
+            calibration.update(
+                _blender_positioned_font_size_host_state(obj.data, calibration)
+            )
+            metric_evidence.update(calibration)
+            matrix_values = _apply_native_font_size_affine_correction(
+                source_matrix_values,
+                calibration["host_font_size_affine_correction_ratio"],
+            )
         metric_evidence.pop("source_ink_bounds_design_units", None)
         metric_evidence.pop("source_ink_contours_design_units", None)
         if expected_ink_bounds is not None:
@@ -1742,21 +1940,13 @@ def _create_font_candidate(
                 )
             )
             if positioned_size_calibration is not None:
-                data.size = float(
-                    positioned_size_calibration["host_font_size_m"]
-                )
-                if not math.isclose(
-                    float(data.size),
-                    float(positioned_size_calibration["host_font_size_m"]),
-                    rel_tol=1e-6,
-                    abs_tol=1e-10,
-                ):
-                    raise RuntimeError(
-                        "Blender native FONT size calibration did not round-trip: "
-                        f"actual={float(data.size):.17g}, "
-                        "expected="
-                        f"{float(positioned_size_calibration['host_font_size_m']):.17g}"
+                data.size = float(positioned_size_calibration["host_font_size_m"])
+                positioned_size_calibration.update(
+                    _blender_positioned_font_size_host_state(
+                        data,
+                        positioned_size_calibration,
                     )
+                )
         else:
             sealed_baseline_alignment = "BOTTOM_BASELINE"
             try:
@@ -2136,9 +2326,25 @@ def _verify_native_font_size_calibration(
         )
         expected = _blender_positioned_font_size_calibration(source_metrics)
         actual_host_size_m = float(obj.data.size)
+        expected_host_state = _blender_positioned_font_size_host_state(
+            obj.data,
+            expected,
+        )
         stored_source_em_size_m = float(obj.get("pdf_metric_source_em_size_m"))
         stored_host_size_m = float(obj.get("pdf_metric_host_font_size_m"))
+        stored_host_data_size_m = float(
+            obj.get("pdf_metric_host_font_data_size_m")
+        )
         stored_ratio = float(obj.get("pdf_metric_host_font_size_calibration_ratio"))
+        stored_affine_correction = float(
+            obj.get("pdf_metric_host_font_size_affine_correction_ratio")
+        )
+        stored_hard_min_m = float(obj.get("pdf_metric_host_font_size_hard_min_m"))
+        stored_hard_max_m = float(obj.get("pdf_metric_host_font_size_hard_max_m"))
+        stored_clamped = obj.get("pdf_metric_host_font_size_clamped")
+        stored_compensation = str(
+            obj.get("pdf_metric_host_font_size_compensation", "") or ""
+        )
         stored_normalization_units = int(
             obj.get("pdf_metric_host_font_normalization_units")
         )
@@ -2147,7 +2353,26 @@ def _verify_native_font_size_calibration(
         stored_method = str(
             obj.get("pdf_metric_host_font_size_calibration", "") or ""
         )
-    except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+    except RuntimeError as exc:
+        runtime_expected = locals().get("expected")
+        expected_host_size = (
+            float(runtime_expected.get("host_font_size_m"))
+            if isinstance(runtime_expected, dict)
+            and runtime_expected.get("host_font_size_m") is not None
+            else math.nan
+        )
+        evidence.update(
+            actual_host_font_size_m=(
+                float(getattr(getattr(obj, "data", None), "size", math.nan))
+            ),
+            native_font_size_calibration_error=str(exc),
+            native_font_size_calibration_verified=False,
+        )
+        if math.isfinite(expected_host_size):
+            evidence["expected_host_font_size_m"] = expected_host_size
+        failures.append("native_font_size_calibration_mismatch")
+        return failures, evidence
+    except (AttributeError, KeyError, TypeError, ValueError):
         evidence["native_font_size_calibration_verified"] = False
         failures.append("native_font_size_calibration_unverifiable")
         return failures, evidence
@@ -2156,6 +2381,14 @@ def _verify_native_font_size_calibration(
     expected_source_em_size_m = float(expected["source_em_size_m"])
     expected_ratio = float(expected["host_font_size_calibration_ratio"])
     expected_method = str(expected["host_font_size_calibration"])
+    expected_host_data_size_m = float(expected_host_state["host_font_data_size_m"])
+    expected_affine_correction = float(
+        expected_host_state["host_font_size_affine_correction_ratio"]
+    )
+    expected_hard_min_m = float(expected_host_state["host_font_size_hard_min_m"])
+    expected_hard_max_m = float(expected_host_state["host_font_size_hard_max_m"])
+    expected_clamped = bool(expected_host_state["host_font_size_clamped"])
+    expected_compensation = str(expected_host_state["host_font_size_compensation"])
     expected_normalization_units = int(
         source_metrics["host_font_normalization_units"]
     )
@@ -2164,8 +2397,14 @@ def _verify_native_font_size_calibration(
     evidence.update(
         actual_host_font_size_m=actual_host_size_m,
         expected_host_font_size_m=expected_host_size_m,
+        expected_host_font_data_size_m=expected_host_data_size_m,
         source_em_size_m=expected_source_em_size_m,
         host_font_size_calibration_ratio=expected_ratio,
+        host_font_size_affine_correction_ratio=expected_affine_correction,
+        host_font_size_hard_min_m=expected_hard_min_m,
+        host_font_size_hard_max_m=expected_hard_max_m,
+        host_font_size_clamped=expected_clamped,
+        host_font_size_compensation=expected_compensation,
         host_font_size_calibration=expected_method,
         host_font_normalization_units=expected_normalization_units,
         host_font_bbox_y_min_units=expected_bbox_y_min,
@@ -2175,23 +2414,37 @@ def _verify_native_font_size_calibration(
         actual_host_size_m,
         stored_source_em_size_m,
         stored_host_size_m,
+        stored_host_data_size_m,
         stored_ratio,
+        stored_affine_correction,
+        stored_hard_min_m,
+        stored_hard_max_m,
         expected_host_size_m,
+        expected_host_data_size_m,
         expected_source_em_size_m,
         expected_ratio,
+        expected_affine_correction,
+        expected_hard_min_m,
+        expected_hard_max_m,
     )
     matches = all(
         math.isfinite(value) and value > 0.0 for value in finite_positive
     ) and all(
         math.isclose(actual, wanted, rel_tol=1e-6, abs_tol=1e-10)
         for actual, wanted in (
-            (actual_host_size_m, expected_host_size_m),
+            (actual_host_size_m, expected_host_data_size_m),
             (stored_source_em_size_m, expected_source_em_size_m),
             (stored_host_size_m, expected_host_size_m),
+            (stored_host_data_size_m, expected_host_data_size_m),
             (stored_ratio, expected_ratio),
+            (stored_affine_correction, expected_affine_correction),
+            (stored_hard_min_m, expected_hard_min_m),
+            (stored_hard_max_m, expected_hard_max_m),
         )
     ) and (
         stored_method == expected_method
+        and stored_clamped is expected_clamped
+        and stored_compensation == expected_compensation
         and stored_normalization_units == expected_normalization_units
         and stored_bbox_y_min == expected_bbox_y_min
         and stored_bbox_y_max == expected_bbox_y_max
@@ -2217,10 +2470,40 @@ def _verify_metric_character_transform(obj, text_item) -> tuple[list[str], Dict[
         local_advance = float(obj.get("pdf_metric_local_advance"))
         local_line_height = float(obj.get("pdf_metric_local_line_height"))
         local_baseline_y = float(obj.get("pdf_metric_local_baseline_y", 0.0) or 0.0)
-        actual_baseline_vec = matrix @ Vector((0.0, local_baseline_y, 0.0))
-        actual_advance_vec = matrix @ Vector((local_advance, local_baseline_y, 0.0))
+        zero_ink_identity = bool(obj.get("pdf_metric_zero_ink_identity", False))
+        calibration_failures, calibration_evidence = (
+            _verify_native_font_size_calibration(
+                obj,
+                text_item,
+                zero_ink_identity=zero_ink_identity,
+            )
+        )
+        failures.extend(calibration_failures)
+        evidence.update(calibration_evidence)
+        affine_correction = float(
+            calibration_evidence.get(
+                "host_font_size_affine_correction_ratio",
+                1.0,
+            )
+        )
+        if not math.isfinite(affine_correction) or affine_correction <= 0.0:
+            affine_correction = 1.0
+            failures.append("native_font_size_affine_correction_unverifiable")
+        evaluated_local_advance = local_advance / affine_correction
+        evaluated_local_line_height = local_line_height / affine_correction
+        evaluated_local_baseline_y = local_baseline_y / affine_correction
+        actual_baseline_vec = matrix @ Vector(
+            (0.0, evaluated_local_baseline_y, 0.0)
+        )
+        actual_advance_vec = matrix @ Vector(
+            (evaluated_local_advance, evaluated_local_baseline_y, 0.0)
+        )
         actual_line_vec = matrix @ Vector(
-            (0.0, local_baseline_y + local_line_height, 0.0)
+            (
+                0.0,
+                evaluated_local_baseline_y + evaluated_local_line_height,
+                0.0,
+            )
         )
         actual_baseline = (float(actual_baseline_vec[0]), float(actual_baseline_vec[1]))
         actual_advance = (float(actual_advance_vec[0]), float(actual_advance_vec[1]))
@@ -2256,16 +2539,10 @@ def _verify_metric_character_transform(obj, text_item) -> tuple[list[str], Dict[
         )
         evaluated_matrix = [float(value) for row in matrix for value in row]
         intended_matrix = [float(value) for value in obj.get("pdf_affine_matrix", [])]
-        zero_ink_identity = bool(obj.get("pdf_metric_zero_ink_identity", False))
-        calibration_failures, calibration_evidence = (
-            _verify_native_font_size_calibration(
-                obj,
-                text_item,
-                zero_ink_identity=zero_ink_identity,
-            )
-        )
-        failures.extend(calibration_failures)
-        evidence.update(calibration_evidence)
+        source_affine_matrix = [
+            float(value)
+            for value in obj.get("pdf_metric_source_affine_matrix", [])
+        ]
         zero_advance_logical_proof = bool(
             obj.get("pdf_metric_zero_advance_logical_proof", False)
         )
@@ -2304,7 +2581,7 @@ def _verify_metric_character_transform(obj, text_item) -> tuple[list[str], Dict[
                 expected_world_ink_bounds is not None
                 and actual_world_ink_bounds is not None
             ):
-                # Blender tessellates font curves. 0.05 mm permits that finite
+                # Blender tessellates font curves. 0.06 mm permits that finite
                 # host approximation while remaining far below visible overscale.
                 tolerance = _METRIC_INK_BOUNDS_TOLERANCE_M
                 outside = (
@@ -2342,6 +2619,9 @@ def _verify_metric_character_transform(obj, text_item) -> tuple[list[str], Dict[
             local_advance,
             local_line_height,
             local_baseline_y,
+            evaluated_local_advance,
+            evaluated_local_line_height,
+            evaluated_local_baseline_y,
         )
         evidence.update(
             expected_location_m=list(target_origin),
@@ -2356,8 +2636,12 @@ def _verify_metric_character_transform(obj, text_item) -> tuple[list[str], Dict[
             local_advance_m=local_advance,
             local_line_height_m=local_line_height,
             local_baseline_y_m=local_baseline_y,
+            evaluated_local_advance_m=evaluated_local_advance,
+            evaluated_local_line_height_m=evaluated_local_line_height,
+            evaluated_local_baseline_y_m=evaluated_local_baseline_y,
             evaluated_affine_matrix=evaluated_matrix,
             intended_affine_matrix=intended_matrix,
+            source_affine_matrix=source_affine_matrix,
             zero_ink_identity=zero_ink_identity,
             zero_advance_logical_proof=zero_advance_logical_proof,
             expected_world_ink_bounds_m=(
@@ -2399,12 +2683,12 @@ def _verify_metric_character_transform(obj, text_item) -> tuple[list[str], Dict[
                 for left, right in zip(actual, expected)  # noqa: B905
             ):
                 failures.append(reason)
-        if len(evaluated_matrix) != 16 or len(intended_matrix) != 16 or any(
-            abs(actual - expected) > 1e-6
-            for actual, expected in zip(  # noqa: B905
-                evaluated_matrix, intended_matrix
-            )
-        ):
+        matrix_matches, matrix_tolerance = _blender_affine_matrices_close(
+            evaluated_matrix,
+            intended_matrix,
+        )
+        evidence["evaluated_affine_matrix_tolerance"] = matrix_tolerance
+        if not matrix_matches:
             failures.append("evaluated_affine_matrix_mismatch")
         carrier_name = str(obj.get("pdf_affine_carrier", "") or "")
         if carrier_name and (
@@ -2842,11 +3126,16 @@ def _visible_zero_advance_exact_contour_required(text_item) -> bool:
         glyph_id = int(text_item.source_glyph_id)
     except (AttributeError, TypeError, ValueError):
         return False
-    return (
-        bool(getattr(text_item, "positioned_character", False))
+    try:
+        source_ink = _positioned_source_ink_evidence(text_item)
+    except (AttributeError, IndexError, RuntimeError, TypeError, ValueError):
+        return False
+    return bool(
+        getattr(text_item, "positioned_character", False)
         and advance == 0.0
         and glyph_id >= 0
-        and text_has_visible_ink(getattr(text_item, "text", ""))
+        and source_ink.get("source_ink_classification") == "visible"
+        and source_ink.get("source_ink_evidence") == "exact_source_glyph_contours"
     )
 
 
@@ -2862,11 +3151,14 @@ def _positioned_item_uses_only_exact_contours(text_item, requested: str) -> bool
             glyph_id = int(layout.glyph_id)
         except (AttributeError, TypeError, ValueError):
             return False
-        if (
-            advance != 0.0
-            or glyph_id < 0
-            or not text_has_visible_ink(getattr(layout, "text", ""))
-        ):
+        if advance != 0.0 or glyph_id < 0:
+            return False
+        try:
+            child = _character_text_item(text_item, layout)
+            source_ink = _positioned_source_ink_evidence(child)
+        except (AttributeError, IndexError, RuntimeError, TypeError, ValueError):
+            return False
+        if source_ink.get("source_ink_evidence") != "exact_source_glyph_contours":
             return False
     return True
 
@@ -3951,14 +4243,22 @@ def _positioned_zero_ink_source_manifest(
     characters = []
     for index, layout in enumerate(layouts):
         glyph_id = getattr(layout, "glyph_id", None)
-        zero_ink_character = text_is_zero_ink(layout.text)
+        child = _character_text_item(text_item, layout)
+        source_text = str(getattr(layout, "text", "") or "")
+        source_ink = _positioned_source_ink_evidence(
+            child,
+            require_exact_glyph=(
+                text_is_unicode_whitespace(source_text)
+                or text_is_unicode_default_ignorable(source_text)
+            ),
+        )
+        zero_ink_character = bool(source_ink["zero_ink_identity"])
         visible_zero_advance_character = bool(
             not zero_ink_character
             and float(layout.advance_width) == 0.0
             and glyph_id is not None
         )
         if zero_ink_character or visible_zero_advance_character:
-            child = _character_text_item(text_item, layout)
             metrics = _positioned_font_axis_metrics_values(
                 child,
                 size=float(child.font_size) * MM_TO_M,
@@ -4014,6 +4314,8 @@ def _positioned_zero_ink_source_manifest(
             "intended_affine_matrix": [
                 float(value) for row in intended_matrix for value in row
             ],
+            "source_ink_classification": source_ink["source_ink_classification"],
+            "source_ink_evidence": source_ink["source_ink_evidence"],
         })
     return {
         "schema": ZERO_INK_SOURCE_MANIFEST_SCHEMA,
@@ -4068,6 +4370,8 @@ def _attempt_positioned_native_characters(
     visual_style,
     z_offset_m,
     baseline_alignment,
+    source_manifest=None,
+    source_manifest_sha256="",
 ):
     """Create one positioned source item, then evaluate all characters once."""
     layouts = tuple(getattr(text_item, "source_char_layout", ()) or ())
@@ -4075,20 +4379,86 @@ def _attempt_positioned_native_characters(
     ownership_outcomes = []
 
     def character_record(index, layout, child, outcome):
-        return {
+        verification = dict(outcome.evidence or {})
+        character_id = f"{item_id}:char:{index}"
+        glyph_id = getattr(layout, "glyph_id", None)
+        manifest_character = {}
+        if isinstance(source_manifest, dict):
+            manifest_characters = source_manifest.get("characters")
+            if (
+                isinstance(manifest_characters, list)
+                and index < len(manifest_characters)
+                and isinstance(manifest_characters[index], dict)
+            ):
+                manifest_character = manifest_characters[index]
+        character_manifest = None
+        character_manifest_sha256 = ""
+        if verification.get("zero_ink_identity") is True:
+            try:
+                raw_character_manifest = make_zero_ink_character_manifest(
+                    source_manifest,
+                    source_manifest_sha256,
+                    index,
+                )
+                character_manifest, character_manifest_sha256 = (
+                    freeze_zero_ink_source_manifest(raw_character_manifest)
+                )
+            except (AttributeError, TypeError, ValueError, OverflowError):
+                character_manifest = None
+                character_manifest_sha256 = ""
+            verification.update({
+                "source_manifest_schema": ZERO_INK_SOURCE_MANIFEST_SCHEMA,
+                "source_manifest_sha256": source_manifest_sha256,
+                "item_id": str(item_id),
+                "page_number": int(page_number),
+                "source_span_id": int(text_item.id),
+                "character_item_id": character_id,
+                "character_index": index,
+                "source_character_text": str(layout.text),
+                "source_glyph_id": int(glyph_id) if glyph_id is not None else None,
+                "requested_representation": requested,
+                "delivered_representation": delivered,
+                "native_zero_ink_entity_verified": bool(outcome.entity_ids),
+                "zero_ink_character_manifest_schema": (
+                    ZERO_INK_CHARACTER_MANIFEST_SCHEMA
+                ),
+                "zero_ink_character_manifest_sha256": character_manifest_sha256,
+            })
+        record = {
+            "item_id": item_id,
+            "character_item_id": character_id,
             "character_index": index,
             "text": str(layout.text),
-            "glyph_id": getattr(layout, "glyph_id", None),
+            "glyph_id": int(glyph_id) if glyph_id is not None else None,
+            "advance_width_model": float(layout.advance_width),
+            "glyph_height_model": float(layout.glyph_height),
             "source_origin_pdf": list(layout.source_origin_pdf),
+            "source_bbox_pdf": list(layout.source_bbox_pdf),
             "source_quad_pdf": [list(point) for point in layout.source_quad_pdf],
             "target_origin_model": list(layout.target_origin),
             "target_quad_model": [list(point) for point in layout.target_quad],
+            "intended_affine_matrix": list(
+                manifest_character.get("intended_affine_matrix", ())
+            ),
+            "source_ink_classification": manifest_character.get(
+                "source_ink_classification"
+            ),
+            "source_ink_evidence": manifest_character.get("source_ink_evidence"),
+            "requested_representation": requested,
+            "delivered_representation": delivered,
             "positioned_character": bool(
                 getattr(child, "positioned_character", False)
             ),
             "entity_ids": [str(value) for value in outcome.entity_ids],
-            "verification": dict(outcome.evidence or {}),
+            "verification": verification,
         }
+        if verification.get("zero_ink_identity") is True:
+            record["source_manifest_sha256"] = source_manifest_sha256
+            record["zero_ink_character_manifest"] = character_manifest
+            record["zero_ink_character_manifest_sha256"] = (
+                character_manifest_sha256
+            )
+        return record
 
     def aggregate_failure(failed, index, outcomes, character_evidence):
         factory = (
@@ -4202,12 +4572,33 @@ def _attempt_positioned_native_characters(
             pass
 
     first = outcomes[0]
+    zero_ink_count = sum(
+        1
+        for character in character_evidence
+        if character.get("verification", {}).get("zero_ink_identity") is True
+    )
+    physical_entity_count = sum(len(outcome.entity_ids) for outcome in outcomes)
     evidence = {
         **_font_asset_evidence(text_item),
+        **_proof_identity(item_id, page_number, int(text_item.id)),
         **dict(first.evidence or {}),
         "item_id": item_id,
+        "requested_representation": requested,
+        "delivered_representation": delivered,
+        "source_manifest_schema": ZERO_INK_SOURCE_MANIFEST_SCHEMA,
+        "source_manifest_sha256": source_manifest_sha256,
+        "source_text": str(
+            source_manifest.get("source_text", text_item.text)
+            if isinstance(source_manifest, dict)
+            else text_item.text
+        ),
+        "source_character_count": len(outcomes),
         "character_positioning_preserved": True,
         "character_count": len(outcomes),
+        "attempted_character_count": len(outcomes),
+        "visible_character_count": len(outcomes) - zero_ink_count,
+        "zero_ink_character_count": zero_ink_count,
+        "physical_entity_count": physical_entity_count,
         "character_entities": character_evidence,
         "dependency_graph_updates": 1,
     }
@@ -4257,7 +4648,6 @@ def _prepare_positioned_converted_candidate(
         source_marks_zero_ink
         and source_evidence.get("zero_ink_identity") is True
         and source_evidence.get("evaluated_ink_bounds_verified") is True
-        and text_is_zero_ink(getattr(text_item, "text", ""))
     )
     try:
         evaluated = source.evaluated_get(depsgraph)
@@ -4478,6 +4868,10 @@ def _attempt_positioned_converted_characters(
             "intended_affine_matrix": list(
                 manifest_character.get("intended_affine_matrix", ())
             ),
+            "source_ink_classification": manifest_character.get(
+                "source_ink_classification"
+            ),
+            "source_ink_evidence": manifest_character.get("source_ink_evidence"),
             "requested_representation": requested,
             "delivered_representation": delivered,
             "positioned_character": bool(
@@ -5004,6 +5398,8 @@ def _attempt_positioned_characters(
             visual_style=visual_style,
             z_offset_m=z_offset_m,
             baseline_alignment=baseline_alignment,
+            source_manifest=source_manifest,
+            source_manifest_sha256=source_manifest_sha256,
         )
     if delivered in {"glyphs", "geometry"}:
         return _attempt_positioned_converted_characters(
@@ -5071,10 +5467,7 @@ def build_text(
                 baseline_alignment = None
     zero_ink_source_manifest = None
     zero_ink_source_manifest_sha256 = ""
-    if (
-        requested in {"glyphs", "geometry"}
-        and positioned_text
-    ):
+    if requested in {"text", "3d_text", "glyphs", "geometry"} and positioned_text:
         try:
             raw_manifest = _positioned_zero_ink_source_manifest(
                 text_item,

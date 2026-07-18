@@ -40,7 +40,7 @@ from .text_delivery import (
     freeze_zero_ink_source_manifest,
     normalize_representation,
     open_zero_ink_reconciliation_authority,
-    text_is_zero_ink,
+    source_character_is_zero_ink,
     zero_ink_character_proof_failures,
     zero_ink_delivery_proof_failures,
 )
@@ -1980,7 +1980,7 @@ def _canonical_zero_ink_delivery_manifest(
     if manifest.get("requested_representation") != source_requested:
         failures.append("zero_ink_delivery_manifest_requested_mode_unbound")
     delivered_representation = manifest.get("delivered_representation")
-    if delivered_representation not in {"glyphs", "geometry"}:
+    if delivered_representation not in {"text", "3d_text", "glyphs", "geometry"}:
         failures.append("zero_ink_delivery_manifest_delivered_mode_invalid")
 
     entity_ids = manifest.get("entity_ids")
@@ -2000,9 +2000,18 @@ def _canonical_zero_ink_delivery_manifest(
         for character in source_characters
         if isinstance(character, dict)
         and isinstance(character.get("text"), str)
-        and text_is_zero_ink(character.get("text"))
+        and source_character_is_zero_ink(character)
     )
-    logical_zero_ink = bool(source_characters) and zero_count == len(source_characters)
+    all_source_characters_zero_ink = bool(source_characters) and zero_count == len(
+        source_characters
+    )
+    # Native Text/3D Text intentionally retain editable FONT entities even when
+    # every character has no rendered ink. Converted CURVE/MESH delivery has no
+    # truthful physical entity for an all-zero item and remains logical-only.
+    logical_zero_ink = bool(
+        all_source_characters_zero_ink
+        and delivered_representation in {"glyphs", "geometry"}
+    )
     if _strict_manifest_int(manifest.get("source_character_count")) != len(
         source_characters
     ):
@@ -2230,13 +2239,16 @@ def _reverify_text_delivery_after_stack(
                 for character in canonical_characters
                 if isinstance(character, dict)
                 and isinstance(character.get("text"), str)
-                and text_is_zero_ink(character.get("text"))
+                and source_character_is_zero_ink(character)
             )
             canonical_logical_zero_ink = bool(canonical_characters) and (
                 canonical_zero_count == len(canonical_characters)
             )
             canonical_count_contribution = (
-                0 if canonical_logical_zero_ink else 1
+                0
+                if canonical_logical_zero_ink
+                and canonical_delivery.get("logical_zero_ink_delivery") is True
+                else 1
             )
             if (
                 canonical_detector_maps_bound
@@ -2331,7 +2343,7 @@ def _reverify_text_delivery_after_stack(
             for character in manifest_characters
             if isinstance(character, dict)
             and isinstance(character.get("text"), str)
-            and text_is_zero_ink(character.get("text"))
+            and source_character_is_zero_ink(character)
         )
         record_zero_count = record.get("zero_ink_character_count")
         evidence_characters = prior_evidence.get("character_entities")
@@ -2344,7 +2356,7 @@ def _reverify_text_delivery_after_stack(
                     and character["verification"].get("zero_ink_identity") is True
                     or (
                         isinstance(character.get("text"), str)
-                        and text_is_zero_ink(character.get("text"))
+                        and source_character_is_zero_ink(character)
                     )
                 )
                 for character in evidence_characters
