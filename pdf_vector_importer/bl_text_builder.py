@@ -8,6 +8,7 @@ import logging
 import math
 import os
 from pathlib import Path
+import struct
 import tempfile
 from typing import Any, Callable, Dict, Optional, Tuple
 
@@ -375,6 +376,107 @@ def _quad_requires_full_affine(quad) -> bool:
     return abs(dot) > 1e-6 or determinant < 0.0
 
 
+_FONT_NORMALIZATION_CACHE: Dict[str, int] = {}
+
+_SFNT_TAGS = (b"\x00\x01\x00\x00", b"OTTO", b"true")
+
+
+def _sfnt_head_bbox_extent(data: bytes) -> Optional[int]:
+    """Return head-table yMax - yMin for sfnt bytes, or None if unreadable."""
+    if len(data) < 12 or data[0:4] not in _SFNT_TAGS:
+        return None
+    try:
+        (num_tables,) = struct.unpack(">H", data[4:6])
+        for index in range(num_tables):
+            entry = 12 + index * 16
+            if entry + 16 > len(data):
+                return None
+            if data[entry:entry + 4] != b"head":
+                continue
+            (table_offset,) = struct.unpack(">I", data[entry + 8:entry + 12])
+            if table_offset + 44 > len(data):
+                return None
+            (y_min,) = struct.unpack(">h", data[table_offset + 38:table_offset + 40])
+            (y_max,) = struct.unpack(">h", data[table_offset + 42:table_offset + 44])
+            if y_max <= y_min:
+                return None
+            return int(y_max) - int(y_min)
+    except struct.error:
+        return None
+    return None
+
+
+def _cff_font_bbox_extent(data: bytes) -> Optional[int]:
+    """Return FontBBox height for bare-CFF bytes, or None if unreadable.
+
+    FreeType exposes a bare CFF's global bounds from the top-dict FontBBox
+    (design units under the standard 1/1000 FontMatrix), which is the same
+    normalization source it uses for sfnt head bounds.
+    """
+    if not data[:1] == b"\x01":
+        return None
+    try:
+        from io import BytesIO
+
+        from fontTools.cffLib import CFFFontSet
+    except ImportError:
+        return None
+    try:
+        cff = CFFFontSet()
+        cff.decompile(BytesIO(data), None)
+        top = cff[cff.fontNames[0]]
+        matrix = tuple(float(v) for v in getattr(top, "FontMatrix", (0.001, 0, 0, 0.001, 0, 0)))
+        bbox = getattr(top, "FontBBox", None)
+        if bbox is None or len(bbox) < 4 or len(matrix) < 6:
+            return None
+        # Only the standard 1/1000 design grid is proven; refuse to guess.
+        if (
+            abs(matrix[0] - 0.001) > 1e-9
+            or abs(matrix[3] - 0.001) > 1e-9
+            or abs(matrix[1]) > 1e-12
+            or abs(matrix[2]) > 1e-12
+        ):
+            return None
+        extent = float(bbox[3]) - float(bbox[1])
+        if not math.isfinite(extent) or extent <= 0.0:
+            return None
+        return int(round(extent))
+    except Exception:
+        return None
+
+
+def _blender_font_normalization_extent(asset) -> int:
+    """Return the design-unit extent Blender maps one FONT data.size onto.
+
+    Blender (via FreeType) normalizes an imported vector font by its GLOBAL
+    font bounding-box height — head.yMax - head.yMin for sfnt fonts — not by
+    units_per_em and not by hhea ascender-descender. Measured on Blender 5.2
+    with the owner drawing's embedded Arial subset: advance, ink width, and
+    ink height all implied exactly 2794.0 units per data.size, matching the
+    head bbox (em 2048, hhea asc-desc 2288). Deriving glyph scale from the
+    ascender-descender box rendered every positioned character at 2288/2794 =
+    0.819 of its true size (R-B regression, hot 379 -> 497 on 1015).
+    """
+    digest = str(getattr(asset, "usable_sha256", "") or "")
+    cached = _FONT_NORMALIZATION_CACHE.get(digest)
+    if cached is not None:
+        return cached
+    data = bytes(getattr(asset, "usable_bytes", b"") or b"")
+    if not data or not digest or sha256(data).hexdigest() != digest:
+        raise RuntimeError(
+            "exact font bytes are unavailable for host normalization metrics"
+        )
+    extent = _sfnt_head_bbox_extent(data)
+    if extent is None:
+        extent = _cff_font_bbox_extent(data)
+    if extent is None or extent <= 0:
+        raise RuntimeError(
+            "exact font global bounds are unavailable for host normalization metrics"
+        )
+    _FONT_NORMALIZATION_CACHE[digest] = int(extent)
+    return int(extent)
+
+
 def _positioned_font_axis_metrics(obj, text_item) -> Dict[str, Any]:
     asset = getattr(text_item, "font_asset", None)
     glyph_id = getattr(text_item, "source_glyph_id", None)
@@ -438,10 +540,34 @@ def _positioned_font_axis_metrics(obj, text_item) -> Dict[str, Any]:
         or size <= 0.0
     ):
         raise RuntimeError("exact embedded font metrics are invalid for positioned character")
-    local_unit_scale = size / float(line_height_units)
+    # Blender renders one font design unit as data.size / global-bbox-extent
+    # meters (see _blender_font_normalization_extent). Reading data.size back
+    # from the host also folds in any hard-range clamp the host applied.
+    font_normalization_units = _blender_font_normalization_extent(asset)
+    rendered_unit_m = size / float(font_normalization_units)
+    # Vertical axis is NEUTRAL: the character quad's vertical edge supplies
+    # direction only. The quad edge length is not a reliable font line box
+    # (PyMuPDF quad heights measured 0.937 x em on the owner drawing where an
+    # ascender-descender box would be 1.117 x em), so scaling glyph ink to it
+    # under-delivers the requested size. With local_line_height equal to the
+    # quad edge length, the matrix's vertical column is a unit vector and the
+    # rendered vertical scale stays exactly the calibrated source em scale.
+    target_quad = getattr(text_item, "target_quad_model", None)
+    if target_quad is None or len(target_quad) != 4:
+        raise RuntimeError(
+            "positioned character target quad is unavailable for metric mapping"
+        )
+    ul, _ur, _lr, ll = tuple(
+        (float(point[0]), float(point[1])) for point in target_quad
+    )
+    quad_vertical_m = math.hypot(ul[0] - ll[0], ul[1] - ll[1]) * MM_TO_M
+    if not math.isfinite(quad_vertical_m) or quad_vertical_m <= 0.0:
+        raise RuntimeError(
+            "positioned character target quad has no vertical extent"
+        )
     baseline_alignment = str(obj.get("pdf_baseline_alignment", "") or "")
     local_baseline_y = (
-        -float(descender) * local_unit_scale
+        -float(descender) * rendered_unit_m
         if baseline_alignment == "BOTTOM"
         else 0.0
     )
@@ -452,9 +578,12 @@ def _positioned_font_axis_metrics(obj, text_item) -> Dict[str, Any]:
         "descender": descender,
         "advance_units": advance_units,
         "line_height_units": line_height_units,
-        "local_advance": float(advance_units) * local_unit_scale,
-        "local_line_height": size,
+        "font_normalization_units": font_normalization_units,
+        "rendered_unit_m": rendered_unit_m,
+        "local_advance": float(advance_units) * rendered_unit_m,
+        "local_line_height": quad_vertical_m,
         "local_baseline_y": local_baseline_y,
+        "vertical_axis_scale": "neutral_source_em",
         "metric_source": "embedded_font_glyph_metrics",
         "zero_ink_identity": False,
     }
@@ -1064,11 +1193,24 @@ def _create_font_candidate(
         name = f"P{page_number}_text_{delivered}_{int(text_item.id)}{entity_suffix}"
         data = bpy.data.curves.new(name=name, type="FONT")
         data.body = str(text_item.text)
-        requested_size_mm = (
-            float(getattr(text_item, "font_size", 0.0) or 0.0)
-            if positioned_character
-            else float(_calibrated_text_size_mm(text_item))
-        )
+        if positioned_character:
+            # Blender normalizes a vector font by its global bbox height, not
+            # its em size; scale data.size so the rendered em equals the
+            # source em (see _blender_font_normalization_extent).
+            asset = getattr(text_item, "font_asset", None)
+            units_per_em = int(getattr(asset, "units_per_em", 0) or 0)
+            if units_per_em <= 0:
+                raise RuntimeError(
+                    "exact embedded font em size is unavailable for positioned character"
+                )
+            host_calibration = (
+                float(_blender_font_normalization_extent(asset)) / float(units_per_em)
+            )
+            requested_size_mm = (
+                float(getattr(text_item, "font_size", 0.0) or 0.0) * host_calibration
+            )
+        else:
+            requested_size_mm = float(_calibrated_text_size_mm(text_item))
         data.size = max(requested_size_mm * MM_TO_M, 0.0001)
         data.font = font
         data.align_x = "LEFT"

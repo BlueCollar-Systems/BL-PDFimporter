@@ -378,12 +378,51 @@ class _FakeBpy:
         )
 
 
+def _sfnt_font_bytes(*, units_per_em=1000, y_min=-250, y_max=1000):
+    """Minimal single-table sfnt whose only content is a valid 'head' table.
+
+    Blender/FreeType normalizes a loaded vector font by the head-table global
+    bounding-box height (yMax - yMin), so tests choose an extent that differs
+    from BOTH units_per_em and hhea ascender-descender to pin the basis.
+    """
+    import struct
+
+    head = struct.pack(
+        ">IIIIHHqqhhhhHHhhh",
+        0x00010000,  # version
+        0,  # fontRevision
+        0,  # checkSumAdjustment
+        0x5F0F3CF5,  # magicNumber
+        0,  # flags
+        units_per_em,
+        0,  # created
+        0,  # modified
+        -100,  # xMin
+        y_min,
+        900,  # xMax
+        y_max,
+        0,  # macStyle
+        0,  # lowestRecPPEM
+        2,  # fontDirectionHint
+        0,  # indexToLocFormat
+        0,  # glyphDataFormat
+    )
+    header = struct.pack(">IHHHH", 0x00010000, 1, 16, 0, 0)
+    entry = struct.pack(">4sIII", b"head", 0, 28, len(head))
+    return header + entry + head
+
+
+# head bbox extent baked into the shared fixture: 1000 - (-250) = 1250 design
+# units with units_per_em 1000 and hhea ascender-descender 800-(-200) = 1000.
+_FIXTURE_FONT_BBOX_EXTENT = 1250
+
+
 def _font_asset():
-    font_bytes = b"exact-pdf-font"
+    font_bytes = _sfnt_font_bytes(units_per_em=1000, y_min=-250, y_max=1000)
     return types.SimpleNamespace(
         asset_id="sha256:abcdef",
         usable_sha256=sha256(font_bytes).hexdigest(),
-        usable_format="cff",
+        usable_format="ttf",
         usable_bytes=font_bytes,
         source_sha256="123456",
         base_font_name="ExactPDF",
@@ -751,6 +790,97 @@ def test_positioned_whitespace_without_glyph_id_uses_source_layout_identity_metr
     assert metrics["zero_ink_identity"] is True
     assert metrics["local_advance"] == pytest.approx(0.006)
     assert metrics["local_line_height"] == pytest.approx(0.006)
+
+
+def test_positioned_glyph_metrics_use_blender_font_bbox_normalization():
+    # R-B regression contract (owner drawing 1015, v1.0.66..v1.0.68):
+    # Blender/FreeType normalizes a loaded vector font so one data.size spans
+    # the font's GLOBAL bounding-box height (head.yMax - head.yMin), not the
+    # hhea ascender-descender line box. The disproved assumption
+    # (local_unit_scale = size / (ascender - descender)) rendered every
+    # positioned character at (asc-desc)/bbox_extent of its true size —
+    # measured 2288/2794 = 0.819 with the drawing's embedded Arial subset,
+    # hot cells 379 -> 497 on the visual-parity harness.
+    child = bl_text_builder._character_text_item(_item(), _character_layout()[0])
+    data = _FontData("BboxNormalization")
+    # host-calibrated size: 6 mm source em * (1250 / 1000) bbox calibration
+    data.size = 0.0075
+    obj = _Object("BboxNormalization", data)
+
+    metrics = bl_text_builder._positioned_font_axis_metrics(obj, child)
+
+    assert metrics["metric_source"] == "embedded_font_glyph_metrics"
+    assert metrics["font_normalization_units"] == _FIXTURE_FONT_BBOX_EXTENT
+    # advance_units(500) rendered meters: 500 * data.size / bbox_extent(1250)
+    assert metrics["local_advance"] == pytest.approx(500 * 0.0075 / 1250)
+    assert metrics["advance_units"] == 500
+
+
+def test_positioned_glyph_metrics_vertical_axis_is_neutral_quad_edge():
+    # The PyMuPDF character quad's vertical edge is NOT a reliable
+    # ascender-descender box (measured 0.937 x em on the owner drawing, an
+    # ascender-descender box would be 1.117 x em). Mapping the font line box
+    # onto it under-scales glyph ink. The quad's vertical edge supplies
+    # DIRECTION only: local_line_height must equal the quad edge length so the
+    # matrix's vertical column is a unit vector and the rendered vertical
+    # scale stays exactly the calibrated source em scale.
+    child = bl_text_builder._character_text_item(_item(), _character_layout()[0])
+    data = _FontData("NeutralVertical")
+    data.size = 0.0075
+    obj = _Object("NeutralVertical", data)
+
+    metrics = bl_text_builder._positioned_font_axis_metrics(obj, child)
+
+    # layout target_quad UL(12,30) LL(12,24) mm -> vertical edge 6 mm = 0.006 m
+    assert metrics["local_line_height"] == pytest.approx(0.006)
+    matrix = bl_text_builder._metric_character_matrix_values(
+        local_advance=metrics["local_advance"],
+        local_line_height=metrics["local_line_height"],
+        local_baseline_y=metrics["local_baseline_y"],
+        target_origin=child.insertion,
+        target_quad=child.target_quad_model,
+        z=0.0,
+    )
+    # vertical column must be a unit vector: rendered vertical scale 1.0
+    assert math.hypot(matrix[0][1], matrix[1][1]) == pytest.approx(1.0)
+
+
+def test_positioned_font_candidate_calibrates_host_size_to_font_bbox(monkeypatch):
+    # data.size must be source_em_size * (bbox_extent / units_per_em) so the
+    # rendered em equals the source em after Blender's bbox normalization.
+    fake, collection = _install(monkeypatch)
+    captured_sizes = []
+
+    def capture_affine(obj, *_args, **_kwargs):
+        captured_sizes.append(float(obj.data.size))
+        return None
+
+    monkeypatch.setattr(bl_text_builder, "_apply_target_quad_affine", capture_affine)
+    monkeypatch.setattr(
+        bl_text_builder,
+        "_verify_transform_and_dimensions",
+        lambda *_args, **_kwargs: ([], {}),
+    )
+    opts = types.SimpleNamespace(import_mode="vector", text_mode="3d_text")
+    item = _item()
+    item.text = "AB"
+    item.normalized = "AB"
+    item.source_char_layout = _character_layout()
+    item.requires_individual_positioning = True
+
+    obj = bl_text_builder.build_text(
+        item,
+        collection,
+        page_number=2,
+        text_mode="3d_text",
+        provenance_opts=opts,
+    )
+
+    assert obj is not None
+    assert captured_sizes, "positioned characters must reach the affine stage"
+    # 6 mm source em * (1250/1000) = 7.5 mm host size
+    for size in captured_sizes:
+        assert size == pytest.approx(0.0075)
 
 
 def test_affine_coefficients_preserve_shear_and_mirror():
@@ -1636,7 +1766,7 @@ def test_corrupt_deterministic_font_cache_is_atomically_repaired(monkeypatch, tm
     fake, collection = _install(monkeypatch)
     item = _item()
     digest = item.font_asset.usable_sha256
-    cache_path = tmp_path / "bc_bl_pdf_exact_fonts" / f"{digest}.cff"
+    cache_path = tmp_path / "bc_bl_pdf_exact_fonts" / f"{digest}.ttf"
     cache_path.parent.mkdir(parents=True)
     cache_path.write_bytes(b"corrupt-prior-attempt")
     monkeypatch.setattr(bl_text_builder.tempfile, "gettempdir", lambda: str(tmp_path))
@@ -1684,7 +1814,7 @@ def test_font_cache_uses_unique_attempt_temp_files_and_leaves_none_behind(
     _fake, _collection = _install(monkeypatch)
     item = _item()
     digest = item.font_asset.usable_sha256
-    cache_path = tmp_path / "bc_bl_pdf_exact_fonts" / f"{digest}.cff"
+    cache_path = tmp_path / "bc_bl_pdf_exact_fonts" / f"{digest}.ttf"
     cache_path.parent.mkdir(parents=True)
     monkeypatch.setattr(bl_text_builder.tempfile, "gettempdir", lambda: str(tmp_path))
     original_replace = bl_text_builder.os.replace
