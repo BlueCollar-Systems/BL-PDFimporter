@@ -110,12 +110,59 @@ class TestImportReportWriter(unittest.TestCase):
                     {
                         "item_id": "page:1:text:1",
                         "page": 1,
+                        "source_span_id": 1,
                         "requested_representation": "text",
                         "final_representation": "text",
                         "status": "delivered",
+                        "fallback_attempted": False,
                         "fallback_used": False,
                         "entity_ids": ["P1_text_1"],
-                        "attempts": [],
+                        "final_state_verification": {
+                            "status": "verified",
+                            "page_number": 1,
+                            "stack_offset_m": 0.0,
+                            "representation": "text",
+                            "canonical_parent_verified": True,
+                            "provenance_parent_handle_verified": True,
+                            "entities": [
+                                {
+                                    "entity_id": "P1_text_1",
+                                    "actual_object_type": "FONT",
+                                    "actual_location_m": [0.0, 0.0, 0.0],
+                                    "expected_location_m": [0.0, 0.0],
+                                    "object_handle_verified": True,
+                                    "source_item_verified": True,
+                                    "character_identity_verified": None,
+                                    "representation_fields_verified": True,
+                                    "text_material_binding_verified": True,
+                                    "affine_verified": True,
+                                    "physical_ink_continuity_verified": True,
+                                    "expectation_kind": "span",
+                                    "live_ink_element_count": 4,
+                                    "live_ink_measurement": "evaluated_mesh_vertices",
+                                }
+                            ],
+                            "failures": [],
+                        },
+                        "attempts": [
+                            {
+                                "attempt_index": 0,
+                                "attempted_representation": "text",
+                                "status": "delivered",
+                                "reason": "verified",
+                                "evidence": {
+                                    "actual_object_type": "FONT",
+                                    "actual_location_m": [0.0, 0.0],
+                                },
+                                "entity_ids": ["P1_text_1"],
+                                "owned_artifacts": [],
+                                "superseded": False,
+                                "cleanup": {
+                                    "status": "not_required",
+                                    "removed": [],
+                                },
+                            }
+                        ],
                     }
                 ],
                 _text_delivered_entity_counts={"native_text": 1},
@@ -132,6 +179,7 @@ class TestImportReportWriter(unittest.TestCase):
                         "primitives": 0,
                         "text_items": 1,
                         "text_source_spans": 1,
+                        "text_source_item_ids": ["page:1:text:1"],
                         "collections": 1,
                         "elapsed": 0.1,
                     },
@@ -140,20 +188,75 @@ class TestImportReportWriter(unittest.TestCase):
                     provenance_opts=provenance,
                 )
             data = json.loads(report_path.read_text(encoding="utf-8"))
+            delivery = data["extra"]["text_representation_delivery"]
             self.assertEqual(
-                data["extra"]["text_representation_delivery"],
-                {
-                    "required": True,
-                    "verified": True,
-                    "source_items": 1,
-                    "delivered_items": 1,
-                    "failed_items": 0,
-                },
+                delivery["schema"],
+                "bcs.text_representation_delivery/1.1",
             )
+            self.assertTrue(delivery["required"])
+            self.assertTrue(delivery["verified"])
+            self.assertEqual(delivery["invalid_reasons"], [])
+            self.assertEqual(
+                delivery["items"],
+                [
+                    {
+                        "source_item_id": "page:1:text:1",
+                        "terminal_attempt_index": 0,
+                        "final_type": "text",
+                        "verified": True,
+                    }
+                ],
+            )
+            self.assertEqual(delivery["source_item_count"], 1)
+            self.assertEqual(delivery["delivered_item_count"], 1)
+            self.assertEqual(delivery["failed_item_count"], 0)
+            self.assertEqual(len(data["extra"]["text_delivery_attempts"]), 1)
             self.assertTrue(data["extra"]["import_contract_ready"]["ready"])
             self.assertTrue(
                 data["extra"]["import_contract_ready"]["checks"]["text_delivery"]
             )
+
+    def test_zero_text_inventory_emits_verified_empty_contract(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="bl_import_report_") as tmp:
+            report_path = Path(tmp) / "import_report.json"
+            with patch(
+                "pdf_vector_importer.bl_import_engine._pymupdf_version",
+                return_value="",
+            ):
+                write_import_report(
+                    str(Path(tmp) / "sample.pdf"),
+                    {"import_text": True, "text_mode": "text"},
+                    {
+                        "pages_imported": 1,
+                        "primitives": 0,
+                        "text_items": 0,
+                        "text_source_spans": 0,
+                        "text_source_item_ids": [],
+                        "collections": 1,
+                        "elapsed": 0.1,
+                    },
+                    import_mode="vector",
+                    output_path=str(report_path),
+                )
+
+            data = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                data["extra"]["text_delivery_obligations"],
+                {
+                    "schema": "bcs.text_delivery_obligations/1.0",
+                    "required": False,
+                    "requested_type": "text",
+                    "source_item_ids": [],
+                },
+            )
+            self.assertEqual(data["extra"]["text_delivery_attempts"], [])
+            self.assertFalse(
+                data["extra"]["text_representation_delivery"]["required"]
+            )
+            self.assertTrue(
+                data["extra"]["text_representation_delivery"]["verified"]
+            )
+            self.assertTrue(data["extra"]["import_contract_ready"]["ready"])
 
     def test_missing_required_text_delivery_is_terminally_incomplete(self) -> None:
         with tempfile.TemporaryDirectory(prefix="bl_import_report_") as tmp:
@@ -170,6 +273,7 @@ class TestImportReportWriter(unittest.TestCase):
                         "primitives": 0,
                         "text_items": 0,
                         "text_source_spans": 1,
+                        "text_source_item_ids": ["page:1:text:1"],
                         "collections": 1,
                         "elapsed": 0.1,
                     },
@@ -187,6 +291,18 @@ class TestImportReportWriter(unittest.TestCase):
     def test_disabled_text_delivery_is_not_required_by_contract(self) -> None:
         with tempfile.TemporaryDirectory(prefix="bl_import_report_") as tmp:
             report_path = Path(tmp) / "import_report.json"
+            stale_provenance = types.SimpleNamespace(
+                _text_delivery_records=[
+                    {
+                        "item_id": "page:1:text:1",
+                        "requested_representation": "3d_text",
+                        "final_representation": "3d_text",
+                        "status": "delivered",
+                        "entity_ids": ["StaleText001"],
+                    }
+                ],
+                _text_delivered_entity_counts={"native_3d_text": 1},
+            )
             with patch(
                 "pdf_vector_importer.bl_import_engine._pymupdf_version",
                 return_value="",
@@ -204,11 +320,42 @@ class TestImportReportWriter(unittest.TestCase):
                     },
                     import_mode="vector",
                     output_path=str(report_path),
+                    provenance_opts=stale_provenance,
                 )
             data = json.loads(report_path.read_text(encoding="utf-8"))
             delivery = data["extra"]["text_representation_delivery"]
+            self.assertEqual(data["extra"]["text_mode"], "3d_text")
+            self.assertEqual(
+                data["extra"]["text_delivery_obligations"],
+                {
+                    "schema": "bcs.text_delivery_obligations/1.0",
+                    "required": False,
+                    "requested_type": "3d_text",
+                    "source_item_ids": [],
+                },
+            )
+            self.assertEqual(data["extra"]["text_delivery_attempts"], [])
             self.assertFalse(delivery["required"])
             self.assertTrue(delivery["verified"])
+            self.assertEqual(delivery["requested_type"], "3d_text")
+            self.assertEqual(delivery["attempt_count"], 0)
+            self.assertEqual(delivery["source_item_count"], 0)
+            self.assertEqual(delivery["items"], [])
+            actual_types = data["extra"]["actual_text_entity_types"]
+            self.assertEqual(actual_types["entity_type"], "none")
+            self.assertEqual(actual_types["count"], 0)
+            self.assertFalse(actual_types["font_rendered"])
+            for field in (
+                "native_label",
+                "native_text",
+                "native_3d_text",
+                "glyph_curve",
+                "geometry_mesh",
+                "raster_patch",
+                "outline_curve_or_mesh",
+                "dxf_text",
+            ):
+                self.assertEqual(actual_types[field], 0)
             self.assertTrue(data["extra"]["import_contract_ready"]["ready"])
             self.assertTrue(
                 data["extra"]["import_contract_ready"]["checks"]["text_delivery"]
@@ -236,9 +383,32 @@ class TestImportReportWriter(unittest.TestCase):
                     output_path=str(report_path),
                 )
             data = json.loads(report_path.read_text(encoding="utf-8"))
+            self.assertEqual(data["extra"]["text_mode"], "none")
+            self.assertEqual(
+                data["extra"]["text_delivery_obligations"],
+                {
+                    "schema": "bcs.text_delivery_obligations/1.0",
+                    "required": False,
+                    "requested_type": "none",
+                    "source_item_ids": [],
+                },
+            )
+            self.assertEqual(data["extra"]["text_delivery_attempts"], [])
             self.assertFalse(
                 data["extra"]["text_representation_delivery"]["required"]
             )
+            self.assertEqual(
+                data["extra"]["text_representation_delivery"]["requested_type"],
+                "none",
+            )
+            self.assertEqual(
+                data["extra"]["text_representation_delivery"]["items"],
+                [],
+            )
+            actual_types = data["extra"]["actual_text_entity_types"]
+            self.assertEqual(actual_types["entity_type"], "none")
+            self.assertEqual(actual_types["count"], 0)
+            self.assertFalse(actual_types["font_rendered"])
             self.assertTrue(data["extra"]["import_contract_ready"]["ready"])
 
     def test_delivery_failure_is_incomplete_not_a_used_fallback(self) -> None:
@@ -342,6 +512,12 @@ class TestImportReportWriter(unittest.TestCase):
                     "pages_import_ms": 240.0,
                 },
                 "text_source_spans": 4,
+                "text_source_item_ids": [
+                    "page:1:text:1",
+                    "page:1:text:2",
+                    "page:2:text:3",
+                    "page:2:text:4",
+                ],
                 "text_glyph_estimate": 22,
                 "curves": 5,
                 "meshes": 1,
@@ -400,6 +576,9 @@ class TestImportReportWriter(unittest.TestCase):
                 "collections": 0,
                 "elapsed": 0.2,
                 "text_source_spans": 14,
+                "text_source_item_ids": [
+                    f"page:1:text:{index}" for index in range(1, 15)
+                ],
                 "text_glyph_estimate": 1200,
             }
             with patch(

@@ -1798,9 +1798,14 @@ def _artifact(obj=None, data=None) -> Dict[str, str]:
         datablock_id = str(getattr(data, "name", "") or "")
     except ReferenceError:
         datablock_id = "<removed>"
+    try:
+        datablock_kind = _datablock_kind(data) if data is not None else ""
+    except (AttributeError, ReferenceError, TypeError):
+        datablock_kind = ""
     return {
         "object_id": object_id,
         "datablock_id": datablock_id,
+        "datablock_kind": datablock_kind,
         "ownership": "created_by_this_item_attempt",
     }
 

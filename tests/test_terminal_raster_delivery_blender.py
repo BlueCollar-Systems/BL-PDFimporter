@@ -137,6 +137,58 @@ def _raster_placement():
     }
 
 
+def _producer_report_proof(representation, entity_id):
+    raster = representation == "raster"
+    entity = {
+        "entity_id": entity_id,
+        "actual_object_type": "MESH" if raster else "FONT",
+        "actual_location_m": [0.0, 0.0, 0.0],
+        "expected_location_m": [0.0, 0.0],
+        "object_handle_verified": True,
+        "source_item_verified": True,
+        "character_identity_verified": None,
+        "representation_fields_verified": True,
+        "text_material_binding_verified": None if raster else True,
+        "affine_verified": True,
+        "physical_ink_continuity_verified": True,
+        "expectation_kind": "raster" if raster else "span",
+        "live_ink_element_count": 4,
+        "live_ink_measurement": "evaluated_mesh_vertices",
+    }
+    if raster:
+        entity.update(
+            {
+                "raster_geometry_verified": True,
+                "raster_uv_verified": True,
+                "raster_material_binding_verified": True,
+            }
+        )
+    return {
+        "status": "verified",
+        "page_number": 1,
+        "stack_offset_m": 0.0,
+        "representation": representation,
+        "canonical_parent_verified": True,
+        "provenance_parent_handle_verified": True,
+        "entities": [entity],
+        "failures": [],
+    }
+
+
+def _producer_report_impossibility_evidence(item_id, source_span_id):
+    return {
+        "importer_id": "bc_pdf_vector_importer.blender",
+        "item_id": item_id,
+        "page_number": 1,
+        "source_span_id": source_span_id,
+        "reason": "no_exact_embedded_font_match",
+        "proof_category": "source_font_absent_for_item",
+        "font_name": "ExactFixtureFont",
+        "font_failure_page_number": 1,
+        "font_failure_span_font_name": "ExactFixtureFont",
+    }
+
+
 def test_rotated_embedded_image_placement_preserves_pdf_transform_and_uv_order(
     tmp_path,
 ):
@@ -1461,12 +1513,19 @@ def test_report_preserves_every_item_attempt_and_summarizes_failures_loudly(
             "status": "delivered",
             "fallback_used": False,
             "entity_ids": ["P1_text_1"],
+            "final_state_verification": _producer_report_proof(
+                "text",
+                "P1_text_1",
+            ),
             "attempts": [{
                 "attempt_index": 0,
                 "attempted_representation": "text",
                 "status": "delivered",
                 "reason": "verified",
-                "evidence": {"actual_object_type": "FONT"},
+                    "evidence": {
+                        "actual_object_type": "FONT",
+                        "actual_location_m": [0.0, 0.0],
+                    },
                 "entity_ids": ["P1_text_1"],
                 "owned_artifacts": [],
                 "superseded": False,
@@ -1482,13 +1541,62 @@ def test_report_preserves_every_item_attempt_and_summarizes_failures_loudly(
             "status": "delivered",
             "fallback_used": True,
             "entity_ids": ["P1_text_2_raster"],
+            "final_state_verification": _producer_report_proof(
+                "raster",
+                "P1_text_2_raster",
+            ),
             "attempts": [
                 {
                     "attempt_index": 0,
                     "attempted_representation": "text",
                     "status": "impossible",
                     "reason": "exact_source_font_unavailable_for_item",
-                    "evidence": {"source_xref": 9},
+                    "evidence": _producer_report_impossibility_evidence(
+                        "page:1:text:2",
+                        2,
+                    ),
+                    "entity_ids": [],
+                    "owned_artifacts": [],
+                    "superseded": True,
+                    "cleanup": {"status": "complete", "removed": []},
+                },
+                {
+                    "attempt_index": 1,
+                    "attempted_representation": "3d_text",
+                    "status": "impossible",
+                    "reason": "exact_source_font_unavailable_for_item",
+                    "evidence": _producer_report_impossibility_evidence(
+                        "page:1:text:2",
+                        2,
+                    ),
+                    "entity_ids": [],
+                    "owned_artifacts": [],
+                    "superseded": True,
+                    "cleanup": {"status": "complete", "removed": []},
+                },
+                {
+                    "attempt_index": 2,
+                    "attempted_representation": "glyphs",
+                    "status": "impossible",
+                    "reason": "exact_source_font_unavailable_for_item",
+                    "evidence": _producer_report_impossibility_evidence(
+                        "page:1:text:2",
+                        2,
+                    ),
+                    "entity_ids": [],
+                    "owned_artifacts": [],
+                    "superseded": True,
+                    "cleanup": {"status": "complete", "removed": []},
+                },
+                {
+                    "attempt_index": 3,
+                    "attempted_representation": "geometry",
+                    "status": "impossible",
+                    "reason": "exact_source_font_unavailable_for_item",
+                    "evidence": _producer_report_impossibility_evidence(
+                        "page:1:text:2",
+                        2,
+                    ),
                     "entity_ids": [],
                     "owned_artifacts": [],
                     "superseded": True,
@@ -1499,7 +1607,10 @@ def test_report_preserves_every_item_attempt_and_summarizes_failures_loudly(
                     "attempted_representation": "raster",
                     "status": "delivered",
                     "reason": "verified",
-                    "evidence": {"actual_object_type": "MESH"},
+                    "evidence": {
+                        "actual_object_type": "MESH",
+                        "actual_location_m": [0.0, 0.0],
+                    },
                     "entity_ids": ["P1_text_2_raster"],
                     "owned_artifacts": [],
                     "superseded": False,
@@ -1535,6 +1646,11 @@ def test_report_preserves_every_item_attempt_and_summarizes_failures_loudly(
         "primitives": 5,
         "text_items": 2,
         "text_source_spans": 3,
+        "text_source_item_ids": [
+            "page:1:text:1",
+            "page:1:text:2",
+            "page:1:text:3",
+        ],
         "collections": 1,
         "elapsed": 0.01,
     }
@@ -1560,7 +1676,52 @@ def test_report_preserves_every_item_attempt_and_summarizes_failures_loudly(
         "final_counts": {"raster": 1, "text": 1},
         "failed_item_ids": ["page:1:text:3"],
     }
-    assert delivery["items"] == records
+    assert set(delivery) == {"schema", "summary"}
+    attempt_ledger = report["extra"]["text_delivery_attempts"]
+    assert len(attempt_ledger) == 7
+    assert [attempt["source_item_id"] for attempt in attempt_ledger] == [
+        "page:1:text:1",
+        "page:1:text:2",
+        "page:1:text:2",
+        "page:1:text:2",
+        "page:1:text:2",
+        "page:1:text:2",
+        "page:1:text:3",
+    ]
+    assert [attempt["status"] for attempt in attempt_ledger] == [
+        "delivered",
+        "impossible",
+        "impossible",
+        "impossible",
+        "impossible",
+        "delivered",
+        "failed",
+    ]
+    representation_delivery = report["extra"]["text_representation_delivery"]
+    assert representation_delivery["schema"] == (
+        "bcs.text_representation_delivery/1.1"
+    )
+    assert representation_delivery["items"] == [
+        {
+            "source_item_id": "page:1:text:1",
+            "terminal_attempt_index": 0,
+            "final_type": "text",
+            "verified": True,
+        },
+        {
+            "source_item_id": "page:1:text:2",
+            "terminal_attempt_index": 5,
+            "final_type": "raster",
+            "verified": True,
+        },
+        {
+            "source_item_id": "page:1:text:3",
+            "terminal_attempt_index": 6,
+            "final_type": None,
+            "verified": False,
+        },
+    ]
+    assert representation_delivery["verified"] is False
     assert report["fallback"]["used"] is True
     assert report["fallback"]["text"] == {
         "requested": "text",

@@ -1543,6 +1543,41 @@ def test_post_stack_proof_revalidates_live_representation_and_canonical_parent(
     )
 
 
+def test_live_continuity_accepts_exact_labels_as_font_entities(monkeypatch):
+    _fake, _collection, _opts, record, objects = (
+        _positioned_mixed_delivery_for_final_state(monkeypatch, "text")
+    )
+    entity_id = record["entity_ids"][0]
+    obj = objects[entity_id]
+    obj["pdf_text_mode"] = "labels"
+    obj["pdf_text_requested_mode"] = "labels"
+    evidence = record["attempts"][-1]["evidence"]
+    expectations, _entries, expectation_failures = (
+        bl_import_engine._delivery_entity_expectations(
+            evidence,
+            record["entity_ids"],
+            "labels",
+        )
+    )
+    assert expectation_failures == []
+
+    proof, failures = bl_import_engine._live_entity_continuity_failures(
+        obj,
+        entity_id=entity_id,
+        item_id=record["item_id"],
+        source_span_id=record["source_span_id"],
+        requested_representation="labels",
+        representation="labels",
+        expectation=expectations[entity_id],
+        stack_offset_m=0.0,
+    )
+
+    assert failures == []
+    assert proof["representation_fields_verified"] is True
+    assert proof["affine_verified"] is True
+    assert proof["physical_ink_continuity_verified"] is True
+
+
 def test_post_stack_proof_accepts_blender_idproperty_float_quantization(monkeypatch):
     _fake, _collection, opts, record, objects = (
         _positioned_mixed_delivery_for_final_state(monkeypatch, "3d_text")

@@ -40,10 +40,14 @@ from .pdfcadcore.primitive_extractor import (
     _page_rotation_transform,
     _transform_pdf_point,
 )
+from .pdfcadcore.text_delivery_report import build_text_representation_delivery
 from .text_delivery import (
     AttemptOutcome,
+    REPRESENTATIONS,
     ZERO_INK_DELIVERY_MANIFEST_SCHEMA,
     ZeroInkReconciliationAuthority,
+    _impossibility_proof_failures,
+    fallback_ladder,
     freeze_zero_ink_source_manifest,
     normalize_representation,
     open_zero_ink_reconciliation_authority,
@@ -232,7 +236,10 @@ def _text_fallback_from_provenance(provenance_opts: Any) -> Optional[Dict[str, A
             "reason": (
                 reason_values[0]
                 if len(reason_values) == 1
-                else "multiple_item_specific_reasons; see extra.text_delivery.items"
+                else (
+                    "multiple_item_specific_reasons; see "
+                    "extra.text_delivery_attempts"
+                )
             ),
             "count": sum(groups.values()),
         }
@@ -304,6 +311,785 @@ def _text_delivery_from_provenance(provenance_opts: Any) -> Dict[str, Any]:
     }
 
 
+def _report_text_type(value: Any) -> str:
+    """Normalize one Blender representation name for the shared report ledger."""
+
+    raw = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    return {"text3d": "3d_text", "3dtext": "3d_text"}.get(raw, raw)
+
+
+def _report_exact_text_type(value: Any) -> str:
+    """Accept only canonical representation evidence emitted by the producer."""
+
+    return value if isinstance(value, str) and value in REPRESENTATIONS else ""
+
+
+def _report_string_ids(value: Any) -> List[str]:
+    if not isinstance(value, (list, tuple)):
+        return [""]
+    return [item if isinstance(item, str) else "" for item in value]
+
+
+def _report_host_identity(namespace: str, raw_identity: Any) -> str:
+    """Qualify a valid Blender identity without repairing malformed evidence."""
+
+    if not isinstance(raw_identity, str):
+        return ""
+    if not raw_identity or raw_identity != raw_identity.strip():
+        return raw_identity
+    return f"blender:{namespace}:{raw_identity}"
+
+
+def _report_merge_identity_evidence(*sources: List[str]) -> List[str]:
+    """Coalesce cross-channel identity overlap without hiding source duplicates."""
+
+    merged: List[str] = []
+    for source in sources:
+        source_seen = set()
+        for identity in source:
+            if identity in source_seen or identity not in merged:
+                merged.append(identity)
+            source_seen.add(identity)
+    return merged
+
+
+def _report_object_identity_pairs(
+    value: Any,
+    *,
+    namespace_prefix: str = "",
+) -> List[tuple[str, str]]:
+    return [
+        (
+            raw_identity,
+            _report_host_identity(f"{namespace_prefix}object", raw_identity),
+        )
+        for raw_identity in _report_string_ids(value)
+    ]
+
+
+def _report_owned_artifact_identity_pairs(
+    value: Any,
+    *,
+    namespace_prefix: str = "",
+) -> List[tuple[str, str]]:
+    """Return raw-to-canonical mappings for attempt-owned Blender artifacts."""
+
+    if not isinstance(value, (list, tuple)):
+        return [("", "")]
+    identities: List[tuple[str, str]] = []
+    for artifact in value:
+        if not isinstance(artifact, dict) or artifact.get("ownership") != (
+            "created_by_this_item_attempt"
+        ):
+            identities.append(("", ""))
+            continue
+        artifact_ids: List[tuple[str, str]] = []
+        for field, namespace in (
+            ("object_id", "object"),
+            ("material_id", "material"),
+            ("image_id", "image"),
+            ("file_path", "file"),
+        ):
+            raw_identity = artifact.get(field)
+            if raw_identity in (None, ""):
+                continue
+            artifact_ids.append(
+                (
+                    raw_identity if isinstance(raw_identity, str) else "",
+                    _report_host_identity(
+                        f"{namespace_prefix}{namespace}",
+                        raw_identity,
+                    ),
+                )
+            )
+        raw_datablock_id = artifact.get("datablock_id")
+        if raw_datablock_id not in (None, ""):
+            raw_kind = artifact.get("datablock_kind")
+            datablock_kind = (
+                raw_kind.lower()
+                if isinstance(raw_kind, str)
+                and raw_kind
+                and raw_kind == raw_kind.strip()
+                and raw_kind.upper()
+                in {"CURVE", "MESH", "MATERIAL", "IMAGE", "FONT"}
+                else ""
+            )
+            artifact_ids.append(
+                (
+                    raw_datablock_id
+                    if isinstance(raw_datablock_id, str)
+                    else "",
+                    _report_host_identity(
+                        f"{namespace_prefix}datablock:{datablock_kind}",
+                        raw_datablock_id,
+                    )
+                    if datablock_kind
+                    else "",
+                )
+            )
+        identities.extend(artifact_ids or [("", "")])
+    return identities
+
+
+def _report_removed_entity_ids(
+    cleanup: Any,
+    ownership_pairs: List[tuple[str, str]],
+    *,
+    namespace_prefix: str = "",
+) -> List[str]:
+    if not isinstance(cleanup, dict):
+        return []
+    available: Dict[str, List[str]] = {}
+    for raw_identity, canonical_identity in ownership_pairs:
+        choices = available.setdefault(raw_identity, [])
+        if canonical_identity not in choices:
+            choices.append(canonical_identity)
+    removed: List[str] = []
+    for raw_removed in _report_string_ids(cleanup.get("removed")):
+        matches = available.get(raw_removed) or []
+        removed.append(
+            matches.pop(0)
+            if matches
+            else _report_host_identity(
+                f"{namespace_prefix}unbound_removed",
+                raw_removed,
+            )
+        )
+    return removed
+
+
+def _report_finite_coordinates(value: Any, length: int) -> Optional[List[float]]:
+    if not isinstance(value, (list, tuple)) or len(value) != length:
+        return None
+    coordinates: List[float] = []
+    for raw_coordinate in value:
+        if not isinstance(raw_coordinate, (int, float)) or isinstance(
+            raw_coordinate,
+            bool,
+        ):
+            return None
+        coordinate = float(raw_coordinate)
+        if not math.isfinite(coordinate):
+            return None
+        coordinates.append(coordinate)
+    return coordinates
+
+
+def _report_final_state_verified(
+    proof: Any,
+    attempted_type: str,
+    raw_record: Dict[str, Any],
+    raw_attempt: Dict[str, Any],
+) -> bool:
+    """Bind report certification to Blender's complete post-stack proof."""
+
+    if not isinstance(proof, dict) or attempted_type not in REPRESENTATIONS:
+        return False
+    if proof.get("status") != "verified" or proof.get("representation") != attempted_type:
+        return False
+    if not isinstance(proof.get("failures"), list) or proof["failures"]:
+        return False
+    raw_page = raw_record.get("page")
+    raw_span = raw_record.get("source_span_id")
+    if (
+        not isinstance(raw_page, int)
+        or isinstance(raw_page, bool)
+        or raw_page <= 0
+        or not isinstance(raw_span, int)
+        or isinstance(raw_span, bool)
+        or raw_span <= 0
+        or proof.get("page_number") != raw_page
+    ):
+        return False
+    stack_offset = proof.get("stack_offset_m")
+    if (
+        not isinstance(stack_offset, (int, float))
+        or isinstance(stack_offset, bool)
+        or not math.isfinite(float(stack_offset))
+        or proof.get("canonical_parent_verified") is not True
+        or proof.get("provenance_parent_handle_verified") is not True
+    ):
+        return False
+    stack_offset_value = float(stack_offset)
+
+    raw_entity_ids = raw_record.get("entity_ids")
+    if not isinstance(raw_entity_ids, list) or any(
+        not isinstance(entity_id, str)
+        or not entity_id
+        or entity_id != entity_id.strip()
+        for entity_id in raw_entity_ids
+    ):
+        return False
+    if len(raw_entity_ids) != len(set(raw_entity_ids)):
+        return False
+    entity_proofs = proof.get("entities")
+    if not isinstance(entity_proofs, list):
+        return False
+    if [
+        entity_proof.get("entity_id") if isinstance(entity_proof, dict) else None
+        for entity_proof in entity_proofs
+    ] != raw_entity_ids:
+        return False
+
+    source_id = raw_record.get("item_id")
+    if (
+        not isinstance(source_id, str)
+        or not source_id
+        or source_id != source_id.strip()
+    ):
+        return False
+    if not raw_entity_ids:
+        logical_id = raw_record.get("logical_delivery_id")
+        source_manifest_sha256 = raw_record.get("source_manifest_sha256")
+        return bool(
+            raw_record.get("zero_ink_delivery") is True
+            and proof.get("logical_zero_ink_delivery") is True
+            and logical_id == f"{source_id}:zero-ink:{attempted_type}"
+            and proof.get("logical_delivery_id") == logical_id
+            and isinstance(source_manifest_sha256, str)
+            and re.fullmatch(r"[0-9a-f]{64}", source_manifest_sha256)
+            and proof.get("source_manifest_sha256") == source_manifest_sha256
+        )
+
+    attempt_evidence = raw_attempt.get("evidence")
+    if not isinstance(attempt_evidence, dict):
+        return False
+    try:
+        unstacked_locations = _delivery_expected_locations(
+            attempt_evidence,
+            raw_entity_ids,
+        )
+        entity_expectations, _expectation_entries, expectation_failures = (
+            _delivery_entity_expectations(
+                attempt_evidence,
+                raw_entity_ids,
+                attempted_type,
+            )
+        )
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return False
+    if (
+        expectation_failures
+        or set(unstacked_locations) != set(raw_entity_ids)
+        or set(entity_expectations) != set(raw_entity_ids)
+    ):
+        return False
+
+    expected_object_type = {
+        "labels": "FONT",
+        "text": "FONT",
+        "3d_text": "FONT",
+        "glyphs": "CURVE",
+        "geometry": "MESH",
+        "raster": "MESH",
+    }[attempted_type]
+    for entity_proof in entity_proofs:
+        if not isinstance(entity_proof, dict):
+            return False
+        if entity_proof.get("actual_object_type") != expected_object_type:
+            return False
+        actual_location = _report_finite_coordinates(
+            entity_proof.get("actual_location_m"),
+            3,
+        )
+        if actual_location is None:
+            return False
+        expected_location = _report_finite_coordinates(
+            entity_proof.get("expected_location_m"),
+            2,
+        )
+        unstacked_location = _report_finite_coordinates(
+            unstacked_locations.get(entity_proof["entity_id"]),
+            2,
+        )
+        if unstacked_location is None:
+            return False
+        recomputed_location = [
+            unstacked_location[0],
+            unstacked_location[1] + stack_offset_value,
+        ]
+        if not all(math.isfinite(coordinate) for coordinate in recomputed_location):
+            return False
+        if expected_location is None or any(
+            abs(proven - expected) > 1e-7
+            for proven, expected in zip(
+                expected_location,
+                recomputed_location,
+                strict=True,
+            )
+        ) or any(
+            abs(actual - expected) > 1e-7
+            for actual, expected in zip(
+                actual_location[:2],
+                expected_location,
+                strict=True,
+            )
+        ):
+            return False
+        expectation_kind = entity_proof.get("expectation_kind")
+        sealed_expectation = entity_expectations.get(entity_proof["entity_id"])
+        if (
+            not isinstance(sealed_expectation, dict)
+            or expectation_kind != sealed_expectation.get("kind")
+            or expectation_kind not in {"character", "span", "raster"}
+        ):
+            return False
+        if attempted_type == "raster":
+            if expectation_kind != "raster":
+                return False
+        elif expectation_kind == "raster":
+            return False
+        if (
+            entity_proof.get("object_handle_verified") is not True
+            or entity_proof.get("source_item_verified") is not True
+            or entity_proof.get("representation_fields_verified") is not True
+            or entity_proof.get("affine_verified") is not True
+            or entity_proof.get("physical_ink_continuity_verified") is not True
+        ):
+            return False
+        expected_character_state = True if expectation_kind == "character" else None
+        if entity_proof.get("character_identity_verified") is not expected_character_state:
+            return False
+        if expectation_kind == "raster":
+            if entity_proof.get("text_material_binding_verified") is not None or any(
+                entity_proof.get(field) is not True
+                for field in (
+                    "raster_geometry_verified",
+                    "raster_uv_verified",
+                    "raster_material_binding_verified",
+                )
+            ):
+                return False
+        elif entity_proof.get("text_material_binding_verified") is not True:
+            return False
+        ink_count = entity_proof.get("live_ink_element_count")
+        if (
+            not isinstance(ink_count, int)
+            or isinstance(ink_count, bool)
+            or ink_count <= 0
+        ):
+            return False
+        measurement = entity_proof.get("live_ink_measurement")
+        if measurement == "explicit_test_host_points":
+            if getattr(bpy, "_bc_pdf_vector_importer_test_host", False) is not True:
+                return False
+        elif measurement != "evaluated_mesh_vertices":
+            return False
+        if expectation_kind == "character":
+            expected_bounds = _report_finite_coordinates(
+                entity_proof.get("expected_world_ink_bounds_m"),
+                4,
+            )
+            actual_bounds = _report_finite_coordinates(
+                entity_proof.get("actual_world_ink_bounds_m"),
+                4,
+            )
+            if (
+                expected_bounds is None
+                or actual_bounds is None
+                or any(
+                    abs(actual - expected) > 6e-5
+                    for actual, expected in zip(
+                        actual_bounds,
+                        expected_bounds,
+                        strict=True,
+                    )
+                )
+            ):
+                return False
+
+    zero_count = raw_record.get("zero_ink_character_count")
+    if isinstance(zero_count, int) and not isinstance(zero_count, bool) and zero_count > 0:
+        if (
+            proof.get("logical_zero_ink_children") != zero_count
+            or proof.get("logical_zero_ink_children_verified") is not True
+            or proof.get("source_manifest_sha256")
+            != raw_record.get("source_manifest_sha256")
+        ):
+            return False
+    return True
+
+
+def _report_attempt_sequence_verified(
+    requested_type: str,
+    attempted_types: List[str],
+) -> bool:
+    """Require Blender's compressed attempts to follow its finite fallback ladder."""
+
+    if not requested_type or not attempted_types:
+        return False
+    try:
+        expected_ladder = fallback_ladder(requested_type)
+    except (KeyError, RuntimeError, TypeError, ValueError):
+        return False
+    compressed_attempts: List[str] = []
+    for raw_attempted_type in attempted_types:
+        attempted_type = _report_text_type(raw_attempted_type)
+        if not attempted_type:
+            return False
+        if not compressed_attempts or compressed_attempts[-1] != attempted_type:
+            compressed_attempts.append(attempted_type)
+    return tuple(compressed_attempts) == expected_ladder[: len(compressed_attempts)]
+
+
+def _report_impossibility_failures(
+    raw_record: Dict[str, Any],
+    raw_attempt: Any,
+    attempted_type: str,
+) -> List[str]:
+    """Re-run Blender's item-bound impossibility validator at report ingestion."""
+
+    if not isinstance(raw_attempt, dict):
+        return ["attempt_record_invalid"]
+    if attempted_type not in REPRESENTATIONS:
+        return ["attempted_representation_invalid"]
+    source_id = raw_record.get("item_id")
+    page_number = raw_record.get("page")
+    source_span_id = raw_record.get("source_span_id")
+    if (
+        not isinstance(source_id, str)
+        or not source_id
+        or source_id != source_id.strip()
+    ):
+        return ["item_identity_invalid"]
+    if (
+        not isinstance(page_number, int)
+        or isinstance(page_number, bool)
+        or page_number <= 0
+    ):
+        return ["page_identity_invalid"]
+    if (
+        not isinstance(source_span_id, int)
+        or isinstance(source_span_id, bool)
+        or source_span_id <= 0
+    ):
+        return ["source_span_identity_invalid"]
+    evidence = raw_attempt.get("evidence")
+    reason = raw_attempt.get("reason")
+    if not isinstance(evidence, dict):
+        return ["impossibility_evidence_invalid"]
+    if (
+        not isinstance(reason, str)
+        or not reason
+        or reason != reason.strip()
+    ):
+        return ["impossibility_reason_invalid"]
+    try:
+        failures = _impossibility_proof_failures(
+            attempted_representation=attempted_type,
+            item_id=source_id,
+            page_number=page_number,
+            source_span_id=source_span_id,
+            outcome=AttemptOutcome.impossible(reason, evidence=evidence),
+        )
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return ["impossibility_validator_unreadable"]
+    return list(dict.fromkeys(str(failure) for failure in failures if str(failure)))
+
+
+def _canonical_text_delivery_attempts(
+    delivery_records: Any,
+) -> List[Dict[str, Any]]:
+    """Flatten Blender records into the host-neutral canonical attempt ledger."""
+
+    ledger: List[Dict[str, Any]] = []
+    for raw_record in list(delivery_records or []):
+        if not isinstance(raw_record, dict):
+            continue
+        raw_source_id = raw_record.get("item_id")
+        source_id = (
+            raw_source_id
+            if isinstance(raw_source_id, str)
+            and raw_source_id
+            and raw_source_id == raw_source_id.strip()
+            else ""
+        )
+        requested = _report_exact_text_type(
+            raw_record.get("requested_representation")
+        )
+        record_final = _report_exact_text_type(raw_record.get("final_representation"))
+        record_status = str(raw_record.get("status") or "failed").strip().lower()
+        raw_attempts = list(raw_record.get("attempts") or [])
+        if not raw_attempts:
+            raw_attempts = [
+                {
+                    "attempted_representation": requested,
+                    "status": "failed",
+                    "reason": "missing_item_attempt_ledger",
+                    "evidence": {"record_status": record_status},
+                    "entity_ids": [],
+                    "owned_artifacts": [],
+                    "superseded": True,
+                    "cleanup": {"status": "failed", "removed": []},
+                }
+            ]
+        attempted_types = [
+            _report_exact_text_type(
+                raw_attempt.get("attempted_representation")
+                if "attempted_representation" in raw_attempt
+                else raw_attempt.get("attempted_type")
+            )
+            if isinstance(raw_attempt, dict)
+            else ""
+            for raw_attempt in raw_attempts
+        ]
+        impossibility_failures_by_attempt = [
+            _report_impossibility_failures(
+                raw_record,
+                raw_attempt,
+                attempted_types[index],
+            )
+            if isinstance(raw_attempt, dict)
+            and str(raw_attempt.get("status") or "").strip().lower()
+            == "impossible"
+            else []
+            for index, raw_attempt in enumerate(raw_attempts)
+        ]
+        all_impossibility_proofs_verified = all(
+            not (
+                isinstance(raw_attempt, dict)
+                and str(raw_attempt.get("status") or "").strip().lower()
+                == "impossible"
+            )
+            or not impossibility_failures_by_attempt[index]
+            for index, raw_attempt in enumerate(raw_attempts)
+        )
+        attempt_sequence_verified = _report_attempt_sequence_verified(
+            requested,
+            attempted_types,
+        ) and all_impossibility_proofs_verified
+        record_metadata = {
+            str(key): value
+            for key, value in raw_record.items()
+            if str(key) not in {"attempts", "final_state_verification"}
+            and not str(key).startswith("_")
+        }
+        for local_index, raw_attempt in enumerate(raw_attempts):
+            attempt = raw_attempt if isinstance(raw_attempt, dict) else {}
+            terminal = local_index == len(raw_attempts) - 1
+            host_status = str(attempt.get("status") or "failed").strip().lower()
+            attempted_type = _report_exact_text_type(
+                attempt.get("attempted_representation")
+                if "attempted_representation" in attempt
+                else attempt.get("attempted_type")
+            )
+            terminal_verified = bool(
+                terminal
+                and host_status == "delivered"
+                and record_status == "delivered"
+            )
+            impossibility_failures = impossibility_failures_by_attempt[local_index]
+            impossibility_proof_verified = bool(
+                host_status == "impossible" and not impossibility_failures
+            )
+            outcome = (
+                "proven_impossible"
+                if impossibility_proof_verified
+                else "verified"
+                if terminal_verified
+                else "failed"
+            )
+            cleanup = attempt.get("cleanup")
+            cleanup_status = (
+                str(cleanup.get("status") or "").strip().lower()
+                if isinstance(cleanup, dict)
+                else ""
+            )
+            cleanup_complete = cleanup_status in (
+                {"complete", "not_required"} if terminal else {"complete"}
+            )
+            identity_namespace_prefix = (
+                "" if terminal else f"attempt:{source_id}:{local_index}:"
+            )
+            attempt_entity_pairs = _report_object_identity_pairs(
+                attempt.get("entity_ids"),
+                namespace_prefix=identity_namespace_prefix,
+            )
+            record_entity_pairs = _report_object_identity_pairs(
+                raw_record.get("entity_ids")
+            )
+            owned_artifact_pairs = _report_owned_artifact_identity_pairs(
+                attempt.get("owned_artifacts"),
+                namespace_prefix=identity_namespace_prefix,
+            )
+            attempt_entity_ids = [identity for _, identity in attempt_entity_pairs]
+            record_entity_ids = [identity for _, identity in record_entity_pairs]
+            owned_artifact_ids = [identity for _, identity in owned_artifact_pairs]
+            created_entity_ids = _report_merge_identity_evidence(
+                attempt_entity_ids,
+                owned_artifact_ids,
+            )
+            removed_entity_ids = _report_removed_entity_ids(
+                cleanup,
+                [*attempt_entity_pairs, *owned_artifact_pairs],
+                namespace_prefix=identity_namespace_prefix,
+            )
+            delivery_entity_ids = (
+                record_entity_ids or attempt_entity_ids
+                if terminal_verified
+                else []
+            )
+            if (
+                terminal_verified
+                and not delivery_entity_ids
+                and raw_record.get("zero_ink_delivery") is True
+            ):
+                raw_logical_id = raw_record.get("logical_delivery_id")
+                logical_id = _report_host_identity(
+                    "logical",
+                    raw_logical_id,
+                )
+                if logical_id:
+                    delivery_entity_ids = [logical_id]
+                    created_entity_ids = _report_merge_identity_evidence(
+                        created_entity_ids,
+                        [logical_id],
+                    )
+            support_entity_ids = (
+                [
+                    entity_id
+                    for entity_id in created_entity_ids
+                    if entity_id not in set(delivery_entity_ids)
+                ]
+                if terminal_verified
+                else []
+            )
+            retained_entity_ids = [*delivery_entity_ids, *support_entity_ids]
+            reused_entity_ids = [
+                entity_id
+                for entity_id in retained_entity_ids
+                if entity_id not in set(created_entity_ids)
+            ]
+            final_state_proof = attempt.get("final_state_verification")
+            if not isinstance(final_state_proof, dict):
+                final_state_proof = raw_record.get("final_state_verification")
+            final_state_verified = _report_final_state_verified(
+                final_state_proof,
+                attempted_type,
+                raw_record,
+                attempt,
+            ) if terminal else False
+            logical_zero_ink_verified = bool(
+                raw_record.get("zero_ink_delivery") is True
+                and not record_entity_ids
+                and not attempt_entity_ids
+                and delivery_entity_ids
+                and delivery_entity_ids
+                == [
+                    _report_host_identity(
+                        "logical",
+                        raw_record.get("logical_delivery_id"),
+                    )
+                ]
+            )
+            physical_record_verified = bool(
+                record_entity_ids
+                and record_entity_ids == attempt_entity_ids
+                and delivery_entity_ids == record_entity_ids
+            )
+            record_verified = bool(
+                terminal_verified
+                and attempt_sequence_verified
+                and record_final == attempted_type
+                and final_state_verified
+                and (physical_record_verified or logical_zero_ink_verified)
+            )
+            ownership_verified = bool(
+                record_verified
+                and not set(removed_entity_ids).intersection(retained_entity_ids)
+                and set(retained_entity_ids).issubset(
+                    set(created_entity_ids).union(reused_entity_ids)
+                )
+                and not reused_entity_ids
+            )
+            entry = {
+                str(key): value
+                for key, value in attempt.items()
+                if not str(key).startswith("_")
+            }
+            entry.update(
+                {
+                    "source_item_id": source_id,
+                    "requested_type": requested,
+                    "attempted_type": attempted_type,
+                    "final_type": record_final if terminal_verified else None,
+                    "outcome": outcome,
+                    "cleanup_complete": cleanup_complete,
+                    "created_entity_ids": created_entity_ids,
+                    "removed_entity_ids": removed_entity_ids,
+                    "delivery_entity_ids": delivery_entity_ids,
+                    "support_entity_ids": support_entity_ids,
+                    "referenced_entity_ids": [],
+                    "reused_entity_ids": reused_entity_ids,
+                    "strategy": str(attempt.get("strategy") or attempted_type),
+                    "record_verified": record_verified,
+                    "type_verified": bool(
+                        terminal_verified
+                        and attempt_sequence_verified
+                        and record_final == attempted_type
+                        and final_state_verified
+                    ),
+                    "visual_verified": bool(
+                        terminal_verified
+                        and attempt_sequence_verified
+                        and final_state_verified
+                    ),
+                    "ownership_verified": ownership_verified,
+                    "attempt_sequence_verified": attempt_sequence_verified,
+                    "impossibility_proof_verified": impossibility_proof_verified,
+                    "impossibility_proof_failures": impossibility_failures,
+                    "host_outcome": host_status,
+                    "evidence": (
+                        dict(attempt.get("evidence") or {})
+                        if isinstance(attempt.get("evidence"), dict)
+                        else {}
+                    ),
+                }
+            )
+            if terminal:
+                entry["host_record"] = dict(record_metadata)
+                if (
+                    "final_state_verification" not in entry
+                    and isinstance(raw_record.get("final_state_verification"), dict)
+                ):
+                    entry["final_state_verification"] = dict(
+                        raw_record["final_state_verification"]
+                    )
+            ledger.append(entry)
+    return ledger
+
+
+def _text_delivery_obligation_source_ids(
+    stats: Dict[str, Any],
+    expected_count: int,
+) -> Dict[str, Any]:
+    """Read the extraction inventory without deriving identities from outcomes."""
+
+    raw_source_ids = stats.get("text_source_item_ids")
+    source_item_ids = list(raw_source_ids) if isinstance(raw_source_ids, list) else []
+    target_count = max(0, int(expected_count))
+    exact_ids = bool(
+        all(
+            isinstance(source_id, str)
+            and bool(source_id)
+            and source_id == source_id.strip()
+            for source_id in source_item_ids
+        )
+        and len(source_item_ids) == len(set(source_item_ids))
+    )
+    inventory_valid = bool(
+        isinstance(raw_source_ids, list)
+        and len(source_item_ids) == target_count
+        and exact_ids
+    )
+    return {
+        "source_item_ids": source_item_ids,
+        "valid": inventory_valid,
+        "expected_count": target_count,
+        "actual_count": len(source_item_ids),
+    }
+
+
 def write_import_report(
     filepath: str,
     config: Dict,
@@ -323,9 +1109,47 @@ def write_import_report(
         or _default_import_report_path(filepath)
     )
     elapsed = float(stats.get("elapsed", 0.0) or 0.0)
-    text_delivery = _text_delivery_from_provenance(provenance_opts)
-    text_delivery_summary = text_delivery["summary"]
-    text_fallback = _text_fallback_from_provenance(provenance_opts)
+    text_source_spans = int(stats.get("text_source_spans", stats.get("text_items", 0)) or 0)
+    text_mode = _report_text_type(config.get("text_mode") or "3d_text")
+    import_text_enabled = bool(config.get("import_text", True)) and text_mode != "none"
+    raw_text_delivery = _text_delivery_from_provenance(
+        provenance_opts if import_text_enabled else None
+    )
+    text_delivery_records = raw_text_delivery["items"]
+    text_source_inventory = _text_delivery_obligation_source_ids(
+        stats,
+        text_source_spans,
+    )
+    obligation_source_ids = (
+        list(text_source_inventory["source_item_ids"])
+        if import_text_enabled
+        else []
+    )
+    text_delivery_required = bool(obligation_source_ids)
+    text_delivery_attempts = _canonical_text_delivery_attempts(
+        text_delivery_records
+    )
+    expected_text_source_ids = (
+        obligation_source_ids
+        if import_text_enabled
+        else []
+    )
+    text_representation_delivery = build_text_representation_delivery(
+        text_delivery_attempts,
+        requested_type=text_mode,
+        required=text_delivery_required,
+        expected_source_item_ids=expected_text_source_ids,
+    )
+    text_delivery_summary = raw_text_delivery["summary"]
+    text_delivery = {
+        "schema": raw_text_delivery["schema"],
+        "summary": text_delivery_summary,
+    }
+    text_fallback = (
+        _text_fallback_from_provenance(provenance_opts)
+        if import_text_enabled
+        else None
+    )
     raster_delivery_failures = []
     for record in list(stats.get("raster_delivery_failures") or []):
         if not isinstance(record, dict):
@@ -367,7 +1191,7 @@ def write_import_report(
     text_fallback_attempted = any(
         bool(record.get("fallback_attempted"))
         or len(tuple(record.get("attempts") or ())) > 1
-        for record in text_delivery["items"]
+        for record in text_delivery_records
     )
     fallback_used = (
         raster_is_fallback
@@ -395,14 +1219,15 @@ def write_import_report(
     phases = dict(stats.get("performance_phases") or {})
     if elapsed > 0 and "total_ms" not in phases:
         phases["total_ms"] = elapsed * 1000.0
-    text_source_spans = int(stats.get("text_source_spans", stats.get("text_items", 0)) or 0)
     text_glyph_estimate = int(stats.get("text_glyph_estimate", 0) or 0)
     bootstrap_text_items = list(stats.get("parts_bootstrap_text_items") or [])
     try:
         delivered_text_counts = getattr(provenance_opts, "_text_delivered_entity_counts", None)
     except AttributeError:
         delivered_text_counts = None
-    if not isinstance(delivered_text_counts, dict):
+    if not import_text_enabled:
+        delivered_text_counts = {}
+    elif not isinstance(delivered_text_counts, dict):
         delivered_text_counts = None
     font_rendered = None
     if delivered_text_counts:
@@ -414,24 +1239,25 @@ def write_import_report(
         except (TypeError, ValueError):
             font_rendered = None
 
-    text_mode = str(config.get("text_mode") or "3d_text")
-    import_text_enabled = bool(config.get("import_text", True)) and text_mode != "none"
     delivery_source_items = int(text_delivery_summary["source_items"])
     delivery_delivered_items = int(text_delivery_summary["delivered_items"])
     delivery_failed_items = int(text_delivery_summary["failed_items"])
-    text_delivery_required = bool(import_text_enabled and text_source_spans > 0)
+    text_source_inventory_valid = bool(
+        not import_text_enabled or text_source_inventory["valid"]
+    )
     text_delivery_verified = bool(
-        not text_delivery_required
+        not import_text_enabled
         or (
-            delivery_source_items == text_source_spans
-            and delivery_delivered_items == delivery_source_items
-            and delivery_failed_items == 0
+            text_source_inventory_valid
+            and text_representation_delivery["verified"] is True
         )
     )
     terminal_failure = {}
     if not text_delivery_verified:
         terminal_failure["text_delivery"] = {
             "required_source_items": text_source_spans,
+            "source_inventory_valid": text_source_inventory_valid,
+            "source_inventory_items": int(text_source_inventory["actual_count"]),
             "recorded_source_items": delivery_source_items,
             "delivered_items": delivery_delivered_items,
             "failed_items": delivery_failed_items,
@@ -453,19 +1279,20 @@ def write_import_report(
         "scale_hints": stats.get("scale_hints"),
         "fallback_attempted": bool(fallback_attempted),
         "result_status": "incomplete" if terminal_failure else "success",
+        "text_mode": text_mode,
     }
     if terminal_failure:
         extra["terminal_failure"] = terminal_failure
     if int(text_delivery_summary["source_items"]) > 0:
         extra["text_delivery"] = text_delivery
-    if text_source_spans > 0 or int(text_delivery_summary["source_items"]) > 0:
-        extra["text_representation_delivery"] = {
-            "required": text_delivery_required,
-            "verified": text_delivery_verified,
-            "source_items": delivery_source_items,
-            "delivered_items": delivery_delivered_items,
-            "failed_items": delivery_failed_items,
-        }
+    extra["text_delivery_obligations"] = {
+        "schema": "bcs.text_delivery_obligations/1.0",
+        "required": text_delivery_required,
+        "requested_type": text_mode,
+        "source_item_ids": obligation_source_ids,
+    }
+    extra["text_delivery_attempts"] = text_delivery_attempts
+    extra["text_representation_delivery"] = text_representation_delivery
     if raster_delivery_failures:
         extra["raster_delivery_failures"] = raster_delivery_failures
         extra["raster_delivery_failure_count"] = len(raster_delivery_failures)
@@ -488,14 +1315,13 @@ def write_import_report(
         extra["text_mode_normalized_from"] = sorted(
             str(value) for value in normalized_from
         )
-    if bool(config.get("import_text", True)) and text_mode != "none":
-        extra["actual_text_entity_types"] = build_actual_text_entity_types(
-            host_app="blender",
-            text_mode=text_mode,
-            count=int(stats.get("text_items", 0) or 0),
-            font_rendered=font_rendered,
-            delivered_counts=delivered_text_counts,
-        )
+    extra["actual_text_entity_types"] = build_actual_text_entity_types(
+        host_app="blender",
+        text_mode=text_mode if import_text_enabled else None,
+        count=int(stats.get("text_items", 0) or 0) if import_text_enabled else 0,
+        font_rendered=font_rendered if import_text_enabled else False,
+        delivered_counts=delivered_text_counts,
+    )
 
     report = build_import_report(
         host_app="blender",
@@ -527,8 +1353,8 @@ def write_import_report(
         fallback_used=fallback_used,
         fallback_reason=fallback_reason,
         pdf_engine_version=_pymupdf_version(),
-        import_text=bool(config.get("import_text", True)),
-        text_mode=text_mode if import_text_enabled else None,
+        import_text=import_text_enabled,
+        text_mode=text_mode,
         text_source_spans=text_source_spans,
         text_glyph_estimate=text_glyph_estimate,
         text_fallback=text_fallback,
@@ -557,8 +1383,10 @@ def write_import_report(
             if "text_representation_fallback_used" not in signals:
                 signals.append("text_representation_fallback_used")
             action = (
-                "Review extra.text_delivery.items for each requested representation, "
-                "impossibility proof, cleanup result, and final entity identity."
+                "Review extra.text_delivery_attempts and the compact terminal joins in "
+                "extra.text_representation_delivery.items for each requested "
+                "representation, impossibility proof, cleanup result, and final "
+                "entity identity."
             )
             if action not in actions:
                 actions.append(action)
@@ -2592,6 +3420,7 @@ def _live_entity_continuity_failures(
 
     actual_type = str(getattr(obj, "type", "") or "")
     expected_type = {
+        "labels": "FONT",
         "text": "FONT",
         "3d_text": "FONT",
         "glyphs": "CURVE",
@@ -4166,6 +4995,7 @@ def import_pdf(
             "recognition_skipped_pages": 0,
             "hidden_startup_cube": hidden_startup_cube,
             "text_source_spans": 0,
+            "text_source_item_ids": [],
             "text_glyph_estimate": 0,
             "parts_bootstrap_text_items": [],
             "model3d_solids": 0,
@@ -4272,13 +5102,18 @@ def import_pdf(
 
             _progress(_page_progress(i, 0.35), f"Parsed page {page_num}: {len(page_data.primitives)} primitives")
             _merge_scale_into_stats(total_stats, page_data)
-            total_stats["text_source_spans"] += len(page_data.text_items or [])
+            page_text_items = list(page_data.text_items or [])
+            total_stats["text_source_spans"] += len(page_text_items)
+            total_stats["text_source_item_ids"].extend(
+                "page:%d:text:%d" % (int(page_num), int(item.id))
+                for item in page_text_items
+            )
             total_stats["text_glyph_estimate"] += sum(
                 len(str(getattr(item, "text", "") or ""))
-                for item in (page_data.text_items or [])
+                for item in page_text_items
             )
-            total_stats["parts_bootstrap_text_items"].extend(page_data.text_items or [])
-            model3d_all_text.extend(page_data.text_items or [])
+            total_stats["parts_bootstrap_text_items"].extend(page_text_items)
+            model3d_all_text.extend(page_text_items)
 
             # 9c. Geometry cleanup (remove micro-segments)
             if import_cfg.cleanup_level != "conservative" or import_cfg.min_seg_len > 0:
@@ -4381,7 +5216,7 @@ def import_pdf(
                         f"Building text for page {_pn}... ({int(frac * 100)}%)",
                     )
                 text_count = build_all_text(
-                    page_data.text_items,
+                    page_text_items,
                     page_col,
                     page_num,
                     visual_style=visual_style,

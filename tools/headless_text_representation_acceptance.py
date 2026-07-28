@@ -589,6 +589,32 @@ def _assert_provenance_parent_links(records, sidecar_path: Path) -> dict:
     return sidecar
 
 
+def _delivery_record_views(attempt_ledger, resolution) -> list[dict]:
+    """Rebuild rich Blender record views in memory from canonical terminals."""
+
+    records = []
+    items = list(resolution["items"])
+    terminals = list(resolution["terminal_attempts"])
+    assert len(items) == len(terminals)
+    for item, terminal in zip(items, terminals, strict=True):
+        source_id = str(item["source_item_id"])
+        host_record = terminal.get("host_record")
+        assert isinstance(host_record, dict), terminal
+        record = dict(host_record)
+        record["item_id"] = source_id
+        record["attempts"] = [
+            attempt
+            for attempt in attempt_ledger
+            if str(attempt.get("source_item_id") or "") == source_id
+        ]
+        if isinstance(terminal.get("final_state_verification"), dict):
+            record["final_state_verification"] = dict(
+                terminal["final_state_verification"]
+            )
+        records.append(record)
+    return records
+
+
 def _physical_entity_snapshot(obj) -> dict:
     snapshot = {
         "name": str(obj.name),
@@ -777,6 +803,9 @@ def main() -> None:
     from pdf_vector_importer.pdfcadcore.import_config import ImportConfig
     from pdf_vector_importer.pdfcadcore.embedded_fonts import EmbeddedFontFailure
     from pdf_vector_importer.pdfcadcore.primitive_extractor import extract_page
+    from pdf_vector_importer.pdfcadcore.text_delivery_report import (
+        resolve_text_representation_delivery,
+    )
     from pdf_vector_importer.packed_assets import verify_packed_sha256
 
     ensure_lib_path()
@@ -1031,8 +1060,9 @@ def main() -> None:
     assert full_stats["text_delivery_delivered_items"] == len(page_data.text_items)
     assert full_stats["text_delivery_failed_items"] == 0
     report = json.loads(report_path.read_text(encoding="utf-8"))
-    delivery = report["extra"]["text_delivery"]
-    summary = delivery["summary"]
+    delivery_summary = report["extra"]["text_delivery"]
+    assert set(delivery_summary) == {"schema", "summary"}
+    summary = delivery_summary["summary"]
     assert summary["source_items"] == len(page_data.text_items)
     assert summary["delivered_items"] == len(page_data.text_items)
     assert summary["failed_items"] == 0
@@ -1041,7 +1071,18 @@ def main() -> None:
     assert int(final_counts.get("raster", 0)) == 0
     assert summary["fallback_items"] == 0
     source_text_by_id = {int(item.id): str(item.text) for item in page_data.text_items}
-    full_records = delivery["items"]
+    delivery = report["extra"]["text_representation_delivery"]
+    attempt_ledger = report["extra"]["text_delivery_attempts"]
+    expected_source_ids = {
+        f"page:1:text:{int(item.id)}" for item in page_data.text_items
+    }
+    delivery_resolution = resolve_text_representation_delivery(
+        attempt_ledger,
+        delivery,
+        expected_source_item_ids=expected_source_ids,
+    )
+    assert delivery_resolution["verified"] is True, delivery_resolution
+    full_records = _delivery_record_views(attempt_ledger, delivery_resolution)
     welding_provenance_path = report_path.with_name(
         report["extra"]["source_provenance_path"]
     )

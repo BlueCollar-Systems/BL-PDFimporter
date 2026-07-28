@@ -40,7 +40,9 @@ def test_stacked_fraction_spacing_extract_page_matches_golden() -> None:
     finally:
         doc.close()
 
-    texts = [item.text.strip() for item in page_data.text_items]
+    # Physical delivery remains every positioned PDF span. Fraction merging is
+    # analysis-only and must never alter requested Text/3D Text/Glyph delivery.
+    texts = [item.text.strip() for item in page_data.semantic_text_items]
     for want in golden.get("expected_merged_fractions") or []:
         assert want in texts, f"expected merged fraction {want!r} in {texts!r}"
     for whole in golden.get("expected_whole_numbers") or []:
@@ -50,7 +52,7 @@ def test_stacked_fraction_spacing_extract_page_matches_golden() -> None:
 
     max_size = float(golden.get("max_merged_font_size_mm") or 2.5)
     merged_set = set(golden.get("expected_merged_fractions") or [])
-    for item in page_data.text_items:
+    for item in page_data.semantic_text_items:
         token = item.text.strip()
         if token in merged_set and item.font_size > max_size:
             pytest.fail(f"{token!r} font_size {item.font_size:.2f}mm exceeds {max_size}")
