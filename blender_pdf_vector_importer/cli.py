@@ -30,7 +30,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--scale", type=float, default=None,
                         help="Additional scale multiplier")
     parser.add_argument("--text-mode", default=None,
-                        choices=["labels", "3d_text", "glyphs", "geometry"],
+                        choices=[
+                            "labels",
+                            "text",
+                            "3d_text",
+                            "glyphs",
+                            "geometry",
+                            "raster",
+                        ],
                         help="Text handling (orthogonal to --mode)")
     parser.add_argument("--import-text",
                         action=argparse.BooleanOptionalAction,

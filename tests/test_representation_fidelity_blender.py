@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import builtins
+from io import BytesIO
 import math
 from hashlib import sha256
 from pathlib import Path
@@ -491,9 +492,30 @@ def _character_layout():
     )
 
 
+def _character_layout_with_space():
+    first, last = _character_layout()
+    whitespace = TextCharLayout(
+        text=" ",
+        glyph_id=None,
+        source_origin_pdf=(16.0, 20.0),
+        source_bbox_pdf=(16.0, 10.0, 18.0, 22.0),
+        source_quad_pdf=((16.0, 10.0), (18.0, 10.0), (18.0, 22.0), (16.0, 22.0)),
+        target_origin=(18.0, 24.0),
+        target_quad=((18.0, 30.0), (20.0, 30.0), (20.0, 24.0), (18.0, 24.0)),
+        advance_width=2.0,
+        glyph_height=6.0,
+    )
+    return first, whitespace, last
+
+
 def _install(monkeypatch, **kwargs):
     fake = _FakeBpy(**kwargs)
     monkeypatch.setattr(bl_text_builder, "bpy", fake)
+    monkeypatch.setattr(
+        bl_text_builder,
+        "_exact_font_glyph_has_visible_ink",
+        lambda _asset, _glyph_id: True,
+    )
     bl_text_builder._FONT_CACHE.clear()
     return fake, _Collection()
 
@@ -717,6 +739,157 @@ def test_positioned_conversion_batches_source_and_final_dependency_graph_updates
 
 
 @pytest.mark.parametrize(
+    ("mode", "expected_type"),
+    [("glyphs", "CURVE"), ("geometry", "MESH")],
+)
+def test_positioned_conversion_preserves_whitespace_advance_without_visible_geometry(
+    monkeypatch,
+    mode,
+    expected_type,
+):
+    fake, collection = _install(monkeypatch)
+    monkeypatch.setattr(
+        bl_text_builder,
+        "_apply_target_quad_affine",
+        lambda *_args, **_kwargs: None,
+    )
+
+    def verify_positioned_transform(obj, text_item):
+        location = [
+            text_item.insertion[0] * 0.001,
+            text_item.insertion[1] * 0.001,
+        ]
+        return (
+            [],
+            {
+                "expected_location_m": location,
+                "actual_baseline_anchor_m": location,
+                "evaluated_bounds_verified": True,
+            },
+        )
+
+    monkeypatch.setattr(
+        bl_text_builder,
+        "_verify_transform_and_dimensions",
+        verify_positioned_transform,
+    )
+    opts = types.SimpleNamespace(import_mode="vector", text_mode=mode)
+    item = _item()
+    item.text = "A B"
+    item.normalized = "A B"
+    item.source_char_layout = _character_layout_with_space()
+    item.requires_individual_positioning = True
+
+    obj = bl_text_builder.build_text(
+        item,
+        collection,
+        page_number=2,
+        text_mode=mode,
+        provenance_opts=opts,
+    )
+
+    assert obj is not None and obj.type == expected_type
+    assert len(collection.objects.items) == 2
+    assert {candidate.type for candidate in collection.objects.items} == {
+        expected_type
+    }
+    record = opts._text_delivery_records[-1]
+    assert record["final_representation"] == mode
+    assert record["fallback_used"] is False
+    assert len(record["entity_ids"]) == 2
+    evidence = record["attempts"][-1]["evidence"]
+    assert evidence["character_count"] == 3
+    assert [entry["text"] for entry in evidence["character_entities"]] == [
+        "A",
+        " ",
+        "B",
+    ]
+    whitespace = evidence["character_entities"][1]
+    assert whitespace["entity_ids"] == []
+    assert whitespace["verification"]["zero_ink_identity"] is True
+    assert whitespace["verification"]["visible_geometry_omitted"] is True
+    assert whitespace["verification"]["advance_preserved"] is True
+    assert whitespace["target_origin_model"] == [18.0, 24.0]
+    assert evidence["character_entities"][2]["target_origin_model"] == [20.0, 24.0]
+    assert fake.view_update_count == 2
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_type"),
+    [("glyphs", "CURVE"), ("geometry", "MESH")],
+)
+def test_positioned_conversion_preserves_exact_font_empty_glyph_advance(
+    monkeypatch,
+    mode,
+    expected_type,
+):
+    fake, collection = _install(monkeypatch)
+    monkeypatch.setattr(
+        bl_text_builder,
+        "_apply_target_quad_affine",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        bl_text_builder,
+        "_exact_font_glyph_has_visible_ink",
+        lambda _asset, glyph_id: int(glyph_id) != 91,
+        raising=False,
+    )
+
+    def verify_positioned_transform(obj, text_item):
+        location = [
+            text_item.insertion[0] * 0.001,
+            text_item.insertion[1] * 0.001,
+        ]
+        return (
+            [],
+            {
+                "expected_location_m": location,
+                "actual_baseline_anchor_m": location,
+                "evaluated_bounds_verified": True,
+            },
+        )
+
+    monkeypatch.setattr(
+        bl_text_builder,
+        "_verify_transform_and_dimensions",
+        verify_positioned_transform,
+    )
+    opts = types.SimpleNamespace(import_mode="vector", text_mode=mode)
+    item = _item()
+    item.text = "AB"
+    item.normalized = "AB"
+    item.source_char_layout = _character_layout()
+    item.requires_individual_positioning = True
+
+    obj = bl_text_builder.build_text(
+        item,
+        collection,
+        page_number=2,
+        text_mode=mode,
+        provenance_opts=opts,
+    )
+
+    assert obj is not None and obj.type == expected_type
+    assert len(collection.objects.items) == 1
+    assert collection.objects.items[0].type == expected_type
+    record = opts._text_delivery_records[-1]
+    assert record["final_representation"] == mode
+    assert len(record["entity_ids"]) == 1
+    characters = record["attempts"][-1]["evidence"]["character_entities"]
+    assert [entry["text"] for entry in characters] == ["A", "B"]
+    assert characters[1]["entity_ids"] == []
+    assert characters[1]["verification"]["zero_ink_identity"] is True
+    assert characters[1]["verification"]["zero_ink_reason"] == (
+        "exact_font_glyph_has_no_visible_bounds"
+    )
+    assert characters[1]["verification"]["source_glyph_visible_ink"] is False
+    assert characters[1]["verification"]["advance_preserved"] is True
+    assert characters[1]["target_origin_model"] == [20.0, 24.0]
+    assert fake.view_update_count == 2
+
+
+@pytest.mark.parametrize(
     ("mode", "install_kwargs"),
     [
         ("glyphs", {"curve_available": False}),
@@ -790,6 +963,51 @@ def test_positioned_whitespace_without_glyph_id_uses_source_layout_identity_metr
     assert metrics["zero_ink_identity"] is True
     assert metrics["local_advance"] == pytest.approx(0.006)
     assert metrics["local_line_height"] == pytest.approx(0.006)
+
+
+def test_exact_font_glyph_visibility_distinguishes_ink_from_empty_advance():
+    from fontTools.fontBuilder import FontBuilder
+    from fontTools.pens.ttGlyphPen import TTGlyphPen
+
+    builder = FontBuilder(1000, isTTF=True)
+    builder.setupGlyphOrder([".notdef", "A", "B"])
+    empty_pen = TTGlyphPen(None)
+    empty = empty_pen.glyph()
+    visible_pen = TTGlyphPen(None)
+    visible_pen.moveTo((50, 0))
+    visible_pen.lineTo((550, 0))
+    visible_pen.lineTo((550, 700))
+    visible_pen.lineTo((50, 700))
+    visible_pen.closePath()
+    builder.setupGlyf({".notdef": empty, "A": visible_pen.glyph(), "B": empty})
+    builder.setupHorizontalMetrics(
+        {".notdef": (500, 0), "A": (600, 50), "B": (600, 0)}
+    )
+    builder.setupHorizontalHeader(ascent=800, descent=-200)
+    builder.setupCharacterMap({65: "A", 66: "B"})
+    builder.setupOS2()
+    builder.setupNameTable(
+        {
+            "familyName": "Glyph visibility fixture",
+            "styleName": "Regular",
+            "uniqueFontIdentifier": "Glyph visibility fixture Regular",
+            "fullName": "Glyph visibility fixture Regular",
+            "psName": "GlyphVisibilityFixture-Regular",
+        }
+    )
+    builder.setupPost()
+    builder.setupMaxp()
+    output = BytesIO()
+    builder.font.save(output, reorderTables=False)
+    font_bytes = output.getvalue()
+    asset = types.SimpleNamespace(
+        usable_bytes=font_bytes,
+        usable_sha256=sha256(font_bytes).hexdigest(),
+    )
+    bl_text_builder._FONT_GLYPH_INK_CACHE.clear()
+
+    assert bl_text_builder._exact_font_glyph_has_visible_ink(asset, 1) is True
+    assert bl_text_builder._exact_font_glyph_has_visible_ink(asset, 2) is False
 
 
 def test_positioned_glyph_metrics_use_blender_font_bbox_normalization():

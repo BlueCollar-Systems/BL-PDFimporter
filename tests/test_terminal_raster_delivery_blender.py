@@ -125,6 +125,11 @@ class _TextRasterPage:
         return _TextPixmap()
 
 
+class _RotatedTextRasterPage(_TextRasterPage):
+    rotation = 90
+    rotation_matrix = fitz.Matrix(0.0, 1.0, -1.0, 0.0, 3024.0, 0.0)
+
+
 def _raster_placement():
     return {
         "path": "rendered-page.png",
@@ -379,6 +384,48 @@ def test_item_terminal_raster_is_clipped_and_placed_at_the_item_target_bbox(
     assert placement["source_item_id"] == "page:2:text:41"
     assert Path(placement["path"]).read_bytes() == b"verified-png"
     assert expected["pdf_raster_source_item_id"] == "page:2:text:41"
+
+
+def test_item_terminal_raster_transforms_unrotated_source_bbox_for_page_clip(
+    monkeypatch,
+    tmp_path,
+):
+    page = _RotatedTextRasterPage()
+    source_bbox = (1147.1431884765625, 697.7354125976562, 1163.6844482421875, 729.83837890625)
+    text_item = types.SimpleNamespace(
+        id=1,
+        text="1HR",
+        source_bbox_pdf=source_bbox,
+        bbox=(404.688, 408.181, 416.015, 419.503),
+    )
+    captured = []
+    expected = _RasterObject()
+    monkeypatch.setattr(
+        bl_import_engine,
+        "_create_image_plane",
+        lambda placement, *_args, **_kwargs: captured.append(dict(placement))
+        or expected,
+    )
+
+    actual = bl_import_engine._render_text_item_raster(
+        page,
+        text_item,
+        object(),
+        page_num=2,
+        item_id="page:2:text:1",
+        import_cfg=types.SimpleNamespace(raster_dpi=300),
+        image_dir=str(tmp_path),
+    )
+
+    assert actual is expected
+    assert len(page.calls) == 1
+    expected_clip = fitz.Rect(*source_bbox) * page.rotation_matrix
+    actual_clip = page.calls[0]["clip"]
+    assert tuple(actual_clip) == pytest.approx(tuple(expected_clip))
+    assert captured[0]["source_bbox_pdf"] == list(source_bbox)
+    assert captured[0]["source_render_clip_pdf"] == pytest.approx(
+        list(expected_clip)
+    )
 
 
 def test_item_terminal_raster_metadata_failure_cleans_created_plane(monkeypatch, tmp_path):

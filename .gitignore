@@ -11,6 +11,7 @@ build/
 .idea/
 *.swp
 .pytest_cache/
+.pytest_tmp*/
 .ruff_cache/
 dev_logs/
 benchmarks/

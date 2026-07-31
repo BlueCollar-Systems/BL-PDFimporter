@@ -27,6 +27,48 @@ def _write_sample_pdf(pdf_path: Path) -> None:
 class TestModeCli(unittest.TestCase):
     """Smoke-test the ``--mode auto`` CLI contract for BCS-ARCH-001."""
 
+    def test_cli_accepts_every_shared_text_representation(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="bl_mode_cli_text_contract_") as tmp:
+            tmp_path = Path(tmp)
+            pdf_path = tmp_path / "sample.pdf"
+            _write_sample_pdf(pdf_path)
+
+            for text_mode in (
+                "labels",
+                "text",
+                "3d_text",
+                "glyphs",
+                "geometry",
+                "raster",
+            ):
+                with self.subTest(text_mode=text_mode):
+                    result = subprocess.run(
+                        [
+                            sys.executable,
+                            "-m",
+                            "blender_pdf_vector_importer.cli",
+                            str(pdf_path),
+                            "--mode",
+                            "vector",
+                            "--text-mode",
+                            text_mode,
+                        ],
+                        cwd=os.path.dirname(
+                            os.path.dirname(os.path.abspath(__file__))
+                        ),
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    self.assertEqual(
+                        result.returncode,
+                        0,
+                        msg=(
+                            f"valid text representation {text_mode!r} was rejected: "
+                            f"stdout={result.stdout!r} stderr={result.stderr!r}"
+                        ),
+                    )
+
     def test_cli_writes_import_report_path(self) -> None:
         with tempfile.TemporaryDirectory(prefix="bl_mode_cli_report_") as tmp:
             tmp_path = Path(tmp)

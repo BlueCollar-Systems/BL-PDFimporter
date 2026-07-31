@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import math
 import os
+from io import BytesIO
 from pathlib import Path
 
 import pytest
@@ -142,6 +143,170 @@ def test_one_malformed_font_inventory_record_invalidates_the_whole_page():
 def test_font_without_existing_cmap_or_pdf_unicode_map_is_rejected():
     with pytest.raises(ValueError, match="Unicode map unavailable"):
         embedded_fonts._usable_font(b"not-an-sfnt", "ttf", "ExactFont", {})
+
+
+def test_cmap_repair_adds_host_safe_names_to_anonymous_subset_font():
+    from fontTools.fontBuilder import FontBuilder
+    from fontTools.pens.ttGlyphPen import TTGlyphPen
+    from fontTools.ttLib import TTFont
+
+    builder = FontBuilder(1000, isTTF=True)
+    builder.setupGlyphOrder([".notdef", "A"])
+    pen = TTGlyphPen(None)
+    empty_glyph = pen.glyph()
+    builder.setupGlyf({".notdef": empty_glyph, "A": empty_glyph})
+    builder.setupHorizontalMetrics({".notdef": (500, 0), "A": (600, 0)})
+    builder.setupHorizontalHeader(ascent=800, descent=-200)
+    builder.setupCharacterMap({65: "A"})
+    builder.setupOS2()
+    builder.setupNameTable(
+        {
+            "familyName": "Disposable fixture",
+            "styleName": "Regular",
+            "uniqueFontIdentifier": "Disposable fixture Regular",
+            "fullName": "Disposable fixture Regular",
+            "psName": "DisposableFixture-Regular",
+        }
+    )
+    builder.setupPost()
+    builder.setupMaxp()
+    del builder.font["cmap"]
+    del builder.font["name"]
+    source = BytesIO()
+    builder.font.save(source, reorderTables=False)
+
+    usable_format, usable_bytes, cmap_installed = embedded_fonts._usable_font(
+        source.getvalue(),
+        "ttf",
+        "OCR Exact / Anonymous",
+        {65: 1},
+    )
+
+    assert usable_format == "ttf"
+    assert cmap_installed is True
+    font = TTFont(BytesIO(usable_bytes), lazy=False)
+    try:
+        assert font.getBestCmap() == {65: "A"}
+        names = {
+            int(record.nameID): record.toUnicode()
+            for record in font["name"].names
+            if int(record.nameID) in {1, 2, 3, 4, 5, 6}
+        }
+        assert names[1] == "OCR Exact / Anonymous"
+        assert names[2] == "Regular"
+        assert names[4] == "OCR Exact / Anonymous"
+        assert names[6] == "OCR-Exact-Anonymous"
+    finally:
+        font.close()
+
+
+def test_exact_inventory_name_outranks_weaker_internal_family_aliases(monkeypatch):
+    class Document:
+        @staticmethod
+        def extract_font(xref):
+            names = {
+                1: "ABCDEF+Arial",
+                2: "ArialMT",
+                3: "Arial-BoldMT",
+            }
+            return names[xref], "ttf", "Type0", f"font-{xref}".encode("ascii")
+
+    class Page:
+        parent = Document()
+
+        @staticmethod
+        def get_texttrace():
+            return []
+
+        @staticmethod
+        def get_fonts(*, full=False):
+            assert full is True
+            return [
+                (1, "ttf", "Type0", "ABCDEF+Arial", "F0", "Identity-H"),
+                (2, "ttf", "Type0", "ArialMT", "F1", "Identity-H"),
+                (3, "ttf", "Type0", "Arial-BoldMT", "F2", "Identity-H"),
+            ]
+
+    monkeypatch.setattr(
+        embedded_fonts,
+        "_page_unicode_glyph_maps",
+        lambda _page: ({"Arial": {65: 1}}, set(), None),
+    )
+    monkeypatch.setattr(
+        embedded_fonts,
+        "_font_program_name_aliases",
+        lambda _data, _format: {"Arial"},
+    )
+    monkeypatch.setattr(
+        embedded_fonts,
+        "_usable_font",
+        lambda source, source_format, _name, _mapping: (
+            source_format,
+            source,
+            True,
+        ),
+    )
+    monkeypatch.setattr(
+        embedded_fonts,
+        "_font_delivery_metrics",
+        lambda _data: (1000, 800, -200, (500, 500)),
+    )
+
+    catalog = EmbeddedFontCatalog.from_page(Page(), page_number=30)
+    asset = catalog.for_span("Arial")
+
+    assert asset is not None
+    assert asset.source_xref == 1
+    assert asset.base_font_name == "Arial"
+
+
+def test_cmap_repair_classifies_fonttools_assertion_as_malformed_source(monkeypatch):
+    monkeypatch.setattr(
+        embedded_fonts,
+        "_install_pdf_unicode_cmap_unchecked",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError(
+                "corrupt cmap table format 4 (data length: 74, header length: 80)"
+            )
+        ),
+    )
+
+    with pytest.raises(
+        embedded_fonts.ExactFontSourceImpossible,
+        match="corrupt cmap table format 4",
+    ):
+        embedded_fonts._install_pdf_unicode_cmap(
+            b"malformed-font",
+            {65: 1},
+            "MalformedFont",
+        )
+
+
+def test_fonttools_assertions_from_malformed_source_tables_do_not_escape(monkeypatch):
+    import fontTools.ttLib
+
+    class MalformedFont:
+        reader = {"head": object()}
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        @staticmethod
+        def getGlyphOrder():
+            raise AssertionError(
+                "corrupt cmap table format 4 (data length: 74, header length: 80)"
+            )
+
+        @staticmethod
+        def close():
+            pass
+
+    monkeypatch.setattr(fontTools.ttLib, "TTFont", MalformedFont)
+
+    assert embedded_fonts._fonttools_loadable(b"malformed-font") is False
+    assert embedded_fonts._font_program_name_aliases(
+        b"malformed-font", "ttf"
+    ) == set()
 
 
 def test_trace_failure_never_uses_an_unbound_source_cmap_as_pdf_glyph_proof(monkeypatch):

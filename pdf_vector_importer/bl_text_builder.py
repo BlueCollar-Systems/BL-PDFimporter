@@ -2,6 +2,7 @@
 """Verified item-scoped Blender text representation delivery."""
 from __future__ import annotations
 
+from io import BytesIO
 from dataclasses import replace
 from hashlib import sha256
 import logging
@@ -28,6 +29,8 @@ from .text_delivery import (
 MM_TO_M = 0.001
 _FONT_SIZE_SCALE = 1.0
 _FONT_CACHE: Dict[str, bpy.types.VectorFont] = {}
+_FONT_GLYPH_INK_CACHE: Dict[Tuple[str, int], bool] = {}
+_FONT_GLYPH_INK_PREFETCH_LIMIT = 4096
 _TEXT_MODES = {"labels", "text", "3d_text", "glyphs", "geometry", "raster"}
 LOGGER = logging.getLogger(__name__)
 
@@ -96,6 +99,51 @@ def _calibrated_text_size_mm(text_item: NormalizedText) -> float:
         float(getattr(text_item, "rotation", 0.0) or 0.0),
         min_size=0.1,
     )
+
+
+def _exact_font_glyph_has_visible_ink(asset, glyph_id: int) -> bool:
+    """Prove whether an exact embedded glyph has drawable source outlines."""
+
+    glyph_index = int(glyph_id)
+    digest = str(getattr(asset, "usable_sha256", "") or "")
+    font_bytes = bytes(getattr(asset, "usable_bytes", b"") or b"")
+    if (
+        glyph_index < 0
+        or not digest
+        or not font_bytes
+        or sha256(font_bytes).hexdigest() != digest
+    ):
+        raise RuntimeError("exact font glyph visibility bytes are unavailable")
+    cache_key = (digest, glyph_index)
+    cached = _FONT_GLYPH_INK_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    from fontTools.pens.boundsPen import BoundsPen
+    from fontTools.ttLib import TTFont
+
+    font = TTFont(BytesIO(font_bytes), lazy=False, recalcTimestamp=False)
+    try:
+        glyph_order = font.getGlyphOrder()
+        if glyph_index >= len(glyph_order):
+            raise RuntimeError(
+                f"exact font glyph index {glyph_index} exceeds "
+                f"glyph count {len(glyph_order)}"
+            )
+        glyph_set = font.getGlyphSet()
+        indices = (
+            range(len(glyph_order))
+            if len(glyph_order) <= _FONT_GLYPH_INK_PREFETCH_LIMIT
+            else (glyph_index,)
+        )
+        for index in indices:
+            glyph_name = glyph_order[index]
+            pen = BoundsPen(glyph_set)
+            glyph_set[glyph_name].draw(pen)
+            _FONT_GLYPH_INK_CACHE[(digest, index)] = pen.bounds is not None
+    finally:
+        font.close()
+    return bool(_FONT_GLYPH_INK_CACHE[cache_key])
 
 
 def _styled_text_color(
@@ -3037,6 +3085,34 @@ def _attempt_positioned_converted_characters(
     for index, layout in enumerate(layouts):
         child = _character_text_item(text_item, layout)
         glyph_id = getattr(layout, "glyph_id", None)
+        zero_ink = str(getattr(layout, "text", "") or "").isspace()
+        zero_ink_reason = "source_whitespace" if zero_ink else ""
+        source_glyph_visible_ink = None
+        if (
+            not zero_ink
+            and glyph_id is not None
+            and getattr(child, "font_asset", None) is not None
+        ):
+            try:
+                source_glyph_visible_ink = _exact_font_glyph_has_visible_ink(
+                    child.font_asset,
+                    int(glyph_id),
+                )
+            except Exception as exc:
+                failure = AttemptOutcome.failed(
+                    "exact_font_glyph_visibility_unverified",
+                    evidence={
+                        "item_id": item_id,
+                        "failed_character_index": index,
+                        "glyph_id": glyph_id,
+                        "exception_type": type(exc).__name__,
+                        "detail": str(exc),
+                    },
+                )
+                return aggregate_failure(failure, index)
+            if not source_glyph_visible_ink:
+                zero_ink = True
+                zero_ink_reason = "exact_font_glyph_has_no_visible_bounds"
         suffix = f"_c{index:04d}_g{glyph_id if glyph_id is not None else 'na'}"
         source, source_data, failure = _create_font_candidate(
             child,
@@ -3056,6 +3132,9 @@ def _attempt_positioned_converted_characters(
             "index": index,
             "layout": layout,
             "child": child,
+            "zero_ink": zero_ink,
+            "zero_ink_reason": zero_ink_reason,
+            "source_glyph_visible_ink": source_glyph_visible_ink,
             "source": source,
             "source_data": source_data,
             "final": None,
@@ -3092,6 +3171,17 @@ def _attempt_positioned_converted_characters(
             )
         source_records.append(character_record(candidate, source_outcome))
 
+    if not any(not candidate["zero_ink"] for candidate in candidates):
+        failure = AttemptOutcome.failed(
+            "positioned_conversion_contains_no_visible_glyphs",
+            evidence={
+                "item_id": item_id,
+                "character_count": len(candidates),
+                "character_entities": source_records,
+            },
+        )
+        return aggregate_failure(failure, records=source_records)
+
     try:
         depsgraph = bpy.context.evaluated_depsgraph_get()
     except Exception as exc:
@@ -3106,6 +3196,8 @@ def _attempt_positioned_converted_characters(
         return aggregate_failure(failure, records=source_records)
 
     for candidate in candidates:
+        if candidate["zero_ink"]:
+            continue
         final, final_data, failure = _prepare_positioned_converted_candidate(
             candidate["source"],
             candidate["source_data"],
@@ -3159,6 +3251,27 @@ def _attempt_positioned_converted_characters(
     outcomes = []
     character_evidence = []
     for candidate in candidates:
+        if candidate["zero_ink"]:
+            source_verification = dict(
+                source_records[candidate["index"]].get("verification") or {}
+            )
+            outcome = AttemptOutcome.delivered(
+                None,
+                evidence={
+                    **source_verification,
+                    "item_id": item_id,
+                    "zero_ink_identity": True,
+                    "zero_ink_reason": candidate["zero_ink_reason"],
+                    "source_glyph_visible_ink": candidate[
+                        "source_glyph_visible_ink"
+                    ],
+                    "visible_geometry_omitted": True,
+                    "advance_preserved": True,
+                },
+            )
+            outcomes.append(outcome)
+            character_evidence.append(character_record(candidate, outcome))
+            continue
         verification_failure, verification_evidence = _verify_converted_candidate(
             candidate["final"],
             candidate["final_data"],
@@ -3206,13 +3319,23 @@ def _attempt_positioned_converted_characters(
         except (AttributeError, ReferenceError, TypeError, ValueError):
             pass
 
-    first = outcomes[0]
+    first = next((outcome for outcome in outcomes if outcome.entity is not None), None)
+    if first is None:  # pragma: no cover - rejected before dependency-graph access
+        failure = AttemptOutcome.failed(
+            "positioned_conversion_contains_no_visible_glyphs",
+            evidence={
+                "item_id": item_id,
+                "character_count": len(candidates),
+                "character_entities": character_evidence,
+            },
+        )
+        return aggregate_failure(failure, records=character_evidence)
     evidence = {
         **_font_asset_evidence(text_item),
         **dict(first.evidence or {}),
         "item_id": item_id,
         "character_positioning_preserved": True,
-        "character_count": len(outcomes),
+        "character_count": len(candidates),
         "character_entities": character_evidence,
         "dependency_graph_updates": 2,
     }

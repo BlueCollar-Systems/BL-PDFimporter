@@ -1424,6 +1424,21 @@ def _render_text_item_raster(
     dpi = int(max(36, getattr(import_cfg, "raster_dpi", 300) or 300))
     matrix = fitz.Matrix(dpi / 72.0, dpi / 72.0)
     clip = fitz.Rect(sx0, sy0, sx1, sy1)
+    try:
+        page_rotation = int(getattr(page, "rotation", 0) or 0) % 360
+    except (TypeError, ValueError):
+        return None
+    if page_rotation:
+        rotation_matrix = getattr(page, "rotation_matrix", None)
+        if rotation_matrix is None:
+            return None
+        try:
+            clip = clip * rotation_matrix
+        except (RuntimeError, TypeError, ValueError):
+            return None
+    render_clip = [float(clip.x0), float(clip.y0), float(clip.x1), float(clip.y1)]
+    if not all(math.isfinite(value) for value in render_clip):
+        return None
     safe_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(item_id)).strip("_")
     if not safe_id:
         return None
@@ -1453,6 +1468,7 @@ def _render_text_item_raster(
         "xref": -1_000_000 - source_id,
         "page_number": int(page_num),
         "source_bbox_pdf": [sx0, sy0, sx1, sy1],
+        "source_render_clip_pdf": render_clip,
         "source_item_id": str(item_id),
     }
     try:
@@ -1468,6 +1484,9 @@ def _render_text_item_raster(
     try:
         obj["pdf_raster_source_item_id"] = str(item_id)
         obj["pdf_raster_source_bbox_pdf"] = list(placement["source_bbox_pdf"])
+        obj["pdf_raster_render_clip_pdf"] = list(
+            placement["source_render_clip_pdf"]
+        )
         obj["pdf_raster_dpi"] = dpi
     except Exception:
         plane_cleanup = _remove_created_image_plane(obj, collection)

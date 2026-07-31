@@ -138,7 +138,15 @@ def _fonttools_loadable(data: bytes) -> bool:
             font[tag].compile(font)
         font.close()
         return True
-    except (AttributeError, KeyError, OSError, TTLibError, TypeError, ValueError):
+    except (
+        AssertionError,
+        AttributeError,
+        KeyError,
+        OSError,
+        TTLibError,
+        TypeError,
+        ValueError,
+    ):
         return False
 
 
@@ -175,7 +183,15 @@ def _font_delivery_metrics(data: bytes) -> tuple[int, int, int, tuple[int, ...]]
         return units_per_em, ascender, descender, advances
     except ExactFontSourceImpossible:
         raise
-    except (AttributeError, KeyError, OSError, TTLibError, TypeError, ValueError) as exc:
+    except (
+        AssertionError,
+        AttributeError,
+        KeyError,
+        OSError,
+        TTLibError,
+        TypeError,
+        ValueError,
+    ) as exc:
         raise ExactFontSourceImpossible(
             f"usable font delivery metrics are unavailable: {type(exc).__name__}: {exc}"
         ) from exc
@@ -324,6 +340,7 @@ def _cff_to_otf(source_bytes: bytes, base_font_name: str) -> bytes:
     except ExactFontSourceImpossible:
         raise
     except (
+        AssertionError,
         EOFError,
         KeyError,
         OSError,
@@ -340,6 +357,7 @@ def _cff_to_otf(source_bytes: bytes, base_font_name: str) -> bytes:
 def _install_pdf_unicode_cmap_unchecked(
     usable_bytes: bytes,
     unicode_to_glyph_id: Mapping[int, int],
+    base_font_name: str = "EmbeddedFont",
 ) -> tuple[bytes, bool]:
     if not unicode_to_glyph_id:
         return usable_bytes, False
@@ -381,6 +399,36 @@ def _install_pdf_unicode_cmap_unchecked(
                 "exact PDF Unicode-to-glyph map is empty"
             )
         font["cmap"] = table
+        if "name" not in font:
+            name_table = newTable("name")
+            name_table.names = []
+            font["name"] = name_table
+        else:
+            name_table = font["name"]
+        existing_name_ids = {
+            int(record.nameID)
+            for record in name_table.names
+            if str(record.toUnicode() or "").strip()
+        }
+        family_name = str(base_font_name or "").strip() or "EmbeddedFont"
+        safe_name = (
+            _SAFE_POSTSCRIPT_NAME.sub("-", family_name).strip("-")
+            or "EmbeddedFont"
+        )[:63]
+        source_token = sha256(usable_bytes).hexdigest()[:16]
+        required_names = {
+            1: family_name,
+            2: "Regular",
+            3: f"BCS-PDFExact-{source_token}",
+            4: family_name,
+            5: "Version 1.000",
+            6: safe_name,
+        }
+        for name_id, value in required_names.items():
+            if name_id in existing_name_ids:
+                continue
+            name_table.setName(value, name_id, 3, 1, 0x0409)
+            name_table.setName(value, name_id, 1, 0, 0)
         output = BytesIO()
         font.save(output, reorderTables=False)
         return output.getvalue(), True
@@ -391,6 +439,7 @@ def _install_pdf_unicode_cmap_unchecked(
 def _install_pdf_unicode_cmap(
     usable_bytes: bytes,
     unicode_to_glyph_id: Mapping[int, int],
+    base_font_name: str = "EmbeddedFont",
 ) -> tuple[bytes, bool]:
     """Install PDF glyph identity while classifying source parse failures."""
 
@@ -398,11 +447,12 @@ def _install_pdf_unicode_cmap(
 
     try:
         return _install_pdf_unicode_cmap_unchecked(
-            usable_bytes, unicode_to_glyph_id
+            usable_bytes, unicode_to_glyph_id, base_font_name
         )
     except ExactFontSourceImpossible:
         raise
     except (
+        AssertionError,
         EOFError,
         KeyError,
         OSError,
@@ -444,7 +494,11 @@ def _usable_font(
             raise ExactFontSourceImpossible(
                 f"unsupported embedded font format: {source_format or '<empty>'}"
             )
-        usable_bytes, cmap_installed = _install_pdf_unicode_cmap(usable_bytes, unicode_map)
+        usable_bytes, cmap_installed = _install_pdf_unicode_cmap(
+            usable_bytes,
+            unicode_map,
+            base_font_name,
+        )
         if not _fonttools_loadable(usable_bytes):
             raise ExactFontSourceImpossible(
                 f"embedded {usable_format} font program is not loadable"
@@ -497,7 +551,15 @@ def _font_program_name_aliases(data: bytes, source_format: str) -> set[str]:
             if name:
                 aliases.add(name)
         return aliases
-    except (AttributeError, KeyError, OSError, TTLibError, TypeError, ValueError):
+    except (
+        AssertionError,
+        AttributeError,
+        KeyError,
+        OSError,
+        TTLibError,
+        TypeError,
+        ValueError,
+    ):
         return set()
     finally:
         if font is not None:
@@ -637,8 +699,6 @@ class EmbeddedFontCatalog:
                     "source_inventory_invalid_for_page",
                 )
                 return cls(page_number, {}, failures)
-            if base_name in ambiguous_names:
-                continue
             if document is None or not hasattr(document, "extract_font"):
                 failures[base_name] = EmbeddedFontFailure(
                     int(page_number), base_name, "source_document_unavailable", xref,
@@ -757,6 +817,19 @@ class EmbeddedFontCatalog:
             for delivery_name in delivery_names:
                 previous = assets.get(delivery_name)
                 if previous is not None and previous.asset_id != asset.asset_id:
+                    previous_is_exact = previous.base_font_name == delivery_name
+                    current_is_exact = base_name == delivery_name
+                    if previous_is_exact and not current_is_exact:
+                        # An exact PDF inventory name outranks a weaker internal
+                        # family/full-name alias from another embedded program.
+                        continue
+                    if current_is_exact and not previous_is_exact:
+                        assets[delivery_name] = replace(
+                            asset, span_font_name=delivery_name
+                        )
+                        ambiguous_names.discard(delivery_name)
+                        failures.pop(delivery_name, None)
+                        continue
                     assets.pop(delivery_name, None)
                     ambiguous_names.add(delivery_name)
                     failures[delivery_name] = EmbeddedFontFailure(
@@ -765,6 +838,15 @@ class EmbeddedFontCatalog:
                         proof_category="source_font_ambiguous_for_item",
                     )
                     continue
+                if (
+                    delivery_name in ambiguous_names
+                    and base_name != delivery_name
+                ):
+                    # Do not let a later weak alias silently resurrect a name
+                    # already proven ambiguous by distinct font programs.
+                    continue
+                if base_name == delivery_name:
+                    ambiguous_names.discard(delivery_name)
                 assets[delivery_name] = replace(
                     asset, span_font_name=delivery_name
                 )
