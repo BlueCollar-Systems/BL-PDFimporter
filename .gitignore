@@ -9,6 +9,7 @@ build/
 .env.local
 .vscode/
 .idea/
+.worktrees/
 *.swp
 .pytest_cache/
 .pytest_tmp*/
