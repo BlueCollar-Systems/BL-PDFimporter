@@ -44,6 +44,22 @@ _AUTO_RECOGNITION_PAGE_AREA_MM2_LIMIT = 12_000_000.0
 _INLINE_IMAGE_COMPOSITE_THRESHOLD = 256
 
 
+class IncompleteImportError(RuntimeError):
+    """The report was written, but one or more mandatory deliveries failed."""
+
+    def __init__(self, failures, stats):
+        self.failures = tuple(str(value) for value in failures if str(value))
+        self.stats = stats
+        self.report_path = str(stats.get("import_report_path") or "")
+        report_hint = f" Report: {self.report_path}." if self.report_path else ""
+        super().__init__(
+            "PDF import is incomplete: "
+            + "; ".join(self.failures)
+            + "."
+            + report_hint
+        )
+
+
 def _env_bool(name: str, default: bool = False) -> bool:
     raw = os.environ.get(name, "").strip().lower()
     if not raw:
@@ -287,6 +303,45 @@ def _text_delivery_from_provenance(provenance_opts: Any) -> Dict[str, Any]:
         },
         "items": records,
     }
+
+
+def _terminal_import_failures(config: Dict, stats: Dict, provenance_opts: Any) -> List[str]:
+    """Return mandatory delivery failures that must make import_pdf fail closed."""
+    failures: List[str] = []
+    report_error = str(stats.get("import_report_error") or "").strip()
+    if report_error:
+        failures.append(f"mandatory import report failed ({report_error})")
+
+    summary = _text_delivery_from_provenance(provenance_opts)["summary"]
+    text_mode = str(config.get("text_mode") or "3d_text").strip().lower()
+    import_text = bool(config.get("import_text", True)) and text_mode != "none"
+    required = int(stats.get("text_source_spans", 0) or 0) if import_text else 0
+    recorded = int(summary["source_items"])
+    delivered = int(summary["delivered_items"])
+    failed = int(summary["failed_items"])
+    if required > 0 and (recorded != required or delivered != required or failed != 0):
+        failures.append(
+            "text delivery failed "
+            f"(required={required}, recorded={recorded}, delivered={delivered}, failed={failed})"
+        )
+
+    raster_failures = list(stats.get("raster_delivery_failures") or [])
+    if raster_failures:
+        failures.append(f"raster delivery failed ({len(raster_failures)} attempt(s))")
+
+    geometry_failures = [
+        issue
+        for issue in list(stats.get("geometry_delivery_issues") or [])
+        if isinstance(issue, dict)
+        and str(issue.get("status") or "").strip().lower() != "verified"
+    ]
+    if geometry_failures:
+        failures.append(f"geometry delivery failed ({len(geometry_failures)} primitive(s))")
+
+    cleanup_error = str(stats.get("temp_cleanup_error") or "").strip()
+    if cleanup_error:
+        failures.append(f"owned temporary cleanup failed ({cleanup_error})")
+    return failures
 
 
 def write_import_report(
@@ -3194,6 +3249,9 @@ def import_pdf(
             total_stats["import_report_path"] = report_path
         except (OSError, RuntimeError, TypeError, ValueError, ImportError) as exc:
             total_stats["import_report_error"] = str(exc)
+        terminal_failures = _terminal_import_failures(config, total_stats, import_cfg)
+        if terminal_failures:
+            raise IncompleteImportError(terminal_failures, total_stats)
         return total_stats
 
     finally:

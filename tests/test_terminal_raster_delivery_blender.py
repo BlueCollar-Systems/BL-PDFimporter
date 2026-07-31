@@ -378,17 +378,18 @@ def _run_raster_import(monkeypatch, tmp_path, *, rendered, plane_created):
         return str(tmp_path / "import_report.json")
 
     monkeypatch.setattr(bl_import_engine, "write_import_report", _capture_report)
-    stats = bl_import_engine.import_pdf(
-        str(input_pdf),
-        config={
-            "mode": "raster",
-            "pages": "1",
-            "auto_focus_view": False,
-            "auto_hide_default_cube": False,
-        },
-    )
+    with pytest.raises(bl_import_engine.IncompleteImportError) as caught:
+        bl_import_engine.import_pdf(
+            str(input_pdf),
+            config={
+                "mode": "raster",
+                "pages": "1",
+                "auto_focus_view": False,
+                "auto_hide_default_cube": False,
+            },
+        )
     assert len(report_calls) == 1
-    return stats, report_calls[0]
+    return caught.value.stats, report_calls[0]
 
 
 def test_raster_render_failure_is_recorded_in_returned_and_reported_stats(monkeypatch, tmp_path):
@@ -1016,9 +1017,25 @@ def test_page_raster_strategy_does_not_suppress_requested_structural_text(
 
     def _capture_text(*args, **kwargs):
         build_calls.append((args, kwargs))
+        kwargs["provenance_opts"]._text_delivery_records = [{
+            "item_id": "page:1:text:9",
+            "page": 1,
+            "source_span_id": 9,
+            "requested_representation": "text",
+            "final_representation": "text",
+            "status": "delivered",
+            "fallback_used": False,
+            "entity_ids": ["Text_9"],
+            "attempts": [],
+        }]
         return 1
 
     monkeypatch.setattr(bl_import_engine, "build_all_text", _capture_text)
+    monkeypatch.setattr(
+        bl_import_engine,
+        "_reverify_text_delivery_after_stack",
+        lambda *_args, **_kwargs: [],
+    )
     stats = bl_import_engine.import_pdf(
         str(input_pdf),
         config={
@@ -1100,17 +1117,18 @@ def test_page_raster_composition_excludes_only_text_that_was_delivered_separatel
     monkeypatch.setattr(bl_import_engine, "build_all_text", _build_text)
     monkeypatch.setattr(bl_import_engine, "_render_page_raster", _capture_render)
 
-    bl_import_engine.import_pdf(
-        str(input_pdf),
-        config={
-            "mode": "raster",
-            "pages": "1",
-            "import_text": True,
-            "text_mode": "text",
-            "auto_focus_view": False,
-            "auto_hide_default_cube": False,
-        },
-    )
+    with pytest.raises(bl_import_engine.IncompleteImportError):
+        bl_import_engine.import_pdf(
+            str(input_pdf),
+            config={
+                "mode": "raster",
+                "pages": "1",
+                "import_text": True,
+                "text_mode": "text",
+                "auto_focus_view": False,
+                "auto_hide_default_cube": False,
+            },
+        )
 
     assert captured[-1]["excluded_text_bboxes"] == [(10.0, 12.0, 30.0, 24.0)]
 
@@ -1580,6 +1598,83 @@ def test_import_stats_exclude_post_stack_failed_text(monkeypatch, tmp_path):
 
     assert stats["text_items"] == 0
     assert stats["text_final_state_failures"] == [{"item_id": "page:1:text:1"}]
+
+
+def test_import_pdf_raises_after_report_when_any_required_text_item_is_undelivered(
+    monkeypatch,
+    tmp_path,
+):
+    input_pdf = tmp_path / "input.pdf"
+    input_pdf.write_bytes(b"%PDF-1.7\n")
+    image_dir = tmp_path / "images"
+    image_dir.mkdir()
+    report_path = tmp_path / "import_report.json"
+    page_data = _page_data()
+    page_data.text_items = [
+        types.SimpleNamespace(id=1, text="WELD", bbox=(0.0, 0.0, 10.0, 2.0))
+    ]
+
+    monkeypatch.setattr(bl_import_engine, "bpy", _FakeBpy())
+    monkeypatch.setattr(bl_import_engine, "check_pymupdf", lambda: True)
+    monkeypatch.setattr(bl_import_engine, "ensure_lib_path", lambda: None)
+    monkeypatch.setattr(fitz_loader, "import_fitz", lambda **_kwargs: object())
+    monkeypatch.setattr(fitz_loader, "safe_open", lambda _path: _Document())
+    monkeypatch.setattr(bl_import_engine, "extract_page", lambda *_args, **_kwargs: page_data)
+    monkeypatch.setattr(bl_import_engine, "build_page", lambda *_args, **_kwargs: {})
+
+    def fail_text_delivery(_items, _collection, page_number, **kwargs):
+        provenance_opts = kwargs["provenance_opts"]
+        provenance_opts._text_delivery_records = [{
+            "item_id": f"page:{page_number}:text:1",
+            "page": page_number,
+            "source_span_id": 1,
+            "requested_representation": "text",
+            "attempts": [{
+                "attempt_index": 0,
+                "attempted_representation": "text",
+                "status": "failed",
+                "reason": "requested_font_representation_visual_verification_failed",
+                "evidence": {},
+                "entity_ids": [],
+                "owned_artifacts": [],
+                "superseded": True,
+                "cleanup": {"status": "complete", "removed": []},
+            }],
+            "final_representation": None,
+            "status": "failed",
+            "fallback_attempted": False,
+            "fallback_used": False,
+            "entity_ids": [],
+        }]
+        return 0
+
+    def write_report(_filepath, _config, _stats, **_kwargs):
+        report_path.write_text('{"extra":{"result_status":"incomplete"}}', encoding="utf-8")
+        return str(report_path)
+
+    monkeypatch.setattr(bl_import_engine, "build_all_text", fail_text_delivery)
+    monkeypatch.setattr(bl_import_engine, "_extract_image_placements", lambda *_args: [])
+    monkeypatch.setattr(bl_import_engine.tempfile, "mkdtemp", lambda **_kwargs: str(image_dir))
+    monkeypatch.setattr(bl_import_engine, "write_import_report", write_report)
+
+    with pytest.raises(bl_import_engine.IncompleteImportError) as caught:
+        bl_import_engine.import_pdf(
+            str(input_pdf),
+            config={
+                "mode": "vector",
+                "pages": "1",
+                "import_text": True,
+                "text_mode": "text",
+                "auto_focus_view": False,
+                "auto_hide_default_cube": False,
+            },
+        )
+
+    assert report_path.is_file()
+    assert caught.value.stats["text_delivery_source_items"] == 1
+    assert caught.value.stats["text_delivery_delivered_items"] == 0
+    assert caught.value.stats["text_delivery_failed_items"] == 1
+    assert caught.value.report_path == str(report_path)
 
 
 def test_unknown_text_representation_fails_before_root_collection_creation(

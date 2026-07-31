@@ -517,6 +517,10 @@ def _install(monkeypatch, **kwargs):
         lambda _asset, _glyph_id: True,
     )
     bl_text_builder._FONT_CACHE.clear()
+    if hasattr(bl_text_builder, "_VERIFIED_FONT_ASSET_BYTES"):
+        bl_text_builder._VERIFIED_FONT_ASSET_BYTES.clear()
+    if hasattr(bl_text_builder, "_VERIFIED_PACKED_FONTS"):
+        bl_text_builder._VERIFIED_PACKED_FONTS.clear()
     return fake, _Collection()
 
 
@@ -668,6 +672,57 @@ def test_character_positioned_3d_text_stays_3d_text_and_records_every_entity(mon
     assert verification_update_counts == [1, 1]
 
 
+def test_positioned_native_text_omits_proven_zero_ink_character_objects(monkeypatch):
+    fake, collection = _install(monkeypatch)
+    monkeypatch.setattr(
+        bl_text_builder,
+        "_apply_target_quad_affine",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        bl_text_builder,
+        "_verify_transform_and_dimensions",
+        lambda _obj, text_item: (
+            [],
+            {
+                "expected_location_m": [
+                    text_item.insertion[0] * 0.001,
+                    text_item.insertion[1] * 0.001,
+                ],
+                "actual_baseline_anchor_m": [
+                    text_item.insertion[0] * 0.001,
+                    text_item.insertion[1] * 0.001,
+                ],
+                "evaluated_bounds_verified": True,
+            },
+        ),
+    )
+    opts = types.SimpleNamespace(import_mode="vector", text_mode="text")
+    item = _item()
+    item.text = "A B"
+    item.normalized = "A B"
+    item.source_char_layout = _character_layout_with_space()
+    item.requires_individual_positioning = True
+
+    obj = bl_text_builder.build_text(
+        item,
+        collection,
+        page_number=2,
+        text_mode="text",
+        provenance_opts=opts,
+    )
+
+    assert obj is not None
+    assert [candidate.data.body for candidate in collection.objects.items] == ["A", "B"]
+    evidence = opts._text_delivery_records[-1]["attempts"][-1]["evidence"]
+    whitespace = evidence["character_entities"][1]
+    assert whitespace["entity_ids"] == []
+    assert whitespace["verification"]["zero_ink_identity"] is True
+    assert whitespace["verification"]["visible_geometry_omitted"] is True
+    assert whitespace["verification"]["advance_preserved"] is True
+    assert fake.view_update_count == 1
+
+
 @pytest.mark.parametrize(
     ("mode", "expected_type"),
     [("glyphs", "CURVE"), ("geometry", "MESH")],
@@ -811,6 +866,7 @@ def test_positioned_conversion_preserves_whitespace_advance_without_visible_geom
     assert whitespace["verification"]["advance_preserved"] is True
     assert whitespace["target_origin_model"] == [18.0, 24.0]
     assert evidence["character_entities"][2]["target_origin_model"] == [20.0, 24.0]
+    assert not any("_c0001_" in name for name in fake.data.curves.removed)
     assert fake.view_update_count == 2
 
 
@@ -2001,6 +2057,43 @@ def test_corrupt_deterministic_font_cache_is_atomically_repaired(monkeypatch, tm
     assert obj is not None
     assert cache_path.read_bytes() == item.font_asset.usable_bytes
     assert fake.data.fonts.loaded == [(str(cache_path), False)]
+
+
+def test_exact_font_integrity_is_hashed_and_packed_once_per_verified_asset(
+    monkeypatch,
+    tmp_path,
+):
+    _fake, _collection = _install(monkeypatch)
+    item = _item()
+    monkeypatch.setattr(bl_text_builder.tempfile, "gettempdir", lambda: str(tmp_path))
+    original_sha256 = bl_text_builder.sha256
+    original_verify = bl_text_builder.verify_packed_sha256
+    source_hash_calls = []
+    packed_verify_calls = []
+
+    def counting_sha256(payload=b""):
+        if bytes(payload) == item.font_asset.usable_bytes:
+            source_hash_calls.append(1)
+        return original_sha256(payload)
+
+    def counting_verify(font, expected_sha):
+        packed_verify_calls.append((font, expected_sha))
+        return original_verify(font, expected_sha)
+
+    monkeypatch.setattr(bl_text_builder, "sha256", counting_sha256)
+    monkeypatch.setattr(bl_text_builder, "verify_packed_sha256", counting_verify)
+
+    first, first_failure = bl_text_builder._load_exact_font(
+        item, "page:2:text:41", 2
+    )
+    second, second_failure = bl_text_builder._load_exact_font(
+        item, "page:2:text:42", 2
+    )
+
+    assert first_failure is None and second_failure is None
+    assert first is second
+    assert len(source_hash_calls) == 1
+    assert packed_verify_calls == []
 
 
 def test_removed_blender_font_datablock_is_evicted_and_reloaded(monkeypatch, tmp_path):

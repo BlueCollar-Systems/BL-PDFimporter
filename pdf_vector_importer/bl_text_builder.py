@@ -31,6 +31,8 @@ _FONT_SIZE_SCALE = 1.0
 _FONT_CACHE: Dict[str, bpy.types.VectorFont] = {}
 _FONT_GLYPH_INK_CACHE: Dict[Tuple[str, int], bool] = {}
 _FONT_GLYPH_INK_PREFETCH_LIMIT = 4096
+_VERIFIED_FONT_ASSET_BYTES: Dict[int, Tuple[Any, str, bytes]] = {}
+_VERIFIED_PACKED_FONTS: Dict[str, Any] = {}
 _TEXT_MODES = {"labels", "text", "3d_text", "glyphs", "geometry", "raster"}
 LOGGER = logging.getLogger(__name__)
 
@@ -878,6 +880,36 @@ def _font_asset_evidence(text_item: NormalizedText) -> Dict[str, Any]:
     }
 
 
+def _verify_font_asset_bytes_once(asset, font_bytes: bytes, expected_sha: str) -> str:
+    """Hash one immutable extracted asset once during a text-build batch."""
+    cache_key = id(asset)
+    cached = _VERIFIED_FONT_ASSET_BYTES.get(cache_key)
+    if (
+        cached is not None
+        and cached[0] is asset
+        and cached[1] == expected_sha
+        and cached[2] is font_bytes
+    ):
+        return expected_sha
+    actual_sha = sha256(font_bytes).hexdigest() if font_bytes else ""
+    if not font_bytes or not expected_sha or actual_sha != expected_sha:
+        return actual_sha
+    _VERIFIED_FONT_ASSET_BYTES[cache_key] = (asset, expected_sha, font_bytes)
+    return actual_sha
+
+
+def _verify_packed_font_once(font, expected_sha: str) -> str:
+    """Read/hash shared packed font bytes once, while detecting removed datablocks."""
+    cached = _VERIFIED_PACKED_FONTS.get(expected_sha)
+    if cached is font:
+        # A removed Blender datablock raises on even lightweight RNA access.
+        _ = font.name
+        return expected_sha
+    actual_sha = verify_packed_sha256(font, expected_sha)
+    _VERIFIED_PACKED_FONTS[expected_sha] = font
+    return actual_sha
+
+
 def _load_exact_font(text_item: NormalizedText, item_id: str, page_number: int):
     asset = getattr(text_item, "font_asset", None)
     if asset is None:
@@ -906,7 +938,7 @@ def _load_exact_font(text_item: NormalizedText, item_id: str, page_number: int):
         )
     font_bytes = bytes(getattr(asset, "usable_bytes", b"") or b"")
     expected_sha = str(getattr(asset, "usable_sha256", "") or "")
-    actual_sha = sha256(font_bytes).hexdigest() if font_bytes else ""
+    actual_sha = _verify_font_asset_bytes_once(asset, font_bytes, expected_sha)
     if not font_bytes or not expected_sha or actual_sha != expected_sha:
         return None, AttemptOutcome.failed(
             "exact_font_asset_hash_verification_failed",
@@ -919,9 +951,10 @@ def _load_exact_font(text_item: NormalizedText, item_id: str, page_number: int):
     cached = _FONT_CACHE.get(expected_sha)
     if cached is not None:
         try:
-            verify_packed_sha256(cached, expected_sha)
+            _verify_packed_font_once(cached, expected_sha)
         except (PackedAssetError, ReferenceError, AttributeError):
             _FONT_CACHE.pop(expected_sha, None)
+            _VERIFIED_PACKED_FONTS.pop(expected_sha, None)
         else:
             return cached, None
     extension = str(getattr(asset, "usable_format", "") or "").lower().lstrip(".")
@@ -965,6 +998,7 @@ def _load_exact_font(text_item: NormalizedText, item_id: str, page_number: int):
         # Load a fresh attempt-owned datablock and verify its packed payload.
         font = bpy.data.fonts.load(str(path), check_existing=False)
         pack_and_verify_bytes(font, font_bytes)
+        _VERIFIED_PACKED_FONTS[expected_sha] = font
     except Exception as exc:
         cleanup_error = ""
         if font is not None:
@@ -1701,8 +1735,8 @@ def _verify_font_candidate(obj, text_item, *, delivered: str, item_id: str):
         getattr(getattr(text_item, "font_asset", None), "usable_sha256", "") or ""
     )
     try:
-        packed_font_sha = verify_packed_sha256(obj.data.font, expected_font_sha)
-    except (AttributeError, PackedAssetError):
+        packed_font_sha = _verify_packed_font_once(obj.data.font, expected_font_sha)
+    except (AttributeError, PackedAssetError, ReferenceError):
         packed_font_sha = ""
         failures.append("exact_font_not_packed_with_verified_bytes")
     verification_evidence["packed_font_sha256"] = packed_font_sha
@@ -2710,6 +2744,10 @@ def _attempt_positioned_native_characters(
 ):
     """Create one positioned source item, then evaluate all characters once."""
     layouts = tuple(getattr(text_item, "source_char_layout", ()) or ())
+    omit_zero_ink = any(
+        not str(getattr(layout, "text", "") or "").isspace()
+        for layout in layouts
+    )
     candidates = []
     ownership_outcomes = []
 
@@ -2759,6 +2797,20 @@ def _attempt_positioned_native_characters(
         child = _character_text_item(text_item, layout)
         glyph_id = getattr(layout, "glyph_id", None)
         suffix = f"_c{index:04d}_g{glyph_id if glyph_id is not None else 'na'}"
+        if omit_zero_ink and str(getattr(layout, "text", "") or "").isspace():
+            pending = AttemptOutcome.delivered(
+                None,
+                evidence={
+                    "item_id": item_id,
+                    "zero_ink_identity": True,
+                    "zero_ink_reason": "source_whitespace",
+                    "visible_geometry_omitted": True,
+                    "advance_preserved": True,
+                },
+            )
+            candidates.append((index, layout, child, None, pending))
+            ownership_outcomes.append(pending)
+            continue
         obj, data, failure = _create_font_candidate(
             child,
             collection,
@@ -2783,7 +2835,7 @@ def _attempt_positioned_native_characters(
             owned_objects=_owned_objects_for_text_entity(obj),
             owned_datablocks=(data,),
         )
-        candidates.append((index, layout, child, obj))
+        candidates.append((index, layout, child, obj, pending))
         ownership_outcomes.append(pending)
 
     try:
@@ -2815,7 +2867,11 @@ def _attempt_positioned_native_characters(
 
     outcomes = list(ownership_outcomes)
     character_evidence = []
-    for position, (index, layout, child, obj) in enumerate(candidates):
+    for position, (index, layout, child, obj, pending) in enumerate(candidates):
+        if obj is None:
+            outcomes[position] = pending
+            character_evidence.append(character_record(index, layout, child, pending))
+            continue
         outcome = _verify_font_candidate(
             obj,
             child,
@@ -2839,7 +2895,12 @@ def _attempt_positioned_native_characters(
         except (AttributeError, ReferenceError, TypeError, ValueError):
             pass
 
-    first = outcomes[0]
+    first = next((outcome for outcome in outcomes if outcome.entity is not None), None)
+    if first is None:  # all-zero-ink spans retain a host FONT above
+        return AttemptOutcome.failed(
+            "positioned_native_contains_no_verified_entity",
+            evidence={"item_id": item_id, "character_entities": character_evidence},
+        )
     evidence = {
         **_font_asset_evidence(text_item),
         **dict(first.evidence or {}),
@@ -2992,6 +3053,10 @@ def _attempt_positioned_converted_characters(
 ):
     """Batch positioned FONT evaluation and CURVE/MESH verification by item."""
     layouts = tuple(getattr(text_item, "source_char_layout", ()) or ())
+    omit_whitespace_sources = any(
+        not str(getattr(layout, "text", "") or "").isspace()
+        for layout in layouts
+    )
     mesh_factory = None
     if delivered == "geometry":
         mesh_factory = getattr(getattr(bpy.data, "meshes", None), "new_from_object", None)
@@ -3113,6 +3178,20 @@ def _attempt_positioned_converted_characters(
             if not source_glyph_visible_ink:
                 zero_ink = True
                 zero_ink_reason = "exact_font_glyph_has_no_visible_bounds"
+        if zero_ink_reason == "source_whitespace" and omit_whitespace_sources:
+            candidates.append({
+                "index": index,
+                "layout": layout,
+                "child": child,
+                "zero_ink": True,
+                "zero_ink_reason": zero_ink_reason,
+                "source_glyph_visible_ink": source_glyph_visible_ink,
+                "source": None,
+                "source_data": None,
+                "final": None,
+                "final_data": None,
+            })
+            continue
         suffix = f"_c{index:04d}_g{glyph_id if glyph_id is not None else 'na'}"
         source, source_data, failure = _create_font_candidate(
             child,
@@ -3156,6 +3235,19 @@ def _attempt_positioned_converted_characters(
 
     source_records = []
     for candidate in candidates:
+        if candidate["source"] is None and candidate["zero_ink"]:
+            source_outcome = AttemptOutcome.delivered(
+                None,
+                evidence={
+                    "item_id": item_id,
+                    "zero_ink_identity": True,
+                    "zero_ink_reason": candidate["zero_ink_reason"],
+                    "visible_geometry_omitted": True,
+                    "advance_preserved": True,
+                },
+            )
+            source_records.append(character_record(candidate, source_outcome))
+            continue
         source_outcome = _verify_font_candidate(
             candidate["source"],
             candidate["child"],
@@ -3218,6 +3310,8 @@ def _attempt_positioned_converted_characters(
             return aggregate_failure(failure, candidate["index"], records)
 
     for candidate in candidates:
+        if candidate["source"] is None:
+            continue
         cleanup, remaining_objects, remaining_data = _remove_object_and_data(
             candidate["source"], candidate["source_data"], collection
         )
@@ -3565,6 +3659,11 @@ def build_all_text(
     provenance_opts: Any = None,
     terminal_raster_callback: Optional[Callable] = None,
 ) -> int:
+    # The extracted assets are immutable and every character using a font shares
+    # one Blender font datablock.  Scope integrity memoization to this page build
+    # so dense drawings do not re-hash identical font payloads thousands of times.
+    _VERIFIED_FONT_ASSET_BYTES.clear()
+    _VERIFIED_PACKED_FONTS.clear()
     count = 0
     total = max(1, len(text_items or []))
     heartbeat_every = max(25, int(total / 25))
