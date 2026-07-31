@@ -8,6 +8,7 @@ optional recognition, and Blender geometry/text building.
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import math
 import os
@@ -40,6 +41,7 @@ _MM_TO_M = 0.001
 _AUTO_RECOGNITION_PRIMITIVE_LIMIT = 20_000
 _AUTO_RECOGNITION_TEXT_LIMIT = 3_000
 _AUTO_RECOGNITION_PAGE_AREA_MM2_LIMIT = 12_000_000.0
+_INLINE_IMAGE_COMPOSITE_THRESHOLD = 256
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -1183,10 +1185,242 @@ def _extract_image_placements(doc, page, page_num: int, import_cfg, image_dir: s
                     "quad_mm": quad_mm,
                     "xref": xref,
                     "page_number": page_num,
+                    "source_kind": "xobject",
+                }
+            )
+
+    try:
+        image_inventory = page.get_image_info(hashes=True, xrefs=True)
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        image_inventory = []
+    inline_inventory = {
+        int(info.get("number", -1)): info
+        for info in image_inventory
+        if int(info.get("xref", 0) or 0) == 0
+    }
+    if inline_inventory:
+        try:
+            image_blocks = page.get_text("dict", flags=fitz.TEXT_PRESERVE_IMAGES).get(
+                "blocks", []
+            )
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            image_blocks = []
+        image_blocks = [
+            block
+            for block in image_blocks
+            if int(block.get("type", 0) or 0) == 1
+        ]
+        if len(inline_inventory) > _INLINE_IMAGE_COMPOSITE_THRESHOLD:
+            composite = _render_images_only_composite(
+                page,
+                page_num,
+                import_cfg,
+                image_dir,
+                image_blocks,
+                image_inventory,
+                fitz,
+            )
+            if composite is not None:
+                return [composite]
+        for block in image_blocks:
+            image_number = int(block.get("number", -1))
+            info = inline_inventory.get(image_number)
+            if info is None:
+                continue
+            image_bytes = bytes(block.get("image") or b"")
+            if not image_bytes:
+                continue
+            content_sha256 = hashlib.sha256(image_bytes).hexdigest()
+            extension = re.sub(
+                r"[^A-Za-z0-9]+", "", str(block.get("ext") or "png")
+            ).lower() or "png"
+            image_path = os.path.join(
+                image_dir,
+                f"page_{page_num:03d}_inline_{content_sha256}.{extension}",
+            )
+            try:
+                if not os.path.isfile(image_path):
+                    Path(image_path).write_bytes(image_bytes)
+            except OSError:
+                continue
+
+            image_transform = block.get("transform")
+            if image_transform is None:
+                continue
+            quad_mm = []
+            for unit_x, unit_y in (
+                (0.0, 1.0),
+                (1.0, 1.0),
+                (1.0, 0.0),
+                (0.0, 0.0),
+            ):
+                point = fitz.Point(unit_x, unit_y) * fitz.Matrix(*image_transform)
+                display_x, display_y = _transform_pdf_point(
+                    float(point.x),
+                    float(point.y),
+                    page_rotation,
+                )
+                x_pt = display_x - page_x0
+                y_pt = display_y - page_y0
+                if import_cfg.flip_y:
+                    y_pt = page_height - y_pt
+                quad_mm.append(
+                    (
+                        x_pt * _MM_PER_PT * import_cfg.user_scale,
+                        y_pt * _MM_PER_PT * import_cfg.user_scale,
+                    )
+                )
+            xs = [point[0] for point in quad_mm]
+            ys = [point[1] for point in quad_mm]
+            digest = info.get("digest") or b""
+            placements.append(
+                {
+                    "path": image_path,
+                    "x_mm": min(xs),
+                    "y_mm": min(ys),
+                    "width_mm": max(xs) - min(xs),
+                    "height_mm": max(ys) - min(ys),
+                    "quad_mm": quad_mm,
+                    "xref": 0,
+                    "page_number": page_num,
+                    "source_kind": "inline",
+                    "source_image_number": image_number,
+                    "source_digest": (
+                        bytes(digest).hex() if isinstance(digest, bytes) else str(digest)
+                    ),
+                    "source_content_sha256": content_sha256,
                 }
             )
 
     return placements
+
+
+def _render_images_only_composite(
+    page,
+    page_num: int,
+    import_cfg,
+    image_dir: str,
+    image_blocks: list[dict],
+    image_inventory: list[dict],
+    fitz,
+) -> Optional[dict]:
+    """Render only page images into one transparent, provenance-locked PNG."""
+    if not image_blocks:
+        return None
+    page_rect = page.rect
+    page_width = float(page_rect.width)
+    page_height = float(page_rect.height)
+    page_x0 = float(getattr(page_rect, "x0", 0.0) or 0.0)
+    page_y0 = float(getattr(page_rect, "y0", 0.0) or 0.0)
+    page_rotation = _page_rotation_transform(
+        page_rect,
+        getattr(page, "rotation_matrix", fitz.Matrix(1, 0, 0, 1, 0, 0)),
+    )
+    inventory_by_number = {
+        int(info.get("number", -1)): info for info in image_inventory
+    }
+    definitions: dict[str, tuple[str, str]] = {}
+    uses: list[str] = []
+    manifest = hashlib.sha256()
+    inline_count = 0
+    for block in image_blocks:
+        image_bytes = bytes(block.get("image") or b"")
+        transform = block.get("transform")
+        if not image_bytes or transform is None:
+            return None
+        image_number = int(block.get("number", -1))
+        info = inventory_by_number.get(image_number, {})
+        if int(info.get("xref", 0) or 0) == 0:
+            inline_count += 1
+        content_sha256 = hashlib.sha256(image_bytes).hexdigest()
+        extension = re.sub(
+            r"[^A-Za-z0-9]+", "", str(block.get("ext") or "png")
+        ).lower() or "png"
+        mime = "image/jpeg" if extension in {"jpg", "jpeg"} else f"image/{extension}"
+        definition_id = f"img_{content_sha256}"
+        if definition_id not in definitions:
+            definitions[definition_id] = (
+                mime,
+                base64.b64encode(image_bytes).decode("ascii"),
+            )
+
+        quad_pt = []
+        matrix = fitz.Matrix(*transform)
+        for unit_x, unit_y in (
+            (0.0, 1.0),
+            (1.0, 1.0),
+            (1.0, 0.0),
+            (0.0, 0.0),
+        ):
+            point = fitz.Point(unit_x, unit_y) * matrix
+            display_x, display_y = _transform_pdf_point(
+                float(point.x), float(point.y), page_rotation
+            )
+            quad_pt.append((display_x - page_x0, display_y - page_y0))
+        q01, _q11, q10, q00 = quad_pt
+        a = q10[0] - q00[0]
+        b = q10[1] - q00[1]
+        c = q01[0] - q00[0]
+        d = q01[1] - q00[1]
+        e, f = q00
+        uses.append(
+            f'<use href="#{definition_id}" '
+            f'transform="matrix({a:.17g} {b:.17g} {c:.17g} {d:.17g} {e:.17g} {f:.17g})"/>'
+        )
+        manifest.update(
+            (
+                f"{image_number}|{content_sha256}|"
+                f"{a:.17g},{b:.17g},{c:.17g},{d:.17g},{e:.17g},{f:.17g}\n"
+            ).encode("ascii")
+        )
+
+    definitions_svg = "".join(
+        f'<image id="{definition_id}" width="1" height="1" '
+        f'preserveAspectRatio="none" href="data:{mime};base64,{encoded}"/>'
+        for definition_id, (mime, encoded) in definitions.items()
+    )
+    svg = (
+        '<svg xmlns="http://www.w3.org/2000/svg" '
+        f'width="{page_width:.17g}" height="{page_height:.17g}" '
+        f'viewBox="0 0 {page_width:.17g} {page_height:.17g}">'
+        f"<defs>{definitions_svg}</defs>{''.join(uses)}</svg>"
+    ).encode("utf-8")
+    digest = manifest.hexdigest()
+    output_path = os.path.join(
+        image_dir,
+        f"page_{page_num:03d}_images_only_{digest[:16]}.png",
+    )
+    dpi = int(max(36, getattr(import_cfg, "raster_dpi", 300) or 300))
+    try:
+        svg_document = fitz.open(stream=svg, filetype="svg")
+        try:
+            pix = svg_document[0].get_pixmap(
+                matrix=fitz.Matrix(dpi / 72.0, dpi / 72.0),
+                alpha=True,
+            )
+            pix.save(output_path)
+        finally:
+            svg_document.close()
+    except (RuntimeError, OSError, TypeError, ValueError):
+        return None
+    if not os.path.isfile(output_path) or os.path.getsize(output_path) <= 0:
+        return None
+    return {
+        "path": output_path,
+        "x_mm": 0.0,
+        "y_mm": 0.0,
+        "width_mm": page_width * _MM_PER_PT * import_cfg.user_scale,
+        "height_mm": page_height * _MM_PER_PT * import_cfg.user_scale,
+        "xref": -2,
+        "page_number": page_num,
+        "source_page_number": page_num,
+        "source_kind": "inline_composite",
+        "composition": "images_only_transparent_composite",
+        "source_image_count": len(image_blocks),
+        "source_inline_image_count": inline_count,
+        "source_unique_content_count": len(definitions),
+        "source_manifest_sha256": digest,
+    }
 
 
 def _render_page_raster(
@@ -1299,6 +1533,7 @@ def _remove_created_image_plane(obj, collection) -> Dict[str, Any]:
         object_name = str(getattr(obj, "name", "") or "")
         mesh = getattr(obj, "data", None)
         mesh_name = str(getattr(mesh, "name", "") or "") if mesh is not None else ""
+        mesh_owned = bool(obj.get("pdf_image_mesh_owned", True))
         material_name = str(obj.get("pdf_image_material", "") or "")
         material_owned = bool(obj.get("pdf_image_material_owned", False))
         image_name = str(obj.get("pdf_image_datablock", "") or "")
@@ -1319,7 +1554,7 @@ def _remove_created_image_plane(obj, collection) -> Dict[str, Any]:
             "exception_type": type(exc).__name__,
             "detail": str(exc),
         }
-    if mesh is not None:
+    if mesh is not None and mesh_owned:
         try:
             bpy.data.meshes.remove(mesh)
             removed.append(mesh_name)
@@ -1393,6 +1628,8 @@ def _render_text_item_raster(
     import_cfg,
     image_dir: str,
     z_offset_m: float = 0.0,
+    image_cache: Optional[_ImportImageCache] = None,
+    style_identity: tuple[Any, ...] = ("source", "base-color-alpha", "hashed"),
 ) -> Optional[bpy.types.Object]:
     """Render and verify one text span as the terminal item-scoped fallback."""
     source_bbox = getattr(text_item, "source_bbox_pdf", None)
@@ -1472,7 +1709,11 @@ def _render_text_item_raster(
         "source_item_id": str(item_id),
     }
     try:
-        obj = _create_image_plane(placement, collection, z_offset_m=z_offset_m)
+        plane_kwargs = {"z_offset_m": z_offset_m}
+        if image_cache is not None:
+            plane_kwargs["image_cache"] = image_cache
+            plane_kwargs["style_identity"] = style_identity
+        obj = _create_image_plane(placement, collection, **plane_kwargs)
     except Exception:
         cleanup = _remove_owned_raster_file(image_path)
         _raise_for_incomplete_raster_cleanup(cleanup)
@@ -1531,12 +1772,21 @@ def _image_plane_geometry(placement: dict):
         y = float(placement.get("y_mm", 0.0)) * _MM_TO_M
         width = max(float(placement.get("width_mm", 0.0)) * _MM_TO_M, 1e-9)
         height = max(float(placement.get("height_mm", 0.0)) * _MM_TO_M, 1e-9)
-        quad = [
-            (x, y),
-            (x + width, y),
-            (x + width, y + height),
-            (x, y + height),
+        quad = [(x, y), (x + width, y), (x + width, y + height), (x, y + height)]
+        vertices = [
+            (0.0, 0.0, 0.0),
+            (width, 0.0, 0.0),
+            (width, height, 0.0),
+            (0.0, height, 0.0),
         ]
+        face = (0, 1, 2, 3)
+        uv_by_vertex = {
+            0: (0.0, 0.0),
+            1: (1.0, 0.0),
+            2: (1.0, 1.0),
+            3: (0.0, 1.0),
+        }
+        return (x, y), vertices, face, uv_by_vertex
     origin_x, origin_y = quad[0]
     vertices = [
         (point_x - origin_x, point_y - origin_y, 0.0)
@@ -1557,27 +1807,123 @@ def _image_plane_geometry(placement: dict):
     return (origin_x, origin_y), vertices, face, uv_by_vertex
 
 
-def _create_image_plane(
+class _ImportImageCache:
+    """Import-local decoded content and Blender image/material/mesh identities."""
+
+    def __init__(self):
+        self._content: dict[str, tuple[bytes, str]] = {}
+        self._images: dict[str, Any] = {}
+        self._materials: dict[tuple[Any, ...], Any] = {}
+        self._meshes: dict[tuple[Any, ...], Any] = {}
+        self.released = False
+
+    def content(self, path: str) -> tuple[bytes, str]:
+        key = os.path.normcase(os.path.abspath(path))
+        cached = self._content.get(key)
+        if cached is None:
+            image_bytes = Path(path).read_bytes()
+            cached = (image_bytes, hashlib.sha256(image_bytes).hexdigest())
+            self._content[key] = cached
+        return cached
+
+    def image(self, content_sha256: str, factory: Callable[[], Any]):
+        image = self._images.get(content_sha256)
+        if image is None:
+            image = factory()
+            self._images[content_sha256] = image
+        return image
+
+    def material(self, identity: tuple[Any, ...], factory: Callable[[], Any]):
+        material = self._materials.get(identity)
+        if material is None:
+            material = factory()
+            self._materials[identity] = material
+        return material
+
+    def mesh(self, identity: tuple[Any, ...], factory: Callable[[], Any]):
+        mesh = self._meshes.get(identity)
+        if mesh is None:
+            mesh = factory()
+            self._meshes[identity] = mesh
+        return mesh
+
+    def release(self) -> None:
+        self._content.clear()
+        self._images.clear()
+        self._materials.clear()
+        self._meshes.clear()
+        self.released = True
+
+
+def _set_image_plane_metadata(
+    obj,
     placement: dict,
-    collection: bpy.types.Collection,
-    z_offset_m: float = 0.0,
-) -> Optional[bpy.types.Object]:
-    """Create a textured mesh plane for an extracted/rasterized PDF image."""
-    path = placement.get("path")
-    if not path or not os.path.isfile(path):
-        return None
+    *,
+    path: str,
+    xref: int,
+    page_num: int,
+    material,
+    image,
+    material_owned: bool,
+    image_owned: bool,
+    mesh_owned: bool,
+    image_sha256: str,
+) -> None:
+    obj["pdf_image_path"] = path
+    obj["pdf_xref"] = xref
+    obj["pdf_image_material"] = str(getattr(material, "name", "") or "")
+    obj["pdf_image_datablock"] = str(getattr(image, "name", "") or "")
+    obj["pdf_image_material_owned"] = bool(material_owned)
+    obj["pdf_image_datablock_owned"] = bool(image_owned)
+    obj["pdf_image_mesh_owned"] = bool(mesh_owned)
+    obj["pdf_image_packed"] = True
+    obj["pdf_image_sha256"] = image_sha256
+    obj["pdf_image_source_kind"] = str(placement.get("source_kind") or "")
+    obj["pdf_image_source_page_number"] = int(
+        placement.get("source_page_number", page_num) or page_num
+    )
+    obj["pdf_image_source_number"] = int(
+        placement.get("source_image_number", -1) or 0
+    )
+    obj["pdf_image_source_digest"] = str(placement.get("source_digest") or "")
+    obj["pdf_image_composition"] = str(placement.get("composition") or "")
+    obj["pdf_image_source_content_sha256"] = str(
+        placement.get("source_content_sha256") or ""
+    )
+    obj["pdf_image_source_manifest_sha256"] = str(
+        placement.get("source_manifest_sha256") or ""
+    )
+    obj["pdf_image_source_count"] = int(
+        placement.get("source_image_count", 1) or 1
+    )
+    obj["pdf_image_source_inline_count"] = int(
+        placement.get(
+            "source_inline_image_count",
+            1 if placement.get("source_kind") == "inline" else 0,
+        )
+        or 0
+    )
+    obj["pdf_image_source_unique_content_count"] = int(
+        placement.get("source_unique_content_count", 1) or 1
+    )
+    if placement.get("quad_mm") is not None:
+        obj["pdf_image_source_quad_mm"] = [
+            [float(value) for value in point]
+            for point in placement["quad_mm"]
+        ]
 
-    try:
-        image_bytes = Path(path).read_bytes()
-    except OSError:
-        return None
-    if not image_bytes:
-        return None
-    image_sha256 = hashlib.sha256(image_bytes).hexdigest()
 
-    page_num = int(placement.get("page_number", 0))
-    xref = int(placement.get("xref", -1))
-
+def _create_uncached_image_plane(
+    placement: dict,
+    collection,
+    *,
+    path: str,
+    image_bytes: bytes,
+    image_sha256: str,
+    page_num: int,
+    xref: int,
+    z_offset_m: float,
+):
     mesh = None
     obj = None
     material = None
@@ -1599,47 +1945,216 @@ def _create_image_plane(
                     uv_layer.data[loop_idx].uv = uv_by_vert.get(v_idx, (0.0, 0.0))
         except Exception as exc:
             raise RuntimeError("raster UV construction failed") from exc
-
         obj = bpy.data.objects.new(f"PDF_Image_{page_num}_{xref}", mesh)
         obj.location = (x, y, z_offset_m)
         collection.objects.link(obj)
-
-        mat_name = f"PDF_Image_Mat_{page_num}_{xref}"
-        material = bpy.data.materials.new(name=mat_name)
+        material = bpy.data.materials.new(name=f"PDF_Image_Mat_{page_num}_{xref}")
         material_created = True
         material.use_nodes = True
         nodes = material.node_tree.nodes
         links = material.node_tree.links
         nodes.clear()
-
         tex = nodes.new(type="ShaderNodeTexImage")
         bsdf = nodes.new(type="ShaderNodeBsdfPrincipled")
         out = nodes.new(type="ShaderNodeOutputMaterial")
-
         image = bpy.data.images.load(path, check_existing=False)
         image_created = True
-        packed_image_sha256 = pack_and_verify_bytes(image, image_bytes)
-        if packed_image_sha256 != image_sha256:
+        if pack_and_verify_bytes(image, image_bytes) != image_sha256:
             raise RuntimeError("packed image digest changed after verification")
         tex.image = image
         links.new(tex.outputs["Color"], bsdf.inputs["Base Color"])
         links.new(tex.outputs["Alpha"], bsdf.inputs["Alpha"])
         links.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
-
         material.blend_method = "HASHED"
         if mesh.materials:
             mesh.materials[0] = material
         else:
             mesh.materials.append(material)
+        _set_image_plane_metadata(
+            obj,
+            placement,
+            path=path,
+            xref=xref,
+            page_num=page_num,
+            material=material,
+            image=image,
+            material_owned=material_created,
+            image_owned=image_created,
+            mesh_owned=True,
+            image_sha256=image_sha256,
+        )
+        return obj
+    except Exception:
+        if obj is not None:
+            try:
+                collection.objects.unlink(obj)
+            except Exception:
+                pass
+            try:
+                bpy.data.objects.remove(obj, do_unlink=True)
+            except Exception:
+                pass
+        if mesh is not None:
+            try:
+                bpy.data.meshes.remove(mesh)
+            except Exception:
+                pass
+        if material_created and material is not None:
+            try:
+                bpy.data.materials.remove(material)
+            except Exception:
+                pass
+        if image_created and image is not None:
+            try:
+                bpy.data.images.remove(image)
+            except Exception:
+                pass
+        return None
 
-        obj["pdf_image_path"] = path
-        obj["pdf_xref"] = xref
-        obj["pdf_image_material"] = str(getattr(material, "name", "") or "")
-        obj["pdf_image_datablock"] = str(getattr(image, "name", "") or "")
-        obj["pdf_image_material_owned"] = bool(material_created)
-        obj["pdf_image_datablock_owned"] = bool(image_created)
-        obj["pdf_image_packed"] = True
-        obj["pdf_image_sha256"] = image_sha256
+
+def _create_image_plane(
+    placement: dict,
+    collection: bpy.types.Collection,
+    z_offset_m: float = 0.0,
+    *,
+    image_cache: Optional[_ImportImageCache] = None,
+    style_identity: tuple[Any, ...] = ("source", "base-color-alpha", "hashed"),
+) -> Optional[bpy.types.Object]:
+    """Create a textured mesh plane for an extracted/rasterized PDF image."""
+    path = placement.get("path")
+    if not path or not os.path.isfile(path):
+        return None
+
+    try:
+        if image_cache is None:
+            image_bytes = Path(path).read_bytes()
+            image_sha256 = hashlib.sha256(image_bytes).hexdigest()
+        else:
+            image_bytes, image_sha256 = image_cache.content(path)
+    except OSError:
+        return None
+    if not image_bytes:
+        return None
+
+    page_num = int(placement.get("page_number", 0))
+    xref = int(placement.get("xref", -1))
+    if image_cache is None:
+        return _create_uncached_image_plane(
+            placement,
+            collection,
+            path=path,
+            image_bytes=image_bytes,
+            image_sha256=image_sha256,
+            page_num=page_num,
+            xref=xref,
+            z_offset_m=z_offset_m,
+        )
+
+    mesh = None
+    obj = None
+    material = None
+    image = None
+    material_created = False
+    image_created = False
+    mesh_created = False
+    try:
+        (x, y), verts, face, uv_by_vert = _image_plane_geometry(placement)
+        def _new_image():
+            nonlocal image_created
+            created = bpy.data.images.load(path, check_existing=False)
+            image_created = True
+            packed_image_sha256 = pack_and_verify_bytes(created, image_bytes)
+            if packed_image_sha256 != image_sha256:
+                raise RuntimeError("packed image digest changed after verification")
+            return created
+
+        image = (
+            _new_image()
+            if image_cache is None
+            else image_cache.image(image_sha256, _new_image)
+        )
+
+        normalized_style = tuple(str(value) for value in style_identity)
+        material_identity = (image_sha256, *normalized_style)
+
+        def _new_material():
+            nonlocal material_created
+            created = bpy.data.materials.new(name=f"PDF_Image_Mat_{page_num}_{xref}")
+            material_created = True
+            created.use_nodes = True
+            nodes = created.node_tree.nodes
+            links = created.node_tree.links
+            nodes.clear()
+            tex = nodes.new(type="ShaderNodeTexImage")
+            bsdf = nodes.new(type="ShaderNodeBsdfPrincipled")
+            out = nodes.new(type="ShaderNodeOutputMaterial")
+            tex.image = image
+            links.new(tex.outputs["Color"], bsdf.inputs["Base Color"])
+            links.new(tex.outputs["Alpha"], bsdf.inputs["Alpha"])
+            links.new(bsdf.outputs["BSDF"], out.inputs["Surface"])
+            created.blend_method = "HASHED"
+            return created
+
+        material = (
+            _new_material()
+            if image_cache is None
+            else image_cache.material(material_identity, _new_material)
+        )
+        geometry_identity = (
+            material_identity,
+            tuple(tuple(float(value) for value in vertex) for vertex in verts),
+            tuple(int(value) for value in face),
+            tuple(
+                (int(index), tuple(float(value) for value in uv_by_vert[index]))
+                for index in sorted(uv_by_vert)
+            ),
+        )
+
+        def _new_mesh():
+            nonlocal mesh_created
+            created = bpy.data.meshes.new(f"PDF_ImgMesh_{page_num}_{xref}")
+            mesh_created = True
+            created.from_pydata(verts, [], [face])
+            created.update()
+            try:
+                uv_layer = created.uv_layers.new(name="UVMap")
+                if uv_layer is None:
+                    raise RuntimeError("UVMap creation returned no layer")
+                for poly in created.polygons:
+                    for loop_idx in poly.loop_indices:
+                        v_idx = created.loops[loop_idx].vertex_index
+                        uv_layer.data[loop_idx].uv = uv_by_vert.get(v_idx, (0.0, 0.0))
+            except Exception as exc:
+                raise RuntimeError("raster UV construction failed") from exc
+            if created.materials:
+                created.materials[0] = material
+            else:
+                created.materials.append(material)
+            return created
+
+        mesh = (
+            _new_mesh()
+            if image_cache is None
+            else image_cache.mesh(geometry_identity, _new_mesh)
+        )
+
+        obj = bpy.data.objects.new(f"PDF_Image_{page_num}_{xref}", mesh)
+        obj.location = (x, y, z_offset_m)
+        collection.objects.link(obj)
+
+        _set_image_plane_metadata(
+            obj,
+            placement,
+            path=path,
+            xref=xref,
+            page_num=page_num,
+            material=material,
+            image=image,
+            material_owned=False,
+            image_owned=False,
+            mesh_owned=False,
+            image_sha256=image_sha256,
+        )
         return obj
     except Exception as exc:
         cleanup_errors = []
@@ -1652,7 +2167,7 @@ def _create_image_plane(
                 bpy.data.objects.remove(obj, do_unlink=True)
             except Exception as cleanup_exc:
                 cleanup_errors.append(f"object:{type(cleanup_exc).__name__}:{cleanup_exc}")
-        if mesh is not None:
+        if mesh_created and image_cache is None and mesh is not None:
             try:
                 bpy.data.meshes.remove(mesh)
             except Exception as cleanup_exc:
@@ -2079,6 +2594,7 @@ def import_pdf(
     doc = None
     image_dir = ""
     image_dir_owned = False
+    image_cache = _ImportImageCache()
 
     try:
         # 1. Verify PyMuPDF is available
@@ -2183,6 +2699,9 @@ def import_pdf(
         total_stats = {
             "pages_imported": 0, "primitives": 0, "text_items": 0,
             "curves": 0, "meshes": 0, "circles": 0, "arcs": 0, "images": 0,
+            "image_source_instances": 0,
+            "inline_image_source_instances": 0,
+            "image_composites": 0,
             "skipped_fill_only": 0,
             "recognition_skipped_pages": 0,
             "hidden_startup_cube": hidden_startup_cube,
@@ -2423,6 +2942,12 @@ def import_pdf(
                             import_cfg=_cfg,
                             image_dir=_dir,
                             z_offset_m=_z,
+                            image_cache=image_cache,
+                            style_identity=(
+                                visual_style,
+                                "base-color-alpha",
+                                "hashed",
+                            ),
                         )
                     ),
                 )
@@ -2495,8 +3020,35 @@ def import_pdf(
                             )
 
                 for placement in placements:
-                    if _create_image_plane(placement, page_col, z_offset_m=image_z_offset_m):
+                    if _create_image_plane(
+                        placement,
+                        page_col,
+                        z_offset_m=image_z_offset_m,
+                        image_cache=image_cache,
+                        style_identity=(
+                            visual_style,
+                            "base-color-alpha",
+                            "hashed",
+                        ),
+                    ):
                         image_count += 1
+                        source_image_count = int(
+                            placement.get("source_image_count", 1) or 1
+                        )
+                        source_inline_count = int(
+                            placement.get(
+                                "source_inline_image_count",
+                                1 if placement.get("source_kind") == "inline" else 0,
+                            )
+                            or 0
+                        )
+                        total_stats["image_source_instances"] += source_image_count
+                        total_stats["inline_image_source_instances"] += source_inline_count
+                        if (
+                            placement.get("composition")
+                            == "images_only_transparent_composite"
+                        ):
+                            total_stats["image_composites"] += 1
                         if isinstance(placement, dict) and placement.get("xref") == -1:
                             raster_page_delivered = True
                     elif isinstance(placement, dict) and int(placement.get("xref", 0) or 0) == -1:
@@ -2645,6 +3197,7 @@ def import_pdf(
         return total_stats
 
     finally:
+        image_cache.release()
         if doc is not None and not bool(getattr(doc, "is_closed", False)):
             try:
                 doc.close()

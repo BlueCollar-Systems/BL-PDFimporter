@@ -142,6 +142,94 @@ def _raster_placement():
     }
 
 
+def _write_inline_image_pdf(path: Path, transforms):
+    """Write a real one-page PDF whose images use BI/ID/EI, not XObjects."""
+    document = fitz.open()
+    page = document.new_page(width=100.0, height=100.0)
+    content_xref = document.get_new_xref()
+    document.update_object(content_xref, "<<>>")
+    stream = bytearray()
+    for a, b, c, d, e, f in transforms:
+        stream.extend(f"q {a} {b} {c} {d} {e} {f} cm\n".encode("ascii"))
+        stream.extend(b"BI /W 1 /H 1 /CS /RGB /BPC 8 ID \xff\x00\x00 EI\nQ\n")
+    document.update_stream(content_xref, bytes(stream))
+    page.set_contents(content_xref)
+    document.save(str(path))
+    document.close()
+
+
+def test_inline_image_is_imported_as_an_individual_exact_placement(tmp_path):
+    pdf_path = tmp_path / "inline-image.pdf"
+    _write_inline_image_pdf(pdf_path, [(20, 0, 0, 10, 10, 30)])
+
+    document = fitz.open(str(pdf_path))
+    try:
+        page = document[0]
+        inventory = page.get_image_info(hashes=True, xrefs=True)
+        assert len(inventory) == 1
+        assert inventory[0]["xref"] == 0
+        placements = bl_import_engine._extract_image_placements(
+            document,
+            page,
+            1,
+            types.SimpleNamespace(flip_y=True, user_scale=1.0, raster_dpi=144),
+            str(tmp_path),
+        )
+    finally:
+        document.close()
+
+    assert len(placements) == 1
+    placement = placements[0]
+    assert placement["source_kind"] == "inline"
+    assert placement["source_image_number"] == 0
+    assert placement["source_content_sha256"] == (
+        "b9214335877109b56e1df370d4f375662e8a662d0aa9dd9d5cfb7498a8283c24"
+    )
+    assert Path(placement["path"]).is_file()
+    expected_quad = [
+        (3.5277777778, 10.5833333333),
+        (10.5833333333, 10.5833333333),
+        (10.5833333333, 14.1111111111),
+        (3.5277777778, 14.1111111111),
+    ]
+    for actual, expected in zip(placement["quad_mm"], expected_quad, strict=True):
+        assert actual == pytest.approx(expected)
+
+
+def test_dense_inline_images_are_one_transparent_images_only_composite(tmp_path):
+    pdf_path = tmp_path / "dense-inline-images.pdf"
+    _write_inline_image_pdf(
+        pdf_path,
+        [(20, 0, 0, 10, 10, 30)] * 257,
+    )
+
+    document = fitz.open(str(pdf_path))
+    try:
+        placements = bl_import_engine._extract_image_placements(
+            document,
+            document[0],
+            1,
+            types.SimpleNamespace(flip_y=True, user_scale=1.0, raster_dpi=144),
+            str(tmp_path),
+        )
+    finally:
+        document.close()
+
+    assert len(placements) == 1
+    placement = placements[0]
+    assert placement["composition"] == "images_only_transparent_composite"
+    assert placement["source_kind"] == "inline_composite"
+    assert placement["source_page_number"] == 1
+    assert placement["source_image_count"] == 257
+    assert placement["source_inline_image_count"] == 257
+    assert len(placement["source_manifest_sha256"]) == 64
+    assert placement["xref"] == -2
+    composite = fitz.Pixmap(placement["path"])
+    assert composite.alpha == 1
+    assert composite.pixel(5, 5)[-1] == 0
+    assert composite.pixel(30, 130)[-1] > 0
+
+
 def test_rotated_embedded_image_placement_preserves_pdf_transform_and_uv_order(
     tmp_path,
 ):
@@ -733,6 +821,76 @@ def test_image_plane_constructor_never_mutates_or_reuses_existing_resources(
     assert result["pdf_image_datablock_owned"] is True
     assert [node.type for node in materials.sentinel.node_tree.nodes] == ["SENTINEL"]
 
+    image_cache = bl_import_engine._ImportImageCache()
+    first_placement = {
+        "path": str(image_path),
+        "x_mm": 10.0,
+        "y_mm": 20.0,
+        "width_mm": 10.0,
+        "height_mm": 5.0,
+        "xref": 44,
+        "page_number": 3,
+        "source_kind": "inline",
+        "source_image_number": 7,
+        "source_digest": "inline-digest-7",
+        "composition": "individual_exact_placement",
+        "source_image_count": 1,
+        "source_inline_image_count": 1,
+        "source_unique_content_count": 1,
+        "source_content_sha256": (
+            "994f1f8f87e80120b9315d83df2f9558d06c952a83f1f7f05719a6d3a0e96f89"
+        ),
+    }
+    second_placement = dict(first_placement, x_mm=30.0, y_mm=40.0, source_image_number=8)
+    cached_first = bl_import_engine._create_image_plane(
+        first_placement,
+        collection,
+        image_cache=image_cache,
+        style_identity=("source", "base-color-alpha", "hashed"),
+    )
+    cached_second = bl_import_engine._create_image_plane(
+        second_placement,
+        collection,
+        image_cache=image_cache,
+        style_identity=("source", "base-color-alpha", "hashed"),
+    )
+
+    assert cached_first is not cached_second
+    assert cached_first.data is cached_second.data
+    assert cached_first.location == (0.01, 0.02, 0.0)
+    assert cached_second.location == (0.03, 0.04, 0.0)
+    assert len(materials.created) == 2
+    assert len(images.created) == 2
+    assert cached_first["pdf_image_source_kind"] == "inline"
+    assert cached_first["pdf_image_source_page_number"] == 3
+    assert cached_first["pdf_image_source_number"] == 7
+    assert cached_first["pdf_image_source_digest"] == "inline-digest-7"
+    assert cached_first["pdf_image_composition"] == "individual_exact_placement"
+    assert cached_first["pdf_image_source_inline_count"] == 1
+    assert cached_first["pdf_image_source_unique_content_count"] == 1
+    assert cached_second["pdf_image_source_number"] == 8
+
+    different_style = bl_import_engine._create_image_plane(
+        first_placement,
+        collection,
+        image_cache=image_cache,
+        style_identity=("blueprint", "base-color-alpha", "hashed"),
+    )
+    assert different_style.data is not cached_first.data
+    assert len(materials.created) == 3
+    assert len(images.created) == 2
+
+    next_import = bl_import_engine._ImportImageCache()
+    isolated = bl_import_engine._create_image_plane(
+        first_placement,
+        collection,
+        image_cache=next_import,
+        style_identity=("source", "base-color-alpha", "hashed"),
+    )
+    assert isolated.data is not cached_first.data
+    assert len(materials.created) == 4
+    assert len(images.created) == 3
+
 
 def test_remove_created_image_plane_removes_all_owned_datablocks(monkeypatch):
     class _Registry:
@@ -780,6 +938,55 @@ def test_remove_created_image_plane_removes_all_owned_datablocks(monkeypatch):
     assert meshes.removed == [mesh.name]
     assert materials.removed == [material.name]
     assert images.removed == [image.name]
+
+
+def test_remove_cached_image_plane_keeps_shared_datablocks(monkeypatch):
+    class _Registry:
+        def __init__(self, value):
+            self.value = value
+            self.removed = []
+
+        def get(self, name):
+            return self.value if name == self.value.name else None
+
+        def remove(self, value, **_kwargs):
+            self.removed.append(value.name)
+
+    mesh = types.SimpleNamespace(name="shared-mesh", type="MESH")
+    material = types.SimpleNamespace(name="shared-material", users=1)
+    image = types.SimpleNamespace(name="shared-image", users=1)
+    obj = _RasterObject()
+    obj.data = mesh
+    obj["pdf_image_mesh_owned"] = False
+    obj["pdf_image_material"] = material.name
+    obj["pdf_image_material_owned"] = False
+    obj["pdf_image_datablock"] = image.name
+    obj["pdf_image_datablock_owned"] = False
+    objects = _Registry(obj)
+    meshes = _Registry(mesh)
+    materials = _Registry(material)
+    images = _Registry(image)
+    fake_bpy = types.SimpleNamespace(
+        data=types.SimpleNamespace(
+            objects=objects,
+            meshes=meshes,
+            materials=materials,
+            images=images,
+        )
+    )
+    unlinked = []
+    collection = types.SimpleNamespace(
+        objects=types.SimpleNamespace(unlink=lambda value: unlinked.append(value.name))
+    )
+    monkeypatch.setattr(bl_import_engine, "bpy", fake_bpy)
+
+    cleanup = bl_import_engine._remove_created_image_plane(obj, collection)
+
+    assert cleanup["status"] == "complete"
+    assert objects.removed == [obj.name]
+    assert meshes.removed == []
+    assert materials.removed == []
+    assert images.removed == []
 
 
 def test_page_raster_strategy_does_not_suppress_requested_structural_text(
@@ -1216,6 +1423,16 @@ def test_owned_import_image_temp_directory_is_removed_after_packed_delivery(
     image_dir.mkdir()
     (image_dir / "packed-source.png").write_bytes(b"temporary")
 
+    class _CacheProbe:
+        def __init__(self):
+            self.released = False
+
+        def release(self):
+            self.released = True
+
+    image_cache = _CacheProbe()
+    seen_caches = []
+
     monkeypatch.setattr(bl_import_engine, "bpy", _FakeBpy())
     monkeypatch.setattr(bl_import_engine, "check_pymupdf", lambda: True)
     monkeypatch.setattr(bl_import_engine, "ensure_lib_path", lambda: None)
@@ -1223,7 +1440,13 @@ def test_owned_import_image_temp_directory_is_removed_after_packed_delivery(
     monkeypatch.setattr(fitz_loader, "safe_open", lambda _path: _Document())
     monkeypatch.setattr(bl_import_engine, "extract_page", lambda *_args, **_kwargs: _page_data())
     monkeypatch.setattr(bl_import_engine, "_render_page_raster", lambda *_args, **_kwargs: _raster_placement())
-    monkeypatch.setattr(bl_import_engine, "_create_image_plane", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(bl_import_engine, "_ImportImageCache", lambda: image_cache)
+
+    def _capture_image_plane(*_args, **kwargs):
+        seen_caches.append(kwargs.get("image_cache"))
+        return object()
+
+    monkeypatch.setattr(bl_import_engine, "_create_image_plane", _capture_image_plane)
     monkeypatch.setattr(bl_import_engine.tempfile, "mkdtemp", lambda **_kwargs: str(image_dir))
     monkeypatch.setattr(
         bl_import_engine,
@@ -1242,6 +1465,67 @@ def test_owned_import_image_temp_directory_is_removed_after_packed_delivery(
     )
 
     assert not image_dir.exists()
+    assert seen_caches == [image_cache]
+    assert image_cache.released is True
+
+
+def test_dense_composite_stats_preserve_source_image_instance_count(
+    monkeypatch,
+    tmp_path,
+):
+    input_pdf = tmp_path / "input.pdf"
+    input_pdf.write_bytes(b"%PDF-1.7\n")
+    image_dir = tmp_path / "images"
+    image_dir.mkdir()
+    placement = {
+        "path": str(image_dir / "images-only.png"),
+        "width_mm": 25.4,
+        "height_mm": 25.4,
+        "xref": -2,
+        "page_number": 1,
+        "source_kind": "inline_composite",
+        "composition": "images_only_transparent_composite",
+        "source_image_count": 257,
+        "source_inline_image_count": 257,
+        "source_manifest_sha256": "a" * 64,
+    }
+
+    monkeypatch.setattr(bl_import_engine, "bpy", _FakeBpy())
+    monkeypatch.setattr(bl_import_engine, "check_pymupdf", lambda: True)
+    monkeypatch.setattr(bl_import_engine, "ensure_lib_path", lambda: None)
+    monkeypatch.setattr(fitz_loader, "import_fitz", lambda **_kwargs: object())
+    monkeypatch.setattr(fitz_loader, "safe_open", lambda _path: _Document())
+    monkeypatch.setattr(bl_import_engine, "extract_page", lambda *_args, **_kwargs: _page_data())
+    monkeypatch.setattr(bl_import_engine, "build_page", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(bl_import_engine, "build_all_text", lambda *_args, **_kwargs: 0)
+    monkeypatch.setattr(
+        bl_import_engine,
+        "_extract_image_placements",
+        lambda *_args, **_kwargs: [placement],
+    )
+    monkeypatch.setattr(bl_import_engine, "_create_image_plane", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(bl_import_engine.tempfile, "mkdtemp", lambda **_kwargs: str(image_dir))
+    monkeypatch.setattr(
+        bl_import_engine,
+        "write_import_report",
+        lambda *_args, **_kwargs: str(tmp_path / "import_report.json"),
+    )
+
+    stats = bl_import_engine.import_pdf(
+        str(input_pdf),
+        config={
+            "mode": "vector",
+            "pages": "1",
+            "import_text": False,
+            "auto_focus_view": False,
+            "auto_hide_default_cube": False,
+        },
+    )
+
+    assert stats["images"] == 1
+    assert stats["image_source_instances"] == 257
+    assert stats["inline_image_source_instances"] == 257
+    assert stats["image_composites"] == 1
 
 
 def test_import_stats_exclude_post_stack_failed_text(monkeypatch, tmp_path):
