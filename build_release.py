@@ -20,7 +20,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-from zipfile import ZIP_DEFLATED, ZipFile
+from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
 
 ROOT = Path(__file__).resolve().parent
 DIST = ROOT / "dist"
@@ -30,6 +30,8 @@ LIB_DIR = PKG / "lib"
 # Patterns to exclude from the release zip
 _EXCLUDE_DIRS = {"__pycache__", "tests", ".pytest_cache", "_archived"}
 _EXCLUDE_SUFFIXES = {".pyc", ".pyo"}
+_ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
+_ZIP_FILE_MODE = 0o100644
 _VENDORED_LIB = PKG / "lib"
 _REQUIRED_RUNTIME_FILES = (
     _VENDORED_LIB / "pymupdf" / "__init__.py",
@@ -62,9 +64,37 @@ def _should_exclude(path: Path) -> bool:
     for part in path.parts:
         if part in _EXCLUDE_DIRS:
             return True
+    normalized_parts = tuple(part.casefold() for part in path.parts)
+    if any(
+        normalized_parts[index : index + 2] == ("lib", "bin")
+        for index in range(len(normalized_parts) - 1)
+    ):
+        return True
+    if path.name.casefold() == "record" and any(
+        part.endswith(".dist-info") for part in normalized_parts
+    ):
+        return True
     if path.suffix in _EXCLUDE_SUFFIXES:
         return True
     return False
+
+
+def _write_deterministic_file(
+    zf: ZipFile,
+    source_path: Path,
+    archive_name: str,
+) -> None:
+    """Write one file with checkout-independent ZIP metadata."""
+    info = ZipInfo(archive_name, date_time=_ZIP_TIMESTAMP)
+    info.compress_type = ZIP_DEFLATED
+    info.create_system = 3
+    info.external_attr = _ZIP_FILE_MODE << 16
+    zf.writestr(
+        info,
+        source_path.read_bytes(),
+        compress_type=ZIP_DEFLATED,
+        compresslevel=9,
+    )
 
 
 def _verify_vendored_pymupdf() -> None:
@@ -139,26 +169,22 @@ def main() -> int:
     _verify_vendored_pymupdf()
     _prune_vendored_pymupdf()
 
-    count = 0
-    with ZipFile(out_path, "w", ZIP_DEFLATED) as zf:
-        # Package all addon files
-        for path in sorted(PKG.rglob("*")):
-            if path.is_dir():
-                continue
-            if _should_exclude(path):
-                continue
-            arcname = str(path.relative_to(ROOT))
-            zf.write(path, arcname)
-            count += 1
+    release_files = []
+    for path in PKG.rglob("*"):
+        if path.is_file() and not _should_exclude(path):
+            release_files.append((path.relative_to(ROOT).as_posix(), path))
 
-        # Include project metadata at the top level
-        for meta in ("README.md", "LICENSE", "THIRD_PARTY_NOTICES.md"):
-            meta_path = ROOT / meta
-            if meta_path.exists():
-                zf.write(meta_path, meta)
-                count += 1
+    for meta in ("README.md", "LICENSE", "THIRD_PARTY_NOTICES.md"):
+        meta_path = ROOT / meta
+        if meta_path.exists():
+            release_files.append((meta, meta_path))
 
-    print(f"Built: {out_path}  ({count} files)")
+    release_files.sort(key=lambda item: item[0])
+    with ZipFile(out_path, "w") as zf:
+        for archive_name, source_path in release_files:
+            _write_deterministic_file(zf, source_path, archive_name)
+
+    print(f"Built: {out_path}  ({len(release_files)} files)")
     return 0
 
 
