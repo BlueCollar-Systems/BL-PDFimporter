@@ -8,9 +8,33 @@ from pathlib import Path
 from .importer import run_import
 
 
+_GENERATED_TREE_NAMES = frozenset(
+    {
+        ".bc_host_jobs",
+        "imported evidence",
+        "imported_evidence",
+    }
+)
+
+
+def _is_source_pdf(root: Path, path: Path) -> bool:
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        return False
+    return not any(
+        part.casefold() in _GENERATED_TREE_NAMES
+        for part in relative.parts[:-1]
+    )
+
+
 def _collect_pdfs(root: Path, recursive: bool) -> list[Path]:
     if recursive:
-        return sorted(p for p in root.rglob("*.pdf") if p.is_file())
+        return sorted(
+            p
+            for p in root.rglob("*.pdf")
+            if p.is_file() and _is_source_pdf(root, p)
+        )
     return sorted(p for p in root.glob("*.pdf") if p.is_file())
 
 

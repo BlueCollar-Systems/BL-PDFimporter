@@ -14,6 +14,8 @@ try:
 except ImportError:
     import fitz
 
+from blender_pdf_vector_importer.batch_cli import _collect_pdfs
+
 
 def _write_sample_pdf(pdf_path: Path) -> None:
     doc = fitz.open()
@@ -26,6 +28,26 @@ def _write_sample_pdf(pdf_path: Path) -> None:
 
 class TestModeCli(unittest.TestCase):
     """Smoke-test the ``--mode auto`` CLI contract for BCS-ARCH-001."""
+
+    def test_recursive_batch_collection_excludes_generated_evidence_trees(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="bl_batch_source_scope_") as tmp:
+            root = Path(tmp)
+            source = root / "source.pdf"
+            generated = (
+                root
+                / "Imported Evidence"
+                / "SketchUp"
+                / "cells"
+                / ".bc_host_jobs"
+                / "source.pdf"
+            )
+            generated.parent.mkdir(parents=True)
+            _write_sample_pdf(source)
+            generated.write_bytes(source.read_bytes())
+
+            collected = _collect_pdfs(root, recursive=True)
+
+            self.assertEqual(collected, [source])
 
     def test_cli_accepts_every_shared_text_representation(self) -> None:
         with tempfile.TemporaryDirectory(prefix="bl_mode_cli_text_contract_") as tmp:
