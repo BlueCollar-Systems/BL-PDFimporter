@@ -28,6 +28,8 @@ def _page(*values: str) -> PageData:
     (
         "5/27/2016 9:10:47 AM",
         "9:10:47 AM",
+        "PRINTED 9:10:47",
+        "PRINTED 23:10:47",
         "ISSUED 5-27-2016",
         "PRINTED 9:10 AM",
     ),
@@ -54,3 +56,19 @@ def test_temporal_noise_does_not_hide_valid_ratio_scale() -> None:
 
     assert resolved.factor == pytest.approx(50.0)
     assert resolved.source == "titleblock"
+
+
+def test_same_text_item_date_does_not_hide_valid_ratio_scale() -> None:
+    resolved = resolve_page_scale(_page("ISSUED 5/27/2016 SCALE 1:50"))
+
+    assert resolved.factor == pytest.approx(50.0)
+    assert resolved.source == "titleblock"
+    assert resolved.notation == "ISSUED 5/27/2016 SCALE 1:50"
+
+
+def test_same_text_item_date_does_not_hide_valid_architectural_scale() -> None:
+    resolved = resolve_page_scale(_page('5/27/2016 SCALE: 1/4" = 1\'-0"'))
+
+    assert resolved.factor == pytest.approx(48.0)
+    assert resolved.source == "titleblock"
+    assert resolved.notation == '5/27/2016 SCALE: 1/4" = 1\'-0"'
