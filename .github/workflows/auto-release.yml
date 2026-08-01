@@ -97,10 +97,14 @@ jobs:
           TAG="v${{ steps.version.outputs.version }}"
           cp scripts/release_safety.py "$RUNNER_TEMP/release_safety.py"
           TAG_SHA="$(git rev-list -n 1 "$TAG^{commit}" 2>/dev/null || true)"
-          if gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" > "$RUNNER_TEMP/release.json" 2>/dev/null; then
-            RELEASE_STATE="$(jq -r 'if .draft then "draft" else "published" end' "$RUNNER_TEMP/release.json")"
+          gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" > "$RUNNER_TEMP/releases.json"
+          DISCOVERY="$(python "$RUNNER_TEMP/release_safety.py" discover-release \
+            --releases-json "$RUNNER_TEMP/releases.json" --tag "$TAG")"
+          RELEASE_STATE="$(printf '%s' "$DISCOVERY" | jq -r .release_state)"
+          RELEASE_ID="$(printf '%s' "$DISCOVERY" | jq -r .release_id)"
+          if [ -n "$RELEASE_ID" ]; then
+            gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" > "$RUNNER_TEMP/release.json"
           else
-            RELEASE_STATE="missing"
             printf '%s\n' '{"assets":[]}' > "$RUNNER_TEMP/release.json"
           fi
           python "$RUNNER_TEMP/release_safety.py" plan-release \
@@ -109,6 +113,7 @@ jobs:
             --tag-sha "$TAG_SHA" \
             --release-state "$RELEASE_STATE" \
             --github-output "$GITHUB_OUTPUT"
+          echo "release_id=$RELEASE_ID" >> "$GITHUB_OUTPUT"
 
       - name: Checkout immutable release source
         run: |
@@ -142,8 +147,21 @@ jobs:
           ACTION="${{ steps.release_plan.outputs.action }}"
           TAG="${{ steps.release_plan.outputs.tag }}"
           RELEASE_TARGET="${{ steps.release_plan.outputs.release_target }}"
+          RELEASE_ID="${{ steps.release_plan.outputs.release_id }}"
           TITLE="v${{ steps.version.outputs.version }} — PDF Vector Importer for Blender"
           RELEASE_JSON="$RUNNER_TEMP/release.json"
+          refresh_release() {
+            gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" > "$RUNNER_TEMP/releases.json"
+            local discovery
+            discovery="$(python "$RUNNER_TEMP/release_safety.py" discover-release \
+              --releases-json "$RUNNER_TEMP/releases.json" --tag "$TAG")"
+            RELEASE_STATE="$(printf '%s' "$discovery" | jq -r .release_state)"
+            RELEASE_ID="$(printf '%s' "$discovery" | jq -r .release_id)"
+            if [ -z "$RELEASE_ID" ]; then
+              return 1
+            fi
+            gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" > "$RELEASE_JSON"
+          }
           shopt -s nullglob
           ASSETS=(dist/*.zip)
           if [ "${#ASSETS[@]}" -ne 1 ]; then
@@ -153,7 +171,8 @@ jobs:
           ASSET="${ASSETS[0]}"
 
           if [ "$ACTION" = "verify_existing_release" ]; then
-            gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" > "$RELEASE_JSON"
+            test -n "$RELEASE_ID"
+            gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" > "$RELEASE_JSON"
             python "$RUNNER_TEMP/release_safety.py" verify-release-assets \
               --release-json "$RELEASE_JSON" --asset "$ASSET" \
               --output "$RUNNER_TEMP/verified-release-assets.json"
@@ -182,7 +201,7 @@ jobs:
 
           if [ "$ACTION" != "complete_draft_release" ]; then
             if ! gh release create "$TAG" --verify-tag --target "$RELEASE_TARGET" --title "$TITLE" --generate-notes --draft; then
-              gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" > "$RELEASE_JSON"
+              refresh_release
               if jq -e ".draft == false" "$RELEASE_JSON" >/dev/null; then
                 python "$RUNNER_TEMP/release_safety.py" verify-release-assets \
                   --release-json "$RELEASE_JSON" --asset "$ASSET" \
@@ -192,16 +211,18 @@ jobs:
                 exit 0
               fi
               jq -e ".draft == true" "$RELEASE_JSON" >/dev/null
+            else
+              refresh_release
             fi
           fi
 
-          gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" > "$RELEASE_JSON"
+          refresh_release
           jq -e ".draft == true" "$RELEASE_JSON" >/dev/null
           ASSET_NAME="$(basename "$ASSET")"
           ASSET_COUNT="$(jq --arg name "$ASSET_NAME" '[.assets[] | select(.name == $name)] | length' "$RELEASE_JSON")"
           if [ "$ASSET_COUNT" = "0" ]; then
             if ! gh release upload "$TAG" "$ASSET"; then
-              gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" > "$RELEASE_JSON"
+              refresh_release
               python "$RUNNER_TEMP/release_safety.py" verify-release-assets \
                 --release-json "$RELEASE_JSON" --asset "$ASSET" \
                 --output "$RUNNER_TEMP/verified-raced-upload-assets.json"
@@ -211,15 +232,15 @@ jobs:
             exit 1
           fi
 
-          gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" > "$RELEASE_JSON"
+          refresh_release
           python "$RUNNER_TEMP/release_safety.py" verify-release-assets \
             --release-json "$RELEASE_JSON" --asset "$ASSET" \
             --output "$RUNNER_TEMP/verified-release-assets.json"
           if ! gh release edit "$TAG" --draft=false --latest; then
-            gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" > "$RELEASE_JSON"
+            refresh_release
             jq -e ".draft == false" "$RELEASE_JSON" >/dev/null
           fi
-          gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" > "$RELEASE_JSON"
+          refresh_release
           jq -e ".draft == false" "$RELEASE_JSON" >/dev/null
           jq -e ".immutable == true" "$RELEASE_JSON" >/dev/null
           python "$RUNNER_TEMP/release_safety.py" verify-release-assets \

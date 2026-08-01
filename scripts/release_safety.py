@@ -153,6 +153,34 @@ def plan_release_completion(
     }
 
 
+def discover_release_by_tag(releases: Sequence[dict], tag: str) -> dict[str, str]:
+    """Find one release, including drafts, and bind later operations to its ID."""
+    if not isinstance(tag, str) or not tag.strip():
+        raise ValueError("tag must be a nonempty string")
+    matches: list[dict] = []
+    for release in releases:
+        if not isinstance(release, dict):
+            raise ValueError("release discovery JSON must contain only objects")
+        if release.get("tag_name") == tag:
+            matches.append(release)
+    if len(matches) > 1:
+        raise ValueError(f"expected exactly one release for tag {tag}; found {len(matches)}")
+    if not matches:
+        return {"release_state": "missing", "release_id": ""}
+
+    release = matches[0]
+    release_id = release.get("id")
+    if isinstance(release_id, bool) or not isinstance(release_id, int) or release_id <= 0:
+        raise ValueError(f"release for tag {tag} has an invalid numeric id")
+    draft = release.get("draft")
+    if not isinstance(draft, bool):
+        raise ValueError(f"release for tag {tag} has an invalid draft state")
+    return {
+        "release_state": "draft" if draft else "published",
+        "release_id": str(release_id),
+    }
+
+
 def verify_release_assets(
     local_assets: Sequence[Path],
     release_assets: Sequence[dict],
@@ -614,6 +642,14 @@ def _main_plan_release(args: argparse.Namespace) -> int:
     return 0
 
 
+def _main_discover_release(args: argparse.Namespace) -> int:
+    payload = json.loads(Path(args.releases_json).read_text(encoding="utf-8"))
+    if not isinstance(payload, list):
+        raise ValueError("release discovery JSON must be an array")
+    print(json.dumps(discover_release_by_tag(payload, args.tag), sort_keys=True))
+    return 0
+
+
 def _main_verify_release_assets(args: argparse.Namespace) -> int:
     payload = json.loads(Path(args.release_json).read_text(encoding="utf-8"))
     if not isinstance(payload, dict) or not isinstance(payload.get("assets"), list):
@@ -671,6 +707,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     plan.add_argument("--github-output", required=True)
 
+    discover = subparsers.add_parser(
+        "discover-release",
+        help="discover a published or draft release and return its numeric ID",
+    )
+    discover.add_argument("--releases-json", required=True)
+    discover.add_argument("--tag", required=True)
+
     verify = subparsers.add_parser(
         "verify-release-assets",
         help="prove that release assets exactly match locally rebuilt bytes",
@@ -686,6 +729,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _main_acknowledge(args)
     if args.command == "plan-release":
         return _main_plan_release(args)
+    if args.command == "discover-release":
+        return _main_discover_release(args)
     if args.command == "verify-release-assets":
         return _main_verify_release_assets(args)
     return 2

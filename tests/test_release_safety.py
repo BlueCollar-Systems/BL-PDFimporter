@@ -9,7 +9,7 @@ import json
 import re
 import sys
 import tempfile
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
 
@@ -442,6 +442,60 @@ class ReleaseSafetyTest:
         assert plan["action"] == "complete_draft_release"
         assert plan["build_ref"] == "a" * 40
 
+    def test_release_discovery_includes_drafts_and_binds_numeric_id(self):
+        release = rs.discover_release_by_tag(
+            [
+                {"id": 12, "tag_name": "v1.0.75", "draft": False},
+                {"id": 34, "tag_name": "v1.0.76", "draft": True},
+            ],
+            "v1.0.76",
+        )
+        assert release == {
+            "release_state": "draft",
+            "release_id": "34",
+        }
+
+        try:
+            rs.discover_release_by_tag(
+                [
+                    {"id": 34, "tag_name": "v1.0.76", "draft": True},
+                    {"id": 35, "tag_name": "v1.0.76", "draft": False},
+                ],
+                "v1.0.76",
+            )
+        except ValueError as exc:
+            assert "exactly one" in str(exc)
+        else:
+            raise AssertionError("duplicate tag-bound releases were accepted")
+
+    def test_release_discovery_cli_emits_machine_readable_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            releases_path = Path(tmp) / "releases.json"
+            releases_path.write_text(
+                json.dumps(
+                    [
+                        {"id": 34, "tag_name": "v1.0.76", "draft": True},
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            stdout = StringIO()
+            with redirect_stdout(stdout):
+                code = rs.main(
+                    [
+                        "discover-release",
+                        "--releases-json",
+                        str(releases_path),
+                        "--tag",
+                        "v1.0.76",
+                    ]
+                )
+            assert code == 0
+            assert json.loads(stdout.getvalue()) == {
+                "release_state": "draft",
+                "release_id": "34",
+            }
+
     def test_release_asset_verification_is_idempotent_and_digest_bound(self):
         with tempfile.TemporaryDirectory() as tmp:
             asset = Path(tmp) / "package.zip"
@@ -709,6 +763,10 @@ class ReleaseSafetyTest:
         assert "--mode release" in workflow
         assert '--summary "$GITHUB_STEP_SUMMARY"' in workflow
         assert "python tests/test_release_safety.py" in workflow
+        assert 'repos/${GITHUB_REPOSITORY}/releases?per_page=100' in workflow
+        assert re.search(r'release_safety\.py"? discover-release', workflow)
+        assert 'repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}' in workflow
+        assert 'releases/tags/${TAG}' not in workflow
         plan_at = re.search(r'release_safety\.py"? plan-release', workflow).start()
         checkout_at = workflow.index('git checkout --detach "${{ steps.release_plan.outputs.build_ref }}"')
         build_at = workflow.index("python build_release.py")
