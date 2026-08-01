@@ -23,6 +23,9 @@ _FONT_PROOF_CATEGORIES = {
         "source_specific_impossibility",
         "runtime_capability_unavailable_for_item",
     },
+    "embedded_type3_font_program_unavailable": {
+        "source_specific_impossibility",
+    },
     "page_font_inventory_failed": {"runtime_inventory_unavailable_for_item"},
     "page_text_trace_inventory_failed": {"runtime_inventory_unavailable_for_item"},
     "invalid_page_font_record": {"source_inventory_invalid_for_page"},

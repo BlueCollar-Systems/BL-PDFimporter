@@ -664,6 +664,7 @@ class EmbeddedFontCatalog:
         assets: dict[str, EmbeddedFontAsset] = {}
         failures: dict[str, EmbeddedFontFailure] = {}
         ambiguous_names: set[str] = set()
+        ambiguous_exact_names: set[str] = set()
         glyph_maps, ambiguous_maps, trace_failure = _page_unicode_glyph_maps(page)
         try:
             records = tuple(page.get_fonts(full=True))
@@ -686,6 +687,30 @@ class EmbeddedFontCatalog:
         document = getattr(page, "parent", None)
         for record in records:
             try:
+                source_type_hint = str(record[2] or "").strip()
+                if record[0] is None and source_type_hint.lower() == "type3":
+                    observed_names = []
+                    for observed_name in (
+                        _without_subset_prefix(record[3]).strip(),
+                        str(record[4] or "").strip(),
+                    ):
+                        if observed_name and observed_name not in observed_names:
+                            observed_names.append(observed_name)
+                    if not observed_names:
+                        raise ValueError(
+                            "Type3 font inventory record has no exact observed name"
+                        )
+                    for observed_name in observed_names:
+                        failures[observed_name] = EmbeddedFontFailure(
+                            int(page_number),
+                            observed_name,
+                            "embedded_type3_font_program_unavailable",
+                            None,
+                            "ExactFontSourceImpossible",
+                            "PDF Type3 resource has no extractable font program",
+                            "source_specific_impossibility",
+                        )
+                    continue
                 xref = int(record[0])
                 source_format = str(record[1] or "").lower().lstrip(".")
                 source_type = str(record[2] or "")
@@ -830,6 +855,8 @@ class EmbeddedFontCatalog:
                         ambiguous_names.discard(delivery_name)
                         failures.pop(delivery_name, None)
                         continue
+                    if previous_is_exact and current_is_exact:
+                        ambiguous_exact_names.add(delivery_name)
                     assets.pop(delivery_name, None)
                     ambiguous_names.add(delivery_name)
                     failures[delivery_name] = EmbeddedFontFailure(
@@ -837,6 +864,11 @@ class EmbeddedFontCatalog:
                         "ambiguous_exact_embedded_font_match", xref,
                         proof_category="source_font_ambiguous_for_item",
                     )
+                    continue
+                if delivery_name in ambiguous_exact_names:
+                    # Distinct exact inventory programs are conclusive
+                    # ambiguity. Repeating either program later cannot make
+                    # the source name exact again.
                     continue
                 if (
                     delivery_name in ambiguous_names

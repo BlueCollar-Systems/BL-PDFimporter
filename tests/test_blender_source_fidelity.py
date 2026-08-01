@@ -16,6 +16,11 @@ from pdf_vector_importer.pdfcadcore.primitive_extractor import (
     _transform_pdf_point,
     extract_page,
 )
+from pdf_vector_importer.text_delivery import (
+    IMPORTER_ID,
+    AttemptOutcome,
+    _impossibility_proof_failures,
+)
 
 try:
     import pymupdf as fitz
@@ -138,6 +143,95 @@ def test_one_malformed_font_inventory_record_invalidates_the_whole_page():
     assert failure.page_number == 6
     assert failure.span_font_name == "GoodFont"
     assert failure.reason == "invalid_page_font_record"
+
+
+def test_shared_catalog_type3_without_xref_is_item_scoped_impossibility():
+    class Document:
+        @staticmethod
+        def extract_font(_xref):
+            raise AssertionError("Type3 without an xref must not be extracted")
+
+    class Page:
+        parent = Document()
+
+        @staticmethod
+        def get_texttrace():
+            return []
+
+        @staticmethod
+        def get_fonts(*, full=False):
+            assert full is True
+            return [(None, "", "Type3", "", "Type3Resource")]
+
+    catalog = EmbeddedFontCatalog.from_page(Page(), page_number=32)
+    failure = catalog.failure_for_span("Type3Resource")
+
+    assert catalog.assets == ()
+    assert len(catalog.failures) == 1
+    assert failure.span_font_name == "Type3Resource"
+    assert failure.reason == "embedded_type3_font_program_unavailable"
+    assert failure.source_xref is None
+    assert failure.error_type == "ExactFontSourceImpossible"
+    assert failure.detail == "PDF Type3 resource has no extractable font program"
+    assert failure.proof_category == "source_specific_impossibility"
+    assert catalog.failure_for_span("OtherFont").reason == "no_exact_embedded_font_match"
+
+
+def test_blender_accepts_type3_no_program_evidence_without_inventing_an_xref():
+    outcome = AttemptOutcome.impossible(
+        "exact_source_font_unavailable_for_item",
+        evidence={
+            "importer_id": IMPORTER_ID,
+            "item_id": "page-32-span-5",
+            "page_number": 32,
+            "source_span_id": 5,
+            "reason": "embedded_type3_font_program_unavailable",
+            "proof_category": "source_specific_impossibility",
+            "source_xref": None,
+            "font_name": "Type3Resource",
+            "font_failure_page_number": 32,
+            "font_failure_span_font_name": "Type3Resource",
+        },
+    )
+
+    failures = _impossibility_proof_failures(
+        attempted_representation="3d_text",
+        item_id="page-32-span-5",
+        page_number=32,
+        source_span_id=5,
+        outcome=outcome,
+    )
+
+    assert failures == []
+
+
+def test_shared_catalog_non_type3_without_xref_remains_terminal_page_failure():
+    class Document:
+        @staticmethod
+        def extract_font(_xref):
+            raise AssertionError("an invalid inventory row must stop extraction")
+
+    class Page:
+        parent = Document()
+
+        @staticmethod
+        def get_texttrace():
+            return []
+
+        @staticmethod
+        def get_fonts(*, full=False):
+            assert full is True
+            return [(None, "", "Type1", "Siwa-Regular", "F1", "")]
+
+    catalog = EmbeddedFontCatalog.from_page(Page(), page_number=33)
+
+    assert catalog.assets == ()
+    assert len(catalog.failures) == 1
+    page_failure = catalog.failures[0]
+    assert page_failure.span_font_name == ""
+    assert page_failure.reason == "invalid_page_font_record"
+    assert page_failure.proof_category == "source_inventory_invalid_for_page"
+    assert catalog.failure_for_span("Siwa-Regular").reason == "invalid_page_font_record"
 
 
 def test_font_without_existing_cmap_or_pdf_unicode_map_is_rejected():
