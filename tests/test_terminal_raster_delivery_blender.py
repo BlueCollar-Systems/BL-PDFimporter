@@ -475,6 +475,37 @@ def test_item_terminal_raster_is_clipped_and_placed_at_the_item_target_bbox(
     assert expected["pdf_raster_source_item_id"] == "page:2:text:41"
 
 
+def test_item_terminal_raster_uses_attempt_owned_resources(monkeypatch, tmp_path):
+    captured_kwargs = []
+
+    def _capture_plane(_placement, _collection, **kwargs):
+        captured_kwargs.append(kwargs)
+        return _RasterObject()
+
+    monkeypatch.setattr(bl_import_engine, "_create_image_plane", _capture_plane)
+
+    actual = bl_import_engine._render_text_item_raster(
+        _TextRasterPage(),
+        types.SimpleNamespace(
+            id=41,
+            text="WELD",
+            source_bbox_pdf=(34.0, 50.0, 147.0, 68.0),
+            bbox=(12.0, 24.0, 52.0, 30.0),
+        ),
+        object(),
+        page_num=2,
+        item_id="page:2:text:41",
+        import_cfg=types.SimpleNamespace(raster_dpi=288),
+        image_dir=str(tmp_path),
+        image_cache=object(),
+    )
+
+    assert actual is not None
+    assert len(captured_kwargs) == 1
+    assert "image_cache" not in captured_kwargs[0]
+    assert "style_identity" not in captured_kwargs[0]
+
+
 def test_item_terminal_raster_transforms_unrotated_source_bbox_for_page_clip(
     monkeypatch,
     tmp_path,

@@ -1764,11 +1764,11 @@ def _render_text_item_raster(
         "source_item_id": str(item_id),
     }
     try:
-        plane_kwargs = {"z_offset_m": z_offset_m}
-        if image_cache is not None:
-            plane_kwargs["image_cache"] = image_cache
-            plane_kwargs["style_identity"] = style_identity
-        obj = _create_image_plane(placement, collection, **plane_kwargs)
+        # A terminal fallback is an isolated delivery attempt. Its image,
+        # material, and mesh must be owned by that attempt so verification can
+        # accept them and rollback can remove them without touching shared
+        # page-image cache resources.
+        obj = _create_image_plane(placement, collection, z_offset_m=z_offset_m)
     except Exception:
         cleanup = _remove_owned_raster_file(image_path)
         _raise_for_incomplete_raster_cleanup(cleanup)
