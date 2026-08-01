@@ -501,11 +501,29 @@ def _assert_character_delivery(record, expected_type: str, source_text: str):
         if attempt["status"] == "delivered"
     )
     character_entities = delivered_attempt["evidence"]["character_entities"]
-    assert len(character_entities) == len(entities)
     assert "".join(str(item["text"]) for item in character_entities) == source_text
-    for item, obj in zip(character_entities, entities):  # noqa: B905
+    materialized_characters = []
+    for item in character_entities:
         assert item["positioned_character"] is True
-        assert item["entity_ids"] == [obj.name]
+        verification = item["verification"]
+        entity_ids = [str(value) for value in item["entity_ids"]]
+        if not entity_ids:
+            assert verification.get("zero_ink_identity") is True
+            assert str(verification.get("zero_ink_reason") or "").strip()
+            assert verification.get("visible_geometry_omitted") is True
+            assert verification.get("advance_preserved") is True
+            continue
+        assert len(entity_ids) == 1
+        materialized_characters.append((item, entity_ids[0]))
+
+    assert [entity_id for _item, entity_id in materialized_characters] == [
+        obj.name for obj in entities
+    ]
+    for (item, entity_id), obj in zip(  # noqa: B905
+        materialized_characters,
+        entities,
+    ):
+        assert entity_id == obj.name
         verification = item["verification"]
         assert verification["metric_affine_applied"] is True
         _assert_points_close(

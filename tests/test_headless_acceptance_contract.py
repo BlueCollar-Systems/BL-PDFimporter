@@ -81,6 +81,33 @@ def _synthetic_page_number_contract():
     }
 
 
+def _metric_verification(**extra):
+    return {
+        "metric_affine_applied": True,
+        "actual_baseline_anchor_m": [0.0, 0.0],
+        "expected_location_m": [0.0, 0.0],
+        "actual_advance_endpoint_m": [1.0, 0.0],
+        "expected_advance_endpoint_m": [1.0, 0.0],
+        "actual_line_axis_endpoint_m": [0.0, 1.0],
+        "expected_line_axis_endpoint_m": [0.0, 1.0],
+        "evaluated_affine_matrix": [1.0],
+        "intended_affine_matrix": [1.0],
+        **extra,
+    }
+
+
+def _positioned_delivery_record(character_entities):
+    return {
+        "entity_ids": ["Char_A", "Char_B"],
+        "attempts": [
+            {
+                "status": "delivered",
+                "evidence": {"character_entities": character_entities},
+            }
+        ],
+    }
+
+
 def test_second_owner_is_refused_and_first_owner_lock_is_preserved(
     monkeypatch,
     tmp_path,
@@ -201,6 +228,88 @@ def test_incomplete_acceptance_returns_nonzero(monkeypatch):
         raise IncompleteImportError("delivery failed")
 
     assert driver._run_main_fail_closed(incomplete, print_failure=lambda: None) == 1
+
+
+def test_character_delivery_accepts_proven_zero_ink_without_invented_host_object(
+    monkeypatch,
+):
+    driver = _load_driver(monkeypatch)
+    objects = {
+        name: types.SimpleNamespace(name=name, type="FONT")
+        for name in ("Char_A", "Char_B")
+    }
+    driver.bpy.data = types.SimpleNamespace(
+        objects=types.SimpleNamespace(get=objects.get)
+    )
+    monkeypatch.setattr(driver, "_assert_metric_entity", lambda _obj: None)
+    record = _positioned_delivery_record(
+        [
+            {
+                "text": "A",
+                "positioned_character": True,
+                "entity_ids": ["Char_A"],
+                "verification": _metric_verification(),
+            },
+            {
+                "text": " ",
+                "positioned_character": True,
+                "entity_ids": [],
+                "verification": {
+                    "zero_ink_identity": True,
+                    "zero_ink_reason": "source_whitespace",
+                    "visible_geometry_omitted": True,
+                    "advance_preserved": True,
+                },
+            },
+            {
+                "text": "B",
+                "positioned_character": True,
+                "entity_ids": ["Char_B"],
+                "verification": _metric_verification(),
+            },
+        ]
+    )
+
+    delivered = driver._assert_character_delivery(record, "FONT", "A B")
+
+    assert [obj.name for obj in delivered] == ["Char_A", "Char_B"]
+
+
+def test_character_delivery_rejects_omission_without_zero_ink_proof(monkeypatch):
+    driver = _load_driver(monkeypatch)
+    objects = {
+        name: types.SimpleNamespace(name=name, type="FONT")
+        for name in ("Char_A", "Char_B")
+    }
+    driver.bpy.data = types.SimpleNamespace(
+        objects=types.SimpleNamespace(get=objects.get)
+    )
+    monkeypatch.setattr(driver, "_assert_metric_entity", lambda _obj: None)
+    record = _positioned_delivery_record(
+        [
+            {
+                "text": "A",
+                "positioned_character": True,
+                "entity_ids": ["Char_A"],
+                "verification": _metric_verification(),
+            },
+            {
+                "text": "X",
+                "positioned_character": True,
+                "entity_ids": [],
+                "verification": {"visible_geometry_omitted": True},
+            },
+            {
+                "text": "B",
+                "positioned_character": True,
+                "entity_ids": ["Char_B"],
+                "verification": _metric_verification(),
+            },
+        ]
+    )
+
+    with pytest.raises(AssertionError):
+        driver._assert_character_delivery(record, "FONT", "AXB")
 
 
 def test_result_gate_requires_complete_per_mode_metrics_and_identity(monkeypatch):
