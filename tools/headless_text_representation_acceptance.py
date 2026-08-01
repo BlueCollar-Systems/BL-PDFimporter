@@ -7,19 +7,250 @@ Run with Blender, not CPython::
 """
 from __future__ import annotations
 
+import csv
 from dataclasses import replace
+from datetime import datetime, timezone
+from hashlib import sha256
 import json
+import locale
 import math
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 import tempfile
 import traceback
 import types
+from typing import Callable, Mapping, Optional
+from uuid import uuid4
 
 import bpy
 from mathutils import Vector
+
+
+class AcceptanceOwnershipError(RuntimeError):
+    """The host-acceptance process cannot prove exclusive Blender ownership."""
+
+
+class AcceptanceResultError(RuntimeError):
+    """The acceptance result is incomplete or bound to the wrong package."""
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _active_blender_process_ids() -> tuple[int, ...]:
+    """Return Windows Blender PIDs, failing closed when inventory is unavailable."""
+    if os.name != "nt":
+        return (os.getpid(),)
+    result = subprocess.run(
+        ["tasklist", "/FI", "IMAGENAME eq blender.exe", "/FO", "CSV", "/NH"],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding=locale.getpreferredencoding(False),
+        errors="replace",
+    )
+    if result.returncode != 0:
+        raise AcceptanceOwnershipError(
+            f"cannot verify Blender process inventory (tasklist={result.returncode})"
+        )
+    pids = []
+    for row in csv.reader(result.stdout.splitlines()):
+        if len(row) < 2 or str(row[0]).strip().casefold() != "blender.exe":
+            continue
+        try:
+            pids.append(int(str(row[1]).strip()))
+        except ValueError as exc:
+            raise AcceptanceOwnershipError(
+                f"invalid Blender PID in process inventory: {row!r}"
+            ) from exc
+    return tuple(sorted(set(pids)))
+
+
+class _AcceptanceLease:
+    def __init__(
+        self,
+        path: Path,
+        *,
+        owner: str,
+        pid: Optional[int] = None,
+        process_ids: Callable[[], tuple[int, ...]] = _active_blender_process_ids,
+    ) -> None:
+        self.path = Path(path)
+        self.owner = str(owner or "unknown")
+        self.pid = int(os.getpid() if pid is None else pid)
+        self.process_ids = process_ids
+        self.token = uuid4().hex
+        self._held = False
+
+    def _payload(self) -> dict:
+        now = _utc_now()
+        return {
+            "owner": self.owner,
+            "pid": self.pid,
+            "token": self.token,
+            "started_at": now,
+            "heartbeat_at": now,
+        }
+
+    def acquire(self) -> None:
+        try:
+            peers = sorted(
+                int(pid) for pid in self.process_ids() if int(pid) != self.pid
+            )
+        except AcceptanceOwnershipError:
+            raise
+        except Exception as exc:
+            raise AcceptanceOwnershipError(
+                f"cannot verify Blender process inventory: {type(exc).__name__}: {exc}"
+            ) from exc
+        if peers:
+            raise AcceptanceOwnershipError(
+                f"other Blender process is active; refusing acceptance run: {peers}"
+            )
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with self.path.open("x", encoding="utf-8", newline="\n") as handle:
+                json.dump(self._payload(), handle, sort_keys=True)
+                handle.write("\n")
+        except FileExistsError as exc:
+            try:
+                existing = self.path.read_text(encoding="utf-8").strip()
+            except OSError:
+                existing = "<unreadable>"
+            raise AcceptanceOwnershipError(
+                f"Blender acceptance lock is already owned: {existing}"
+            ) from exc
+        self._held = True
+
+    def heartbeat(self) -> None:
+        if not self._held:
+            raise AcceptanceOwnershipError("cannot heartbeat an unowned lock")
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise AcceptanceOwnershipError("acceptance lock became unreadable") from exc
+        if payload.get("token") != self.token or int(payload.get("pid", -1)) != self.pid:
+            raise AcceptanceOwnershipError("acceptance lock ownership changed")
+        payload["heartbeat_at"] = _utc_now()
+        replacement = self.path.with_name(
+            f".{self.path.name}.{self.pid}.{self.token}.tmp"
+        )
+        replacement.write_text(
+            json.dumps(payload, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(replacement, self.path)
+
+    def release(self) -> None:
+        if not self._held:
+            return
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+            if (
+                payload.get("token") == self.token
+                and int(payload.get("pid", -1)) == self.pid
+            ):
+                self.path.unlink()
+        except (OSError, ValueError):
+            pass
+        finally:
+            self._held = False
+
+
+_ACTIVE_LEASE: Optional[_AcceptanceLease] = None
+
+
+def _heartbeat_active_lease() -> None:
+    if _ACTIVE_LEASE is not None:
+        _ACTIVE_LEASE.heartbeat()
+
+
+def _release_active_lease() -> None:
+    global _ACTIVE_LEASE
+    if _ACTIVE_LEASE is not None:
+        _ACTIVE_LEASE.release()
+        _ACTIVE_LEASE = None
+
+
+def _package_identity(
+    repo_root: Path,
+    *,
+    importer_version: str,
+    modules: Mapping[str, object],
+) -> dict:
+    root = Path(repo_root).resolve()
+    expected_source_root = (root / "pdf_vector_importer").resolve()
+    if not str(importer_version or "").strip():
+        raise AcceptanceResultError("importer version is unbound")
+    identity_modules = {}
+    for name, module in sorted(modules.items()):
+        module_path = Path(str(getattr(module, "__file__", "") or "")).resolve()
+        try:
+            module_path.relative_to(expected_source_root)
+        except ValueError as exc:
+            raise AcceptanceResultError(
+                f"module {name} loaded outside expected root: {module_path}"
+            ) from exc
+        if not module_path.is_file():
+            raise AcceptanceResultError(f"module source is missing: {module_path}")
+        identity_modules[str(name)] = {
+            "path": str(module_path),
+            "sha256": sha256(module_path.read_bytes()).hexdigest(),
+        }
+    if not identity_modules:
+        raise AcceptanceResultError("package module identity is empty")
+    return {
+        "repo_root": str(root),
+        "importer_version": str(importer_version),
+        "modules": identity_modules,
+    }
+
+
+def _finalize_results(results: dict) -> dict:
+    expected_modes = {"labels", "text", "3d_text", "glyphs", "geometry", "raster"}
+    modes = results.get("modes")
+    if not isinstance(modes, dict) or set(modes) != expected_modes:
+        raise AcceptanceResultError("per-mode delivery metrics are incomplete")
+    for mode in sorted(expected_modes):
+        record = modes[mode]
+        source_items = int(record.get("source_items", 0) or 0)
+        delivered_items = int(record.get("delivered_items", 0) or 0)
+        failed_items = int(record.get("failed_items", 0) or 0)
+        expected_final = "text" if mode == "labels" else mode
+        if (
+            record.get("requested_representation") != mode
+            or record.get("final_representation") != expected_final
+            or record.get("status") != "delivered"
+            or source_items <= 0
+            or delivered_items != source_items
+            or failed_items != 0
+        ):
+            raise AcceptanceResultError(
+                f"{mode} delivery is incomplete: "
+                f"source={source_items} delivered={delivered_items} failed={failed_items}"
+            )
+    identity = results.get("package_identity")
+    critical_modules = {
+        "pdf_vector_importer.bl_import_engine",
+        "pdf_vector_importer.bl_text_builder",
+    }
+    if (
+        not isinstance(identity, dict)
+        or not str(identity.get("repo_root") or "").strip()
+        or not str(identity.get("importer_version") or "").strip()
+        or not isinstance(identity.get("modules"), dict)
+        or not identity["modules"]
+    ):
+        raise AcceptanceResultError("package identity is incomplete")
+    if not critical_modules.issubset(identity["modules"]):
+        raise AcceptanceResultError("critical module identity is incomplete")
+    finalized = dict(results)
+    finalized["result_status"] = "success"
+    return finalized
 
 
 def _args() -> tuple[Path, Path]:
@@ -159,10 +390,22 @@ def _assert_character_delivery(record, expected_type: str, source_text: str):
 
 
 def main() -> None:
+    global _ACTIVE_LEASE
     welding_path, raster_path = _args()
     repo_root = Path(__file__).resolve().parents[1]
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
+
+    lock_path = Path(
+        os.environ.get("BC_BL_ACCEPTANCE_LOCK")
+        or (Path(tempfile.gettempdir()) / "BC_BLENDER_ACCEPTANCE.lock")
+    ).expanduser().resolve()
+    lease = _AcceptanceLease(
+        lock_path,
+        owner=os.environ.get("BC_BL_ACCEPTANCE_OWNER") or f"pid:{os.getpid()}",
+    )
+    lease.acquire()
+    _ACTIVE_LEASE = lease
 
     from pdf_vector_importer import bl_import_engine, bl_text_builder
     from pdf_vector_importer.dependency_manager import ensure_lib_path
@@ -199,6 +442,14 @@ def main() -> None:
     raster_dir = tempfile.mkdtemp(prefix="bc_bl_acceptance_text_")
     results = {
         "blender_version": list(bpy.app.version),
+        "package_identity": _package_identity(
+            repo_root,
+            importer_version=bl_import_engine._importer_version(),
+            modules={
+                "pdf_vector_importer.bl_import_engine": bl_import_engine,
+                "pdf_vector_importer.bl_text_builder": bl_text_builder,
+            },
+        ),
         "source_spans": len(page_data.text_items),
         "exact_item_font": exact_item.font_name,
         "exact_item_font_format": exact_item.font_asset.usable_format,
@@ -267,6 +518,12 @@ def main() -> None:
         elif mode == "geometry":
             assert all(len(entity.data.vertices) > 0 for entity in entities)
         results["modes"][mode] = {
+            "requested_representation": mode,
+            "final_representation": mode,
+            "status": "delivered",
+            "source_items": 1,
+            "delivered_items": 1,
+            "failed_items": 0,
             "object_type": obj.type,
             "entity_id": obj.name,
             "entity_count": len(entities),
@@ -274,6 +531,7 @@ def main() -> None:
             "dependency_graph_updates": dependency_graph_updates,
         }
         _remove_collection(collection)
+        _heartbeat_active_lease()
 
     label_collection = _new_collection("Acceptance_labels")
     label_opts = types.SimpleNamespace(import_mode="vector", text_mode="labels")
@@ -292,12 +550,19 @@ def main() -> None:
     label_entities = _assert_character_delivery(label_record, "FONT", exact_item.text)
     assert "".join(entity.data.body for entity in label_entities) == exact_item.text
     results["modes"]["labels"] = {
+        "requested_representation": "labels",
+        "final_representation": "text",
+        "status": "delivered",
+        "source_items": 1,
+        "delivered_items": 1,
+        "failed_items": 0,
         "object_type": label_obj.type,
         "entity_count": len(label_entities),
         "final": "text",
         "reason": label_record["attempts"][0]["reason"],
     }
     _remove_collection(label_collection)
+    _heartbeat_active_lease()
 
     fallback_collection = _new_collection("Acceptance_missing_font")
     fallback_opts = types.SimpleNamespace(import_mode="vector", text_mode="3d_text")
@@ -325,6 +590,7 @@ def main() -> None:
     }
     _remove_collection(fallback_collection)
     document.close()
+    _heartbeat_active_lease()
 
     raster_document = fitz.open(str(raster_path))
     raster_page = raster_document[0]
@@ -367,6 +633,7 @@ def main() -> None:
             "auto_hide_default_cube": False,
             "import_report_path": str(report_path),
         },
+        progress_callback=lambda _pct, _message: _heartbeat_active_lease(),
     )
     assert full_stats["text_source_spans"] == len(page_data.text_items)
     assert full_stats["text_delivery_source_items"] == len(page_data.text_items)
@@ -453,14 +720,28 @@ def main() -> None:
         "owned_temp_directories_deleted": 2,
     }
 
+    results = _finalize_results(results)
     print("BC_BL_REPRESENTATION_ACCEPTANCE=" + json.dumps(results, sort_keys=True))
 
 
-if __name__ == "__main__":
+def _run_main_fail_closed(
+    main_func: Callable[[], None],
+    *,
+    print_failure: Callable[[], None] = traceback.print_exc,
+) -> int:
     try:
-        main()
+        main_func()
+        return 0
     except BaseException:
-        traceback.print_exc()
+        print_failure()
         sys.stdout.flush()
         sys.stderr.flush()
-        os._exit(1)
+        return 1
+    finally:
+        _release_active_lease()
+
+
+if __name__ == "__main__":
+    exit_code = _run_main_fail_closed(main)
+    if exit_code:
+        os._exit(exit_code)

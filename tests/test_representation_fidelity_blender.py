@@ -1607,6 +1607,55 @@ def test_generic_mesh_exception_stops_without_cross_type_fallback_and_cleans_own
     assert fake.data.objects.removed
 
 
+@pytest.mark.parametrize(
+    ("mode", "install_kwargs", "failure_reason"),
+    [
+        (
+            "glyphs",
+            {"curve_available": False},
+            "glyph_curve_conversion_failed_not_impossibility_proof",
+        ),
+        (
+            "geometry",
+            {"mesh_fail": True},
+            "geometry_mesh_conversion_failed_not_impossibility_proof",
+        ),
+    ],
+)
+def test_present_conversion_api_failure_stays_failed_without_fallback(
+    monkeypatch,
+    mode,
+    install_kwargs,
+    failure_reason,
+):
+    _fake, collection = _install(monkeypatch, **install_kwargs)
+    opts = types.SimpleNamespace(import_mode="vector", text_mode=mode)
+
+    obj = bl_text_builder.build_text(
+        _item(),
+        collection,
+        page_number=2,
+        text_mode=mode,
+        provenance_opts=opts,
+    )
+
+    assert obj is None
+    record = opts._text_delivery_records[-1]
+    assert record["status"] == "failed"
+    assert record["final_representation"] is None
+    assert record["fallback_attempted"] is False
+    assert [attempt["attempted_representation"] for attempt in record["attempts"]] == [
+        mode
+    ]
+    attempt = record["attempts"][0]
+    assert attempt["status"] == "failed"
+    assert attempt["reason"] == failure_reason
+    assert attempt["evidence"]["exception_type"] == "RuntimeError"
+    assert "capability_present" not in attempt["evidence"]
+    assert attempt["cleanup"]["status"] == "complete"
+    assert collection.objects.items == []
+
+
 @pytest.mark.parametrize("mode", ["glyphs", "geometry"])
 def test_failed_conversion_cleans_original_and_partially_linked_final_entity(
     monkeypatch,
