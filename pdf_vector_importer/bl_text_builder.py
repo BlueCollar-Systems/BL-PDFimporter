@@ -1262,13 +1262,14 @@ def _create_font_candidate(
     z_offset_m: float,
     entity_suffix: str = "",
     defer_host_update: bool = False,
+    shared_material=None,
 ):
     font, font_outcome = _load_exact_font(text_item, item_id, page_number)
     if font_outcome is not None:
         return None, None, font_outcome
     data = None
     obj = None
-    material = None
+    material = shared_material
     affine_carrier = None
     positioned_character = bool(getattr(text_item, "positioned_character", False))
     try:
@@ -1330,7 +1331,11 @@ def _create_font_candidate(
             float(y) * MM_TO_M - math.cos(angle_rad) * baseline_compensation_m,
             float(z_offset_m),
         )
-        material = _get_or_create_text_material(visual_style, source_color=text_item.color)
+        if material is None:
+            material = _get_or_create_text_material(
+                visual_style,
+                source_color=text_item.color,
+            )
         expected_rgb = _styled_text_color(visual_style, source_color=text_item.color)
         expected_rgba = (*tuple(float(value) for value in expected_rgb), 1.0)
         obj["pdf_text_material"] = str(getattr(material, "name", "") or "")
@@ -2750,6 +2755,7 @@ def _attempt_positioned_native_characters(
     )
     candidates = []
     ownership_outcomes = []
+    shared_material = None
 
     def character_record(index, layout, child, outcome):
         return {
@@ -2822,11 +2828,14 @@ def _attempt_positioned_native_characters(
             z_offset_m=z_offset_m,
             entity_suffix=suffix,
             defer_host_update=True,
+            shared_material=shared_material,
         )
         if failure is not None:
             outcomes = tuple(ownership_outcomes) + (failure,)
             evidence = [character_record(index, layout, child, failure)]
             return aggregate_failure(failure, index, outcomes, evidence)
+        if shared_material is None:
+            shared_material = data.materials[0]
         pending = AttemptOutcome.delivered(
             obj,
             entity_ids=(obj.name,),
@@ -3073,6 +3082,7 @@ def _attempt_positioned_converted_characters(
 
     candidates = []
     character_evidence = []
+    shared_material = None
 
     def character_record(candidate, outcome):
         layout = candidate["layout"]
@@ -3204,9 +3214,12 @@ def _attempt_positioned_converted_characters(
             z_offset_m=z_offset_m,
             entity_suffix=suffix,
             defer_host_update=True,
+            shared_material=shared_material,
         )
         if failure is not None:
             return aggregate_failure(failure, index)
+        if shared_material is None:
+            shared_material = source_data.materials[0]
         candidates.append({
             "index": index,
             "layout": layout,

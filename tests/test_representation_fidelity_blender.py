@@ -793,6 +793,42 @@ def test_positioned_conversion_batches_source_and_final_dependency_graph_updates
     ]
 
 
+@pytest.mark.parametrize("mode", ["text", "3d_text", "glyphs", "geometry"])
+def test_positioned_characters_share_one_attempt_owned_material(monkeypatch, mode):
+    """Catch per-character shader construction returning to dense text paths."""
+    fake, collection = _install(monkeypatch)
+    monkeypatch.setattr(
+        bl_text_builder,
+        "_apply_target_quad_affine",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        bl_text_builder,
+        "_verify_transform_and_dimensions",
+        lambda *_args, **_kwargs: ([], {"evaluated_bounds_verified": True}),
+    )
+    item = _item()
+    item.text = "AB"
+    item.normalized = "AB"
+    item.source_char_layout = _character_layout()
+    item.requires_individual_positioning = True
+
+    obj = bl_text_builder.build_text(
+        item,
+        collection,
+        page_number=2,
+        text_mode=mode,
+        provenance_opts=types.SimpleNamespace(import_mode="vector", text_mode=mode),
+    )
+
+    assert obj is not None
+    assert len(collection.objects.items) == 2
+    assigned = [candidate.data.materials[0] for candidate in collection.objects.items]
+    assert assigned[0] is assigned[1]
+    assert assigned[0].use_nodes is True
+    assert len(fake.data.materials.items) == 1
+
+
 @pytest.mark.parametrize(
     ("mode", "expected_type"),
     [("glyphs", "CURVE"), ("geometry", "MESH")],
