@@ -68,6 +68,7 @@ class _CurveData:
 
     def copy(self):
         copied = _CurveData(f"{self.name}_copy", self.base_dimensions)
+        copied.splines = list(self.splines)
         copied.materials.extend(self.materials)
         return copied
 
@@ -216,6 +217,8 @@ class _Object(dict):
             raise RuntimeError("curve conversion crashed")
         curve = _CurveData(f"{self.name}_outline", self.dimensions)
         curve.materials.extend(getattr(self.data, "materials", []))
+        if str(getattr(self.data, "body", "")).isspace():
+            curve.splines = []
         return curve
 
     def to_curve_clear(self):
@@ -293,6 +296,9 @@ class _Meshes:
             raise RuntimeError("mesh conversion crashed")
         mesh = _MeshData(f"{evaluated.name}_mesh", evaluated.dimensions)
         mesh.materials.extend(getattr(evaluated.data, "materials", []))
+        if str(getattr(evaluated.data, "body", "")).isspace():
+            mesh.vertices = []
+            mesh.polygons = []
         return mesh
 
     def remove(self, data):
@@ -904,6 +910,59 @@ def test_positioned_conversion_preserves_whitespace_advance_without_visible_geom
     assert evidence["character_entities"][2]["target_origin_model"] == [20.0, 24.0]
     assert not any("_c0001_" in name for name in fake.data.curves.removed)
     assert fake.view_update_count == 2
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_type", "geometry_attr"),
+    [("glyphs", "CURVE", "splines"), ("geometry", "MESH", "vertices")],
+)
+def test_positioned_conversion_delivers_whitespace_only_span_as_empty_typed_carrier(
+    monkeypatch,
+    mode,
+    expected_type,
+    geometry_attr,
+):
+    """Catch zero-ink source items being rejected or replaced with invented ink."""
+    _fake, collection = _install(monkeypatch)
+    monkeypatch.setattr(
+        bl_text_builder,
+        "_apply_target_quad_affine",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        bl_text_builder,
+        "_verify_transform_and_dimensions",
+        lambda *_args, **_kwargs: ([], {"evaluated_bounds_verified": True}),
+    )
+    item = _item()
+    item.text = " "
+    item.normalized = ""
+    item.source_char_layout = (_character_layout_with_space()[1],)
+    item.requires_individual_positioning = True
+    opts = types.SimpleNamespace(import_mode="vector", text_mode=mode)
+
+    obj = bl_text_builder.build_text(
+        item,
+        collection,
+        page_number=2,
+        text_mode=mode,
+        provenance_opts=opts,
+    )
+
+    assert obj is not None and obj.type == expected_type
+    assert len(collection.objects.items) == 1
+    assert len(getattr(obj.data, geometry_attr)) == 0
+    assert obj["pdf_zero_ink_identity"] is True
+    assert obj["pdf_visible_geometry_omitted"] is True
+    assert obj["pdf_advance_preserved"] is True
+    record = opts._text_delivery_records[-1]
+    assert record["status"] == "delivered"
+    assert record["final_representation"] == mode
+    assert len(record["entity_ids"]) == 1
+    evidence = record["attempts"][-1]["evidence"]
+    assert evidence["zero_ink_identity"] is True
+    assert evidence["visible_geometry_omitted"] is True
+    assert evidence["advance_preserved"] is True
 
 
 @pytest.mark.parametrize(

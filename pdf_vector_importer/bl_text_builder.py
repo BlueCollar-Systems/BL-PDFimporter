@@ -2949,6 +2949,7 @@ def _prepare_positioned_converted_candidate(
     item_id,
     depsgraph,
     mesh_factory=None,
+    allow_empty: bool = False,
 ):
     """Convert one evaluated FONT without forcing a dependency-graph update."""
     final_data = None
@@ -2979,7 +2980,7 @@ def _prepare_positioned_converted_candidate(
                 clear = getattr(evaluated, "to_curve_clear", None)
                 if callable(clear):
                     clear()
-            if not list(getattr(final_data, "splines", []) or []):
+            if not allow_empty and not list(getattr(final_data, "splines", []) or []):
                 return None, final_data, AttemptOutcome.failed(
                     "glyph_curve_has_no_verified_splines",
                     evidence={"item_id": item_id},
@@ -2995,7 +2996,7 @@ def _prepare_positioned_converted_candidate(
             if not callable(mesh_factory):  # pragma: no cover - checked by caller
                 raise RuntimeError("positioned mesh conversion capability disappeared")
             final_data = mesh_factory(evaluated, depsgraph=depsgraph)
-            if not list(getattr(final_data, "vertices", []) or []):
+            if not allow_empty and not list(getattr(final_data, "vertices", []) or []):
                 return None, final_data, AttemptOutcome.failed(
                     "geometry_mesh_has_no_verified_vertices",
                     evidence={"item_id": item_id},
@@ -3021,6 +3022,10 @@ def _prepare_positioned_converted_candidate(
         )
         _copy_text_material_metadata(source, final)
         final["pdf_text_source"] = str(text_item.text)
+        if allow_empty:
+            final["pdf_zero_ink_identity"] = True
+            final["pdf_visible_geometry_omitted"] = True
+            final["pdf_advance_preserved"] = True
         collection.objects.link(final)
         return final, final_data, None
     except Exception as exc:
@@ -3276,16 +3281,8 @@ def _attempt_positioned_converted_characters(
             )
         source_records.append(character_record(candidate, source_outcome))
 
-    if not any(not candidate["zero_ink"] for candidate in candidates):
-        failure = AttemptOutcome.failed(
-            "positioned_conversion_contains_no_visible_glyphs",
-            evidence={
-                "item_id": item_id,
-                "character_count": len(candidates),
-                "character_entities": source_records,
-            },
-        )
-        return aggregate_failure(failure, records=source_records)
+    all_zero_ink = not any(not candidate["zero_ink"] for candidate in candidates)
+    zero_ink_carrier_index = candidates[0]["index"] if all_zero_ink else None
 
     try:
         depsgraph = bpy.context.evaluated_depsgraph_get()
@@ -3301,7 +3298,8 @@ def _attempt_positioned_converted_characters(
         return aggregate_failure(failure, records=source_records)
 
     for candidate in candidates:
-        if candidate["zero_ink"]:
+        is_zero_ink_carrier = candidate["index"] == zero_ink_carrier_index
+        if candidate["zero_ink"] and not is_zero_ink_carrier:
             continue
         final, final_data, failure = _prepare_positioned_converted_candidate(
             candidate["source"],
@@ -3314,6 +3312,7 @@ def _attempt_positioned_converted_characters(
             item_id=item_id,
             depsgraph=depsgraph,
             mesh_factory=mesh_factory,
+            allow_empty=is_zero_ink_carrier,
         )
         candidate["final"] = final
         candidate["final_data"] = final_data
@@ -3358,7 +3357,8 @@ def _attempt_positioned_converted_characters(
     outcomes = []
     character_evidence = []
     for candidate in candidates:
-        if candidate["zero_ink"]:
+        is_zero_ink_carrier = candidate["index"] == zero_ink_carrier_index
+        if candidate["zero_ink"] and not is_zero_ink_carrier:
             source_verification = dict(
                 source_records[candidate["index"]].get("verification") or {}
             )
@@ -3408,6 +3408,16 @@ def _attempt_positioned_converted_characters(
                 "item_id": item_id,
                 **verification_evidence,
                 detail_key: len(detail_values),
+                **(
+                    {
+                        "zero_ink_identity": True,
+                        "zero_ink_reason": candidate["zero_ink_reason"],
+                        "visible_geometry_omitted": True,
+                        "advance_preserved": True,
+                    }
+                    if is_zero_ink_carrier
+                    else {}
+                ),
             },
             owned_artifacts=_owned_artifacts_for_text_entity(
                 candidate["final"], candidate["final_data"]
