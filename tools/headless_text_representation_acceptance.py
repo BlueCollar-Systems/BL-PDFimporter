@@ -252,6 +252,7 @@ def _package_identity(
     *,
     importer_version: str,
     modules: Mapping[str, object],
+    release_identity: Optional[Mapping[str, object]] = None,
 ) -> dict:
     root = Path(repo_root).resolve()
     expected_source_root = (root / "pdf_vector_importer").resolve()
@@ -274,14 +275,43 @@ def _package_identity(
         }
     if not identity_modules:
         raise AcceptanceResultError("package module identity is empty")
-    return {
+    identity = dict(release_identity or {})
+    if release_identity is not None:
+        required = (
+            "schema",
+            "status",
+            "source_commit",
+            "source_tag",
+            "package_sha256",
+            "package_hash_kind",
+        )
+        if any(not str(identity.get(key) or "").strip() for key in required):
+            raise AcceptanceResultError("release identity is incomplete")
+        if str(identity.get("importer_version") or "") != str(importer_version):
+            raise AcceptanceResultError("release/importer version identity mismatch")
+        released_modules = identity.get("modules")
+        if not isinstance(released_modules, Mapping):
+            raise AcceptanceResultError("release module identity is incomplete")
+        for name, actual in identity_modules.items():
+            released = released_modules.get(name)
+            if not isinstance(released, Mapping):
+                raise AcceptanceResultError(f"release identity omits module {name}")
+            if (
+                Path(str(released.get("path") or "")).resolve()
+                != Path(actual["path"]).resolve()
+                or str(released.get("sha256") or "").lower() != actual["sha256"]
+            ):
+                raise AcceptanceResultError(f"release identity mismatch for module {name}")
+    identity.update({
         "repo_root": str(root),
         "importer_version": str(importer_version),
         "modules": identity_modules,
-    }
+    })
+    return identity
 
 
 def _finalize_results(results: dict) -> dict:
+    results.setdefault("blender_version", list(bpy.app.version))
     expected_modes = {"labels", "text", "3d_text", "glyphs", "geometry", "raster"}
     modes = results.get("modes")
     if not isinstance(modes, dict) or set(modes) != expected_modes:
@@ -325,6 +355,17 @@ def _finalize_results(results: dict) -> dict:
         raise AcceptanceResultError("package identity is incomplete")
     if not critical_modules.issubset(identity["modules"]):
         raise AcceptanceResultError("critical module identity is incomplete")
+    source_commit = str(identity.get("source_commit") or "")
+    package_sha256 = str(identity.get("package_sha256") or "")
+    source_tag = str(identity.get("source_tag") or "")
+    if (
+        len(source_commit) != 40
+        or any(char not in "0123456789abcdefABCDEF" for char in source_commit)
+        or len(package_sha256) != 64
+        or any(char not in "0123456789abcdefABCDEF" for char in package_sha256)
+        or source_tag != f"v{identity['importer_version']}"
+    ):
+        raise AcceptanceResultError("release identity is incomplete")
 
     synthetic = results.get("synthetic_page_number_contract")
     if not isinstance(synthetic, dict):
@@ -609,7 +650,12 @@ def main() -> None:
                 "pdf_vector_importer.bl_import_engine": bl_import_engine,
                 "pdf_vector_importer.bl_text_builder": bl_text_builder,
             },
+            release_identity=bl_import_engine.runtime_package_identity(),
         ),
+        "source_inputs": {
+            welding_path.name: sha256(welding_path.read_bytes()).hexdigest(),
+            raster_path.name: sha256(raster_path.read_bytes()).hexdigest(),
+        },
         "source_spans": len(page_data.text_items),
         "exact_item_font": exact_item.font_name,
         "exact_item_font_format": exact_item.font_asset.usable_format,

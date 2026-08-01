@@ -741,7 +741,13 @@ def build_page(
     page_area = max(float(page_data.width or 0.0) * float(page_data.height or 0.0), 1e-9)
     prims = page_data.primitives or []
     total_prims = max(1, len(prims))
-    heartbeat_every = max(25, int(config.get("geometry_heartbeat_every", 80) or 80))
+    from .import_session import cancel_heartbeat_interval
+
+    configured_gap = max(1, int(config.get("geometry_heartbeat_every", 25) or 25))
+    heartbeat_every = cancel_heartbeat_interval(
+        total_prims,
+        maximum_gap=min(25, configured_gap),
+    )
     batch_open_curves = bool(config.get("batch_open_curves", True))
     open_curve_batches: Dict[Tuple[int, int, object, float], dict] = {}
 
@@ -817,10 +823,15 @@ def build_page(
 
     for idx, prim in enumerate(prims):
         if progress_callback and (idx % heartbeat_every == 0):
+            progress_result = None
             try:
-                progress_callback((idx + 1) / float(total_prims))
+                progress_result = progress_callback((idx + 1) / float(total_prims))
             except Exception:
                 pass
+            if progress_result is False:
+                from .import_session import ImportCancelledError
+
+                raise ImportCancelledError("PDF import cancelled during geometry building")
         has_fill_any = prim.fill_color is not None
         has_stroke_any = prim.stroke_color is not None
         if (
@@ -1078,8 +1089,13 @@ def build_page(
     _flush_open_curve_batches()
 
     if progress_callback:
+        progress_result = None
         try:
-            progress_callback(1.0)
+            progress_result = progress_callback(1.0)
         except Exception:
             pass
+        if progress_result is False:
+            from .import_session import ImportCancelledError
+
+            raise ImportCancelledError("PDF import cancelled after geometry building")
     return stats

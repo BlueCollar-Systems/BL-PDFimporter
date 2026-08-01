@@ -22,6 +22,30 @@ from bpy_extras.io_utils import ImportHelper
 
 # Shelved 2026-07-06: closed-region shape extrusion deferred; code retained.
 SHAPE_EXTRUSION_UI_ENABLED = False
+_IMPORT_ACTIVE = False
+_IMPORT_CANCEL_REQUESTED = False
+
+
+def _begin_import_session():
+    global _IMPORT_ACTIVE, _IMPORT_CANCEL_REQUESTED
+    _IMPORT_ACTIVE = True
+    _IMPORT_CANCEL_REQUESTED = False
+
+
+def _request_cancel():
+    global _IMPORT_CANCEL_REQUESTED
+    if _IMPORT_ACTIVE:
+        _IMPORT_CANCEL_REQUESTED = True
+
+
+def _cancel_requested() -> bool:
+    return bool(_IMPORT_ACTIVE and _IMPORT_CANCEL_REQUESTED)
+
+
+def _end_import_session():
+    global _IMPORT_ACTIVE, _IMPORT_CANCEL_REQUESTED
+    _IMPORT_ACTIVE = False
+    _IMPORT_CANCEL_REQUESTED = False
 
 
 # ── Mode enum items (BCS-ARCH-001) ───────────────────────────────────
@@ -82,6 +106,23 @@ def _addon_prefs(context):
     return addon.preferences
 
 
+class IMPORT_OT_pdf_vector_cancel(bpy.types.Operator):
+    """Request cooperative cancellation at the next object heartbeat."""
+
+    bl_idname = "import_scene.pdf_vector_cancel"
+    bl_label = "Cancel Active PDF Import"
+    bl_description = "Stop the active PDF import safely and keep completed pages resumable"
+
+    @classmethod
+    def poll(cls, _context):
+        return bool(_IMPORT_ACTIVE)
+
+    def execute(self, _context):
+        _request_cancel()
+        self.report({"WARNING"}, "PDF import cancellation requested")
+        return {"FINISHED"}
+
+
 class IMPORT_OT_pdf_vector(bpy.types.Operator, ImportHelper):
     """Import PDF vector drawings as native Blender geometry."""
 
@@ -115,6 +156,16 @@ class IMPORT_OT_pdf_vector(bpy.types.Operator, ImportHelper):
         name="Pages",
         description="Pages to import: 'all', '1', '1,3-5', or '2-4'",
         default="all",
+    )
+
+    resume_interrupted: BoolProperty(  # type: ignore[assignment]
+        name="Resume Interrupted Import",
+        description=(
+            "Reuse the source-bound checkpoint and existing root collection, "
+            "then build only unfinished pages"
+        ),
+        default=False,
+        options={"SKIP_SAVE"},
     )
 
     import_text: BoolProperty(  # type: ignore[assignment]
@@ -248,6 +299,7 @@ class IMPORT_OT_pdf_vector(bpy.types.Operator, ImportHelper):
         config = {
             "mode": effective_mode,
             "pages": self.pages,
+            "resume": self.resume_interrupted,
             "import_text": self.import_text,
             "text_mode": self.text_mode,
             "group_by_color": self.group_by_color,
@@ -278,7 +330,13 @@ class IMPORT_OT_pdf_vector(bpy.types.Operator, ImportHelper):
             except Exception:
                 pct_i = 0
             _set_status(f"PDF Import {pct_i}% - {message}")
+            try:
+                bpy.ops.wm.redraw_timer(type="DRAW_WIN_SWAP", iterations=1)
+            except Exception:
+                pass
+            return not _cancel_requested()
 
+        _begin_import_session()
         try:
             _set_status("PDF Import 0% - Starting import...")
             stats = bl_import_engine.import_pdf(
@@ -286,6 +344,7 @@ class IMPORT_OT_pdf_vector(bpy.types.Operator, ImportHelper):
                 config=config,
                 progress_callback=_on_progress,
                 context=context,
+                cancel_callback=_cancel_requested,
             )
         except Exception as exc:
             from .pdfcadcore.fitz_loader import PdfOpenError
@@ -295,9 +354,22 @@ class IMPORT_OT_pdf_vector(bpy.types.Operator, ImportHelper):
                 self.report({"ERROR"}, str(exc))
             else:
                 self.report({"ERROR"}, f"PDF import failed: {exc}")
+            _end_import_session()
             return {"CANCELLED"}
 
+        _end_import_session()
         _set_status(None)
+
+        if bool(stats.get("cancelled")):
+            resume = dict(stats.get("resume") or {})
+            self.report(
+                {"WARNING"},
+                "PDF import cancelled safely. Completed pages remain in the scene; "
+                f"enable Resume Interrupted Import to continue pages "
+                f"{resume.get('resume_pages') or '<none>'}. Checkpoint: "
+                f"{stats.get('resume_checkpoint_path') or '<unavailable>'}",
+            )
+            return {"CANCELLED"}
 
         report_error = str(stats.get("import_report_error") or "").strip()
         if report_error:
@@ -386,6 +458,7 @@ class IMPORT_OT_pdf_vector(bpy.types.Operator, ImportHelper):
 
         # Page selection
         layout.prop(self, "pages")
+        layout.prop(self, "resume_interrupted", icon="FILE_REFRESH")
         layout.separator()
 
         adv = layout.box()
@@ -430,3 +503,9 @@ def menu_func_import(self, context):
     self.layout.operator(
         IMPORT_OT_pdf_vector.bl_idname, text="PDF Vector (.pdf)"
     )
+    if IMPORT_OT_pdf_vector_cancel.poll(context):
+        self.layout.operator(
+            IMPORT_OT_pdf_vector_cancel.bl_idname,
+            text="Cancel Active PDF Import",
+            icon="CANCEL",
+        )

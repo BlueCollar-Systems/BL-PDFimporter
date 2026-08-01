@@ -41,14 +41,6 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Run release gate tests
-        run: |
-          set -e
-          python -m pip install --upgrade pip
-          python -m pip install "PyMuPDF>=1.24,<2.0" "fonttools==4.60.2" pytest
-          python pdfcadcore_sync_check.py --skip-cross-repo
-          python -m pytest tests/ -q --basetemp "$RUNNER_TEMP/pytest-blender"
-
       - name: Read committed version
         id: version
         run: |
@@ -96,30 +88,79 @@ jobs:
           out.write_text(f"version={version}\n", encoding="utf-8")
           PY
 
-      - name: Set release target
+      - name: Plan atomic release completion
+        id: release_plan
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          echo "RELEASE_TARGET=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          set -euo pipefail
+          TAG="v${{ steps.version.outputs.version }}"
+          cp scripts/release_safety.py "$RUNNER_TEMP/release_safety.py"
+          TAG_SHA="$(git rev-list -n 1 "$TAG^{commit}" 2>/dev/null || true)"
+          if gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" > "$RUNNER_TEMP/release.json" 2>/dev/null; then
+            RELEASE_STATE="$(jq -r 'if .draft then "draft" else "published" end' "$RUNNER_TEMP/release.json")"
+          else
+            RELEASE_STATE="missing"
+            printf '%s\n' '{"assets":[]}' > "$RUNNER_TEMP/release.json"
+          fi
+          python "$RUNNER_TEMP/release_safety.py" plan-release \
+            --version "${{ steps.version.outputs.version }}" \
+            --head-sha "$GITHUB_SHA" \
+            --tag-sha "$TAG_SHA" \
+            --release-state "$RELEASE_STATE" \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Checkout immutable release source
+        run: |
+          set -euo pipefail
+          git checkout --detach "${{ steps.release_plan.outputs.build_ref }}"
+          test "$(git rev-parse HEAD)" = "${{ steps.release_plan.outputs.build_ref }}"
+
+      - name: Run release gate tests on selected source
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install "PyMuPDF>=1.24,<2.0" "fonttools==4.60.2" pytest
+          python pdfcadcore_sync_check.py --skip-cross-repo
+          python -m pytest tests/ -q --basetemp "$RUNNER_TEMP/pytest-blender"
+          python tests/test_release_safety.py
 
       - name: Build release
+        env:
+          BC_RELEASE_SOURCE_SHA: ${{ steps.release_plan.outputs.build_ref }}
         run: python build_release.py
 
       - name: Smoke shipped add-on ZIP
         run: python scripts/smoke_release_zip.py "dist/Blender-PDF-Importer_*.zip"
 
-      - name: Create release
+      - name: Complete or verify immutable release
         id: mint
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          set -e
-          TAG="v${{ steps.version.outputs.version }}"
+          set -euo pipefail
+          ACTION="${{ steps.release_plan.outputs.action }}"
+          TAG="${{ steps.release_plan.outputs.tag }}"
+          RELEASE_TARGET="${{ steps.release_plan.outputs.release_target }}"
           TITLE="v${{ steps.version.outputs.version }} — PDF Vector Importer for Blender"
+          RELEASE_JSON="$RUNNER_TEMP/release.json"
+          shopt -s nullglob
+          ASSETS=(dist/*.zip)
+          if [ "${#ASSETS[@]}" -ne 1 ]; then
+            echo "Expected exactly one release ZIP; found ${#ASSETS[@]}" >&2
+            exit 1
+          fi
+          ASSET="${ASSETS[0]}"
 
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "Release ${TAG} already exists — immutable; skipping asset upload."
+          if [ "$ACTION" = "verify_existing_release" ]; then
+            gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" > "$RELEASE_JSON"
+            python "$RUNNER_TEMP/release_safety.py" verify-release-assets \
+              --release-json "$RELEASE_JSON" --asset "$ASSET" \
+              --output "$RUNNER_TEMP/verified-release-assets.json"
+            jq -e ".draft == false" "$RELEASE_JSON" >/dev/null
+            jq -e ".immutable == true" "$RELEASE_JSON" >/dev/null
             echo "minted=false" >> "$GITHUB_OUTPUT"
-            # Round 21 Task 5: stateful, bounded stranded-release audit.
-            python scripts/release_safety.py audit-existing-tag \
+            python "$RUNNER_TEMP/release_safety.py" audit-existing-tag \
               --repo "${GITHUB_REPOSITORY}" \
               --tag "$TAG" \
               --before "${{ github.event.before }}" \
@@ -129,10 +170,62 @@ jobs:
               --summary "$GITHUB_STEP_SUMMARY" \
               --warnings-file .release-safety/warnings.json
             exit 0
-          else
-            gh release create "$TAG" --target "${RELEASE_TARGET:-$GITHUB_SHA}" --title "$TITLE" --generate-notes --latest dist/*.zip
-            echo "minted=true" >> "$GITHUB_OUTPUT"
           fi
+
+          if [ "$ACTION" = "mint_new_tag" ]; then
+            git tag "$TAG" "$RELEASE_TARGET"
+            if ! git push origin "refs/tags/${TAG}"; then
+              git fetch --force origin "refs/tags/${TAG}:refs/tags/${TAG}"
+              test "$(git rev-list -n 1 "$TAG^{commit}")" = "$RELEASE_TARGET"
+            fi
+          fi
+
+          if [ "$ACTION" != "complete_draft_release" ]; then
+            if ! gh release create "$TAG" --verify-tag --target "$RELEASE_TARGET" --title "$TITLE" --generate-notes --draft; then
+              gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" > "$RELEASE_JSON"
+              if jq -e ".draft == false" "$RELEASE_JSON" >/dev/null; then
+                python "$RUNNER_TEMP/release_safety.py" verify-release-assets \
+                  --release-json "$RELEASE_JSON" --asset "$ASSET" \
+                  --output "$RUNNER_TEMP/verified-raced-release-assets.json"
+                jq -e ".immutable == true" "$RELEASE_JSON" >/dev/null
+                echo "minted=false" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              jq -e ".draft == true" "$RELEASE_JSON" >/dev/null
+            fi
+          fi
+
+          gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" > "$RELEASE_JSON"
+          jq -e ".draft == true" "$RELEASE_JSON" >/dev/null
+          ASSET_NAME="$(basename "$ASSET")"
+          ASSET_COUNT="$(jq --arg name "$ASSET_NAME" '[.assets[] | select(.name == $name)] | length' "$RELEASE_JSON")"
+          if [ "$ASSET_COUNT" = "0" ]; then
+            if ! gh release upload "$TAG" "$ASSET"; then
+              gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" > "$RELEASE_JSON"
+              python "$RUNNER_TEMP/release_safety.py" verify-release-assets \
+                --release-json "$RELEASE_JSON" --asset "$ASSET" \
+                --output "$RUNNER_TEMP/verified-raced-upload-assets.json"
+            fi
+          elif [ "$ASSET_COUNT" != "1" ]; then
+            echo "Release contains duplicate assets named ${ASSET_NAME}" >&2
+            exit 1
+          fi
+
+          gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" > "$RELEASE_JSON"
+          python "$RUNNER_TEMP/release_safety.py" verify-release-assets \
+            --release-json "$RELEASE_JSON" --asset "$ASSET" \
+            --output "$RUNNER_TEMP/verified-release-assets.json"
+          if ! gh release edit "$TAG" --draft=false --latest; then
+            gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" > "$RELEASE_JSON"
+            jq -e ".draft == false" "$RELEASE_JSON" >/dev/null
+          fi
+          gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" > "$RELEASE_JSON"
+          jq -e ".draft == false" "$RELEASE_JSON" >/dev/null
+          jq -e ".immutable == true" "$RELEASE_JSON" >/dev/null
+          python "$RUNNER_TEMP/release_safety.py" verify-release-assets \
+            --release-json "$RELEASE_JSON" --asset "$ASSET" \
+            --output "$RUNNER_TEMP/verified-published-assets.json"
+          echo "minted=true" >> "$GITHUB_OUTPUT"
 
       - name: Check website dispatch token secret
         if: steps.mint.outputs.minted == 'true'

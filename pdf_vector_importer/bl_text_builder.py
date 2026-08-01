@@ -3689,13 +3689,20 @@ def build_all_text(
     _VERIFIED_PACKED_FONTS.clear()
     count = 0
     total = max(1, len(text_items or []))
-    heartbeat_every = max(25, int(total / 25))
+    from .import_session import cancel_heartbeat_interval
+
+    heartbeat_every = cancel_heartbeat_interval(total)
     for idx, item in enumerate(text_items or []):
         if progress_callback and idx % heartbeat_every == 0:
+            progress_result = None
             try:
-                progress_callback((idx + 1) / float(total))
+                progress_result = progress_callback((idx + 1) / float(total))
             except Exception:
                 pass
+            if progress_result is False:
+                from .import_session import ImportCancelledError
+
+                raise ImportCancelledError("PDF import cancelled during text building")
             try:
                 bpy.ops.wm.redraw_timer(type="DRAW_WIN_SWAP", iterations=1)
             except Exception:
@@ -3714,8 +3721,13 @@ def build_all_text(
         if obj is not None:
             count += 1
     if progress_callback:
+        progress_result = None
         try:
-            progress_callback(1.0)
+            progress_result = progress_callback(1.0)
         except Exception:
             pass
+        if progress_result is False:
+            from .import_session import ImportCancelledError
+
+            raise ImportCancelledError("PDF import cancelled after text building")
     return count

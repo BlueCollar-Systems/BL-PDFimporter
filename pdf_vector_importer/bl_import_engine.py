@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import math
 import os
 import re
@@ -122,6 +123,32 @@ def _default_import_report_path(filepath: str) -> str:
     return os.path.join(tempfile.gettempdir(), f"{base}_import_report.json")
 
 
+def _sha256_path(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _discard_page_collection(page_collection) -> None:
+    """Remove only the incomplete current-page objects and collection."""
+    for obj in list(getattr(page_collection, "all_objects", ()) or ()):
+        try:
+            bpy.data.objects.remove(obj, do_unlink=True)
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            pass
+    try:
+        bpy.data.collections.remove(page_collection)
+    except TypeError:
+        try:
+            bpy.data.collections.remove(page_collection, do_unlink=True)
+        except (AttributeError, RuntimeError, TypeError, ValueError):
+            pass
+    except (AttributeError, RuntimeError, ValueError):
+        pass
+
+
 def _importer_version() -> str:
     try:
         from . import bl_info
@@ -153,6 +180,20 @@ def _pymupdf_version() -> str:
         return str(getattr(fitz, "__version__", "") or "")
     except (ImportError, RuntimeError, OSError):
         return ""
+
+
+def estimate_import_complexity(**kwargs) -> Dict[str, Any]:
+    """Public Blender wrapper for the representation-aware work estimate."""
+    from .import_session import estimate_import_complexity as _estimate
+
+    return _estimate(**kwargs)
+
+
+def runtime_package_identity() -> Dict[str, Any]:
+    """Return and verify the exact installed add-on identity."""
+    from .build_identity import runtime_package_identity as _identity
+
+    return _identity()
 
 
 def _merge_scale_into_stats(stats: Dict, page_data) -> None:
@@ -307,6 +348,8 @@ def _text_delivery_from_provenance(provenance_opts: Any) -> Dict[str, Any]:
 
 def _terminal_import_failures(config: Dict, stats: Dict, provenance_opts: Any) -> List[str]:
     """Return mandatory delivery failures that must make import_pdf fail closed."""
+    if bool(stats.get("cancelled")):
+        return []
     failures: List[str] = []
     report_error = str(stats.get("import_report_error") or "").strip()
     if report_error:
@@ -492,8 +535,17 @@ def write_import_report(
         "resolved_scale": stats.get("resolved_scale"),
         "scale_hints": stats.get("scale_hints"),
         "fallback_attempted": bool(fallback_attempted),
-        "result_status": "incomplete" if terminal_failure else "success",
+        "result_status": (
+            "cancelled"
+            if bool(stats.get("cancelled"))
+            else ("incomplete" if terminal_failure else "success")
+        ),
+        "package_identity": runtime_package_identity(),
     }
+    if stats.get("resume"):
+        extra["resume"] = dict(stats.get("resume") or {})
+    if stats.get("complexity"):
+        extra["complexity"] = dict(stats.get("complexity") or {})
     if terminal_failure:
         extra["terminal_failure"] = terminal_failure
     if int(text_delivery_summary["source_items"]) > 0:
@@ -2586,6 +2638,7 @@ def import_pdf(
     config: Optional[dict] = None,
     progress_callback: Optional[Callable[[float, str], None]] = None,
     context=None,
+    cancel_callback: Optional[Callable[[], bool]] = None,
 ) -> Dict[str, int]:
     """
     Import a PDF file into Blender. Main entry point.
@@ -2640,9 +2693,19 @@ def import_pdf(
                 pass
 
     def _progress(pct: float, msg: str):
+        keep_going = None
         if progress_callback:
-            progress_callback(pct, msg)
+            keep_going = progress_callback(pct, msg)
         _wm_progress(pct)
+        if keep_going is False:
+            return False
+        if cancel_callback is not None:
+            try:
+                if cancel_callback() is True:
+                    return False
+            except Exception:
+                pass
+        return True
 
     t_start = time.perf_counter()
     phase_timings_ms: Dict[str, float] = {}
@@ -2707,6 +2770,7 @@ def import_pdf(
 
         # 6. Determine pages to import
         page_indices = _parse_pages(config.get("pages", "all"), total_pages)
+        requested_page_indices = list(page_indices)
         phase_timings_ms["open_pdf_ms"] = (time.perf_counter() - t_phase) * 1000.0
         if not page_indices:
             doc.close()
@@ -2719,11 +2783,56 @@ def import_pdf(
                 "performance_phases": phase_timings_ms,
             }
 
-        # 7. Create root collection
+        from .import_session import (
+            ImportCancelledError,
+            build_resume_state,
+            load_resume_checkpoint,
+            resume_config_sha256,
+            write_resume_checkpoint,
+        )
+
+        source_sha256 = _sha256_path(filepath)
+        config_sha256 = resume_config_sha256(config)
+        checkpoint_path = str(config.get("resume_checkpoint_path") or "").strip()
+        if not checkpoint_path:
+            checkpoint_path = os.path.join(
+                tempfile.gettempdir(),
+                f"bc_bl_resume_{source_sha256[:12]}_{config_sha256[:12]}.json",
+            )
+        requested_page_numbers = [index + 1 for index in requested_page_indices]
+        resume_state = None
+        if bool(config.get("resume")):
+            resume_state = load_resume_checkpoint(
+                checkpoint_path,
+                source_sha256=source_sha256,
+                config_sha256=config_sha256,
+            )
+            if list(resume_state.get("requested_pages") or []) != requested_page_numbers:
+                raise ValueError("resume checkpoint page selection does not match this import")
+            remaining = set(int(page) for page in resume_state.get("remaining_pages") or [])
+            page_indices = [index for index in requested_page_indices if index + 1 in remaining]
+            if not page_indices:
+                raise ValueError("resume checkpoint has no unfinished pages")
+
+        # 7. Create or recover the root collection
         basename = os.path.splitext(os.path.basename(filepath))[0]
-        root_col = bpy.data.collections.new(f"PDF Import - {basename}")
-        bpy.context.scene.collection.children.link(root_col)
-        collections_created = 1  # root collection
+        if resume_state is not None:
+            root_name = str(resume_state.get("root_collection") or "")
+            try:
+                root_col = bpy.data.collections.get(root_name)
+            except (AttributeError, TypeError):
+                root_col = None
+            if root_col is None:
+                raise ValueError(
+                    "resume checkpoint root collection is missing from this Blender scene"
+                )
+            collections_created = int(
+                (resume_state.get("aggregate_stats") or {}).get("collections", 1) or 1
+            )
+        else:
+            root_col = bpy.data.collections.new(f"PDF Import - {basename}")
+            bpy.context.scene.collection.children.link(root_col)
+            collections_created = 1  # root collection
         text_delivery_enabled = (
             bool(import_cfg.import_text)
             and str(import_cfg.text_mode or "3d_text").strip().lower() != "none"
@@ -2757,6 +2866,7 @@ def import_pdf(
             "image_source_instances": 0,
             "inline_image_source_instances": 0,
             "image_composites": 0,
+            "raster_pages_imported": 0,
             "skipped_fill_only": 0,
             "recognition_skipped_pages": 0,
             "hidden_startup_cube": hidden_startup_cube,
@@ -2767,9 +2877,25 @@ def import_pdf(
             "raster_delivery_failures": [],
             "geometry_delivery_issues": [],
             "text_final_state_failures": [],
+            "cancelled": False,
         }
-        raster_pages_imported = 0
-        total_page_count = max(1, len(page_indices))
+        if resume_state is not None:
+            aggregate = dict(resume_state.get("aggregate_stats") or {})
+            for key, value in aggregate.items():
+                if key != "cancelled":
+                    total_stats[key] = value
+            total_stats["cancelled"] = False
+            prior_delivery = [
+                dict(item)
+                for item in list(resume_state.get("text_delivery_items") or [])
+                if isinstance(item, dict)
+            ]
+            if prior_delivery:
+                import_cfg._text_delivery_records = prior_delivery
+        raster_pages_imported = int(
+            total_stats.get("raster_pages_imported", 0) or 0
+        )
+        total_page_count = max(1, len(requested_page_indices))
         model3d_all_text = []
 
         def _page_progress(page_offset: int, stage: float) -> float:
@@ -2784,14 +2910,47 @@ def import_pdf(
             )
 
         # Multi-page stacking: shift each page downward by accumulated heights.
-        _page_stack_offset_m = 0.0
+        _page_stack_offset_m = float(
+            (resume_state or {}).get("next_stack_offset_m", 0.0) or 0.0
+        )
         _page_arrangement = _normalize_page_arrangement(config.get("page_arrangement"))
         _page_gap_ratio = _normalize_page_gap_ratio(config.get("page_gap_ratio"))
 
-        use_streaming = len(page_indices) > 1
+        use_streaming = len(page_indices) > 1 or resume_state is not None
         page_numbers = [idx + 1 for idx in page_indices]
         stream_cancelled = False
+        cancelled_page = None
+        completed_pages: List[int] = list(
+            (resume_state or {}).get("completed_pages", []) or []
+        )
         t_pages_phase = time.perf_counter()
+
+        def _current_resume_state() -> Dict[str, Any]:
+            delivery_items = [
+                dict(item)
+                for item in list(getattr(import_cfg, "_text_delivery_records", ()) or ())
+                if int(item.get("page", 0) or 0) in completed_pages
+            ]
+            aggregate_stats = {}
+            for key, value in total_stats.items():
+                if key == "parts_bootstrap_text_items":
+                    continue
+                try:
+                    json.dumps(value, allow_nan=False)
+                except (TypeError, ValueError):
+                    continue
+                aggregate_stats[key] = value
+            aggregate_stats["collections"] = collections_created
+            return build_resume_state(
+                source_sha256=source_sha256,
+                config_sha256=config_sha256,
+                requested_pages=requested_page_numbers,
+                completed_pages=completed_pages,
+                root_collection=str(getattr(root_col, "name", "") or ""),
+                next_stack_offset_m=_page_stack_offset_m,
+                aggregate_stats=aggregate_stats,
+                text_delivery_items=delivery_items,
+            )
 
         def _iter_pages_for_import():
             """Yield (loop_index, page_idx, page_num, page, page_data) per page."""
@@ -2808,16 +2967,22 @@ def import_pdf(
             if use_streaming:
                 def _on_stream_progress(prog):
                     nonlocal stream_cancelled
-                    _progress(
+                    keep_going = _progress(
                         _page_progress(prog.page_index - 1, 0.35),
                         f"Extracted page {prog.page_number}/{prog.total_pages}: "
                         f"{prog.primitive_count} primitives ({prog.elapsed_s:.1f}s)",
                     )
+                    if keep_going is False:
+                        stream_cancelled = True
+                        return False
                     if prog.over_budget:
-                        _progress(
+                        keep_going = _progress(
                             _page_progress(prog.page_index - 1, 0.38),
                             f"Page {prog.page_number} exceeded soft budget ({prog.elapsed_s:.1f}s)",
                         )
+                        if keep_going is False:
+                            stream_cancelled = True
+                            return False
                     return False if stream_cancelled else None
 
                 for loop_i, (page_num, page_data) in enumerate(
@@ -2839,7 +3004,12 @@ def import_pdf(
                 yield 0, page_idx, page_num, page, page_data
 
         for i, _page_idx, page_num, page, page_data in _iter_pages_for_import():
-            _progress(_page_progress(i, 0.05), f"Processing page {page_num}/{len(page_indices)}...")
+            if _progress(
+                _page_progress(i, 0.05),
+                f"Processing page {page_num}/{len(page_indices)}...",
+            ) is False:
+                cancelled_page = page_num
+                break
 
             import_mode = (import_cfg.import_mode or "auto").strip().lower()
 
@@ -2874,6 +3044,20 @@ def import_pdf(
             )
             total_stats["parts_bootstrap_text_items"].extend(page_data.text_items or [])
             model3d_all_text.extend(page_data.text_items or [])
+            complexity = estimate_import_complexity(
+                page_count=len(requested_page_indices),
+                primitive_count=int(total_stats.get("primitives", 0) or 0)
+                + len(page_data.primitives or []),
+                text_item_count=int(total_stats.get("text_source_spans", 0) or 0),
+                glyph_count=int(total_stats.get("text_glyph_estimate", 0) or 0),
+                text_mode=(
+                    str(import_cfg.text_mode or "none")
+                    if import_cfg.import_text
+                    else "none"
+                ),
+            )
+            total_stats["complexity"] = complexity
+            _progress(_page_progress(i, 0.40), complexity["message"])
 
             # 9c. Geometry cleanup (remove micro-segments)
             if import_cfg.cleanup_level != "conservative" or import_cfg.min_seg_len > 0:
@@ -2952,16 +3136,21 @@ def import_pdf(
                 t_phase = time.perf_counter()
                 def _geom_progress(frac, _i=i, _pn=page_num):
                     frac = max(0.0, min(1.0, float(frac)))
-                    _progress(
+                    return _progress(
                         _page_progress(_i, 0.72 + (0.10 * frac)),
                         f"Building geometry for page {_pn}... ({int(frac * 100)}%)",
                     )
-                page_stats = build_page(
-                    page_data,
-                    page_col,
-                    page_builder_config,
-                    progress_callback=_geom_progress,
-                )
+                try:
+                    page_stats = build_page(
+                        page_data,
+                        page_col,
+                        page_builder_config,
+                        progress_callback=_geom_progress,
+                    )
+                except ImportCancelledError:
+                    cancelled_page = page_num
+                    _discard_page_collection(page_col)
+                    break
                 _add_phase_ms("geometry_ms", t_phase)
 
             # 9h. Build text objects
@@ -2971,21 +3160,22 @@ def import_pdf(
                 t_phase = time.perf_counter()
                 def _text_progress(frac, _i=i, _pn=page_num):
                     frac = max(0.0, min(1.0, float(frac)))
-                    _progress(
+                    return _progress(
                         _page_progress(_i, 0.82 + (0.09 * frac)),
                         f"Building text for page {_pn}... ({int(frac * 100)}%)",
                     )
-                text_count = build_all_text(
-                    page_data.text_items,
-                    page_col,
-                    page_num,
-                    visual_style=visual_style,
-                    z_offset_m=text_z_offset_m,
-                    strict_text_fidelity=import_cfg.strict_text_fidelity,
-                    text_mode=import_cfg.text_mode,
-                    progress_callback=_text_progress,
-                    provenance_opts=import_cfg,
-                    terminal_raster_callback=(
+                try:
+                    text_count = build_all_text(
+                        page_data.text_items,
+                        page_col,
+                        page_num,
+                        visual_style=visual_style,
+                        z_offset_m=text_z_offset_m,
+                        strict_text_fidelity=import_cfg.strict_text_fidelity,
+                        text_mode=import_cfg.text_mode,
+                        progress_callback=_text_progress,
+                        provenance_opts=import_cfg,
+                        terminal_raster_callback=(
                         lambda text_item, collection, callback_page_number, item_id,
                         _page=page, _cfg=import_cfg, _dir=image_dir, _z=text_z_offset_m:
                         _render_text_item_raster(
@@ -3004,8 +3194,12 @@ def import_pdf(
                                 "hashed",
                             ),
                         )
-                    ),
-                )
+                        ),
+                    )
+                except ImportCancelledError:
+                    cancelled_page = page_num
+                    _discard_page_collection(page_col)
+                    break
                 _add_phase_ms("text_ms", t_phase)
 
             # 9i. Build image/raster planes
@@ -3120,9 +3314,10 @@ def import_pdf(
                 _add_phase_ms("images_ms", t_phase)
             if raster_page_delivered:
                 raster_pages_imported += 1
+                total_stats["raster_pages_imported"] = raster_pages_imported
 
             # 9j. Multi-page stacking: shift this page's collection downward
-            if len(page_indices) > 1 and _page_stack_offset_m != 0.0:
+            if len(requested_page_indices) > 1 and _page_stack_offset_m != 0.0:
                 _stack_page_objects(page_col.all_objects, _page_stack_offset_m)
             final_text_failures = _reverify_text_delivery_after_stack(
                 getattr(import_cfg, "_text_delivery_records", ()),
@@ -3154,18 +3349,41 @@ def import_pdf(
             total_stats["geometry_delivery_issues"].extend(
                 list(page_stats.get("geometry_delivery_issues") or [])
             )
+            completed_pages.append(page_num)
+            write_resume_checkpoint(checkpoint_path, _current_resume_state())
             _progress(
                 _page_progress(i, 1.0),
                 f"Finished page {page_num}/{len(page_indices)} "
                 f"({total_stats['primitives']} primitives, {total_stats['text_items']} text)",
             )
 
+        if stream_cancelled and cancelled_page is None:
+            unfinished = [page for page in requested_page_numbers if page not in completed_pages]
+            cancelled_page = unfinished[0] if unfinished else -1
+
+        if cancelled_page is not None:
+            total_stats["cancelled"] = True
+            resume_state = _current_resume_state()
+            total_stats["resume"] = resume_state
+            total_stats["resume_checkpoint_path"] = checkpoint_path
+            write_resume_checkpoint(checkpoint_path, resume_state)
+
         phase_timings_ms["pages_import_ms"] = (time.perf_counter() - t_pages_phase) * 1000.0
         t_phase = time.perf_counter()
         doc.close()
 
         elapsed = time.perf_counter() - t_start
-        _progress(1.0, "Import complete.")
+        if total_stats["cancelled"]:
+            _progress(
+                min(0.99, 0.10 + 0.75 * (len(completed_pages) / total_page_count)),
+                "Import cancelled safely; completed pages kept and resume checkpoint written.",
+            )
+        else:
+            _progress(1.0, "Import complete.")
+            try:
+                Path(checkpoint_path).unlink(missing_ok=True)
+            except OSError:
+                pass
         try:
             from .pdfcadcore.model3d_intent import analyze_model3d_intent
 
@@ -3202,7 +3420,7 @@ def import_pdf(
             pass
 
         # Merge extended stats into return dict
-        total_stats["pages"] = len(page_indices)
+        total_stats["pages"] = len(requested_page_indices)
         total_stats["collections"] = collections_created
         try:
             total_stats["focused"] = (

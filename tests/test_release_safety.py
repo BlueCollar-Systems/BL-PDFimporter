@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import datetime
+import hashlib
 import json
 import re
 import sys
@@ -396,6 +397,126 @@ class ReleaseSafetyTest:
         assert not rs.is_product_path("tools/release_safety.py")
         assert not rs.is_product_path("scripts/release_safety.py")
 
+    def test_existing_tag_without_release_builds_and_mints_from_tag(self):
+        plan = rs.plan_release_completion(
+            version="1.0.76",
+            head_sha="b" * 40,
+            tag_sha="a" * 40,
+            release_exists=False,
+        )
+        assert plan == {
+            "action": "complete_existing_tag",
+            "tag": "v1.0.76",
+            "build_ref": "a" * 40,
+            "release_target": "a" * 40,
+        }
+
+    def test_existing_release_is_verify_only_and_never_uploads(self):
+        plan = rs.plan_release_completion(
+            version="1.0.76",
+            head_sha="b" * 40,
+            tag_sha="a" * 40,
+            release_exists=True,
+        )
+        assert plan["action"] == "verify_existing_release"
+        assert plan["build_ref"] == "a" * 40
+
+    def test_new_tag_builds_and_mints_from_head(self):
+        plan = rs.plan_release_completion(
+            version="1.0.76",
+            head_sha="b" * 40,
+            tag_sha=None,
+            release_exists=False,
+        )
+        assert plan["action"] == "mint_new_tag"
+        assert plan["build_ref"] == "b" * 40
+
+    def test_draft_release_is_resumed_from_existing_tag(self):
+        plan = rs.plan_release_completion(
+            version="1.0.76",
+            head_sha="b" * 40,
+            tag_sha="a" * 40,
+            release_exists=True,
+            release_is_draft=True,
+        )
+        assert plan["action"] == "complete_draft_release"
+        assert plan["build_ref"] == "a" * 40
+
+    def test_release_asset_verification_is_idempotent_and_digest_bound(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            asset = Path(tmp) / "package.zip"
+            asset.write_bytes(b"immutable package")
+            digest = hashlib.sha256(asset.read_bytes()).hexdigest()
+            verified = rs.verify_release_assets(
+                [asset],
+                [{"name": asset.name, "size": asset.stat().st_size, "digest": f"sha256:{digest}"}],
+            )
+            assert verified == [{"name": asset.name, "size": 17, "sha256": digest}]
+
+            try:
+                rs.verify_release_assets(
+                    [asset],
+                    [{"name": asset.name, "size": asset.stat().st_size, "digest": "sha256:" + "0" * 64}],
+                )
+            except ValueError as exc:
+                assert "digest" in str(exc).lower()
+            else:
+                raise AssertionError("a mismatched immutable release asset was accepted")
+
+    def test_plan_release_cli_writes_stable_github_outputs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "github-output.txt"
+            code = rs.main([
+                "plan-release",
+                "--version", "1.0.76",
+                "--head-sha", "b" * 40,
+                "--tag-sha", "a" * 40,
+                "--release-state", "missing",
+                "--github-output", str(output),
+            ])
+            assert code == 0
+            assert output.read_text(encoding="utf-8").splitlines() == [
+                "action=complete_existing_tag",
+                "tag=v1.0.76",
+                "build_ref=" + "a" * 40,
+                "release_target=" + "a" * 40,
+            ]
+
+    def test_verify_release_assets_cli_writes_machine_readable_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            asset = root / "package.zip"
+            release_json = root / "release.json"
+            output = root / "verified.json"
+            asset.write_bytes(b"immutable package")
+            digest = hashlib.sha256(asset.read_bytes()).hexdigest()
+            release_json.write_text(
+                json.dumps({
+                    "assets": [{
+                        "name": asset.name,
+                        "size": asset.stat().st_size,
+                        "digest": f"sha256:{digest}",
+                    }]
+                }),
+                encoding="utf-8",
+            )
+
+            code = rs.main([
+                "verify-release-assets",
+                "--release-json", str(release_json),
+                "--asset", str(asset),
+                "--output", str(output),
+            ])
+
+            assert code == 0
+            assert json.loads(output.read_text(encoding="utf-8")) == {
+                "verified_assets": [{
+                    "name": asset.name,
+                    "size": asset.stat().st_size,
+                    "sha256": digest,
+                }]
+            }
+
     def test_collect_delta_accepts_explicit_head(self):
         git = fake_git_factory(
             files=["build_release.py"],
@@ -587,13 +708,29 @@ class ReleaseSafetyTest:
         assert '--head "$GITHUB_SHA"' in workflow
         assert "--mode release" in workflow
         assert '--summary "$GITHUB_STEP_SUMMARY"' in workflow
-        audit_at = workflow.index("release_safety.py audit-existing-tag")
+        assert "python tests/test_release_safety.py" in workflow
+        plan_at = re.search(r'release_safety\.py"? plan-release', workflow).start()
+        checkout_at = workflow.index('git checkout --detach "${{ steps.release_plan.outputs.build_ref }}"')
+        build_at = workflow.index("python build_release.py")
+        assert plan_at < checkout_at < build_at
+        assert 'BC_RELEASE_SOURCE_SHA: ${{ steps.release_plan.outputs.build_ref }}' in workflow
+        assert 'gh release create "$TAG" --verify-tag' in workflow
+        assert 'gh release upload "$TAG" "$ASSET"' in workflow
+        assert 'if ! gh release upload "$TAG" "$ASSET"' in workflow
+        assert 'if jq -e ".draft == false" "$RELEASE_JSON"' in workflow
+        assert 'if ! gh release edit "$TAG" --draft=false --latest' in workflow
+        verify_match = re.search(r'release_safety\.py"? verify-release-assets', workflow)
+        assert verify_match is not None
+        verify_at = verify_match.start()
+        publish_at = workflow.index('gh release edit "$TAG" --draft=false --latest')
+        assert verify_at < publish_at
+        assert 'jq -e ".immutable == true"' in workflow
+        audit_at = re.search(r'release_safety\.py"? audit-existing-tag', workflow).start()
         false_at = workflow.rfind('echo "minted=false"', 0, audit_at)
         assert false_at >= 0
         token_at = workflow.index("- name: Check website dispatch token secret")
         token_block = workflow[token_at : workflow.index("- name:", token_at + 8)]
         assert "if: steps.mint.outputs.minted == 'true'" in token_block
-        assert not re.search(r"^\s*gh release upload\b", workflow, re.MULTILINE)
         assert "--clobber" not in workflow
 
     def test_acknowledge_rejects_past_deferral(self):

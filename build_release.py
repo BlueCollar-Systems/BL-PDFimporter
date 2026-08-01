@@ -15,6 +15,8 @@ Output:
 """
 from __future__ import annotations
 
+import json
+import os
 import shutil
 import re
 import subprocess
@@ -97,6 +99,32 @@ def _write_deterministic_file(
     )
 
 
+def _write_deterministic_bytes(zf: ZipFile, data: bytes, archive_name: str) -> None:
+    info = ZipInfo(archive_name, date_time=_ZIP_TIMESTAMP)
+    info.compress_type = ZIP_DEFLATED
+    info.create_system = 3
+    info.external_attr = _ZIP_FILE_MODE << 16
+    zf.writestr(info, data, compress_type=ZIP_DEFLATED, compresslevel=9)
+
+
+def _release_source_commit() -> str:
+    for key in ("BC_RELEASE_SOURCE_SHA", "GITHUB_SHA"):
+        value = str(os.environ.get(key) or "").strip()
+        if re.fullmatch(r"[0-9a-fA-F]{40}", value):
+            return value.lower()
+    proc = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=str(ROOT),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    value = proc.stdout.strip()
+    if not re.fullmatch(r"[0-9a-fA-F]{40}", value):
+        raise RuntimeError("Could not resolve an exact 40-character release source SHA")
+    return value.lower()
+
+
 def _verify_vendored_pymupdf() -> None:
     """Ensure release ZIPs include their private offline runtimes."""
     _verify_vendored_runtime()
@@ -172,17 +200,41 @@ def main() -> int:
     release_files = []
     for path in PKG.rglob("*"):
         if path.is_file() and not _should_exclude(path):
-            release_files.append((path.relative_to(ROOT).as_posix(), path))
+            release_files.append((path.relative_to(ROOT).as_posix(), path.read_bytes()))
 
     for meta in ("README.md", "LICENSE", "THIRD_PARTY_NOTICES.md"):
         meta_path = ROOT / meta
         if meta_path.exists():
-            release_files.append((meta, meta_path))
+            release_files.append((meta, meta_path.read_bytes()))
+
+    from pdf_vector_importer.build_identity import create_release_identity
+
+    package_entries = [
+        (name, data)
+        for name, data in release_files
+        if name.startswith("pdf_vector_importer/")
+        and not name.endswith("/_release_identity.json")
+    ]
+    identity = create_release_identity(
+        importer_version=version,
+        source_commit=_release_source_commit(),
+        source_tag=f"v{version}",
+        package_entries=package_entries,
+    )
+    release_files = [
+        (name, data)
+        for name, data in release_files
+        if not name.endswith("/_release_identity.json")
+    ]
+    release_files.append((
+        "pdf_vector_importer/_release_identity.json",
+        (json.dumps(identity, indent=2, sort_keys=True) + "\n").encode("utf-8"),
+    ))
 
     release_files.sort(key=lambda item: item[0])
     with ZipFile(out_path, "w") as zf:
-        for archive_name, source_path in release_files:
-            _write_deterministic_file(zf, source_path, archive_name)
+        for archive_name, data in release_files:
+            _write_deterministic_bytes(zf, data, archive_name)
 
     print(f"Built: {out_path}  ({len(release_files)} files)")
     return 0

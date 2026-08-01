@@ -49,8 +49,14 @@ def _complete_modes():
 
 def _package_identity():
     return {
+        "schema": "bcs.blender.package_identity/1.0",
+        "status": "verified",
         "repo_root": "C:/synthetic/repo",
         "importer_version": "1.0.74",
+        "source_commit": "c" * 40,
+        "source_tag": "v1.0.74",
+        "package_sha256": "d" * 64,
+        "package_hash_kind": "installed_content_manifest_sha256",
         "modules": {
             "pdf_vector_importer.bl_import_engine": {
                 "path": "C:/synthetic/repo/pdf_vector_importer/bl_import_engine.py",
@@ -388,21 +394,33 @@ def test_result_gate_rejects_cross_representation_delivery(monkeypatch):
 
 def test_result_gate_requires_both_critical_module_identities(monkeypatch):
     driver = _load_driver(monkeypatch)
+    identity = _package_identity()
+    identity["modules"] = {
+        "pdf_vector_importer.bl_import_engine": identity["modules"][
+            "pdf_vector_importer.bl_import_engine"
+        ]
+    }
     results = {
         "modes": _complete_modes(),
-        "package_identity": {
-            "repo_root": "C:/synthetic/repo",
-            "importer_version": "1.0.74",
-            "modules": {
-                "pdf_vector_importer.bl_import_engine": {
-                    "path": "C:/synthetic/repo/pdf_vector_importer/bl_import_engine.py",
-                    "sha256": "a" * 64,
-                }
-            },
-        },
+        "package_identity": identity,
     }
 
     with pytest.raises(driver.AcceptanceResultError, match="critical module"):
+        driver._finalize_results(results)
+
+
+@pytest.mark.parametrize("missing", ["source_commit", "source_tag", "package_sha256"])
+def test_result_gate_requires_release_bound_identity(monkeypatch, missing):
+    driver = _load_driver(monkeypatch)
+    identity = _package_identity()
+    identity.pop(missing)
+    results = {
+        "modes": _complete_modes(),
+        "package_identity": identity,
+        "synthetic_page_number_contract": _synthetic_page_number_contract(),
+    }
+
+    with pytest.raises(driver.AcceptanceResultError, match="release identity"):
         driver._finalize_results(results)
 
 

@@ -11,7 +11,7 @@ from __future__ import annotations
 bl_info = {
     "name": "PDF Vector Importer",
     "author": "BlueCollar Systems",
-    "version": (1, 0, 75),
+    "version": (1, 0, 76),
     "blender": (3, 0, 0),
     "location": "File > Import > PDF Vector (.pdf)",
     "description": "Import PDF vector drawings as native Blender geometry",
@@ -30,6 +30,7 @@ def register():
     preferences.register()
 
     bpy.utils.register_class(preferences.PDFVectorImporterPreferences)
+    bpy.utils.register_class(operators.IMPORT_OT_pdf_vector_cancel)
     bpy.utils.register_class(operators.IMPORT_OT_pdf_vector)
     bpy.types.TOPBAR_MT_file_import.append(operators.menu_func_import)
 
@@ -49,6 +50,7 @@ def unregister():
 
     bpy.types.TOPBAR_MT_file_import.remove(operators.menu_func_import)
     bpy.utils.unregister_class(operators.IMPORT_OT_pdf_vector)
+    bpy.utils.unregister_class(operators.IMPORT_OT_pdf_vector_cancel)
     bpy.utils.unregister_class(preferences.PDFVectorImporterPreferences)
 
     preferences.unregister()

@@ -1,6 +1,6 @@
 # PDF Vector Importer for Blender
 
-[![Version](https://img.shields.io/badge/Version-1.0.75-blue.svg)]()
+[![Version](https://img.shields.io/badge/Version-1.0.76-blue.svg)]()
 
 **BUILT. NOT BOUGHT.** -- BlueCollar Systems
 
@@ -61,6 +61,16 @@ After enabling the addon:
 4. Click **Import PDF Vector**
 
 Geometry is grouped into collections by page and (optionally) by source layer or color.
+
+Long imports publish phase/page/object progress in Blender's status area and in
+`import_report.json`. The report includes a representation-aware complexity
+estimate (`work_units` and `tier`) so Geometry, Glyphs, and 3D Text requests are
+not presented as equivalent to flat Text. **Cancel Active PDF Import** requests
+cooperative cancellation at the next object heartbeat. The incomplete page is
+rolled back, completed pages remain, and an atomic source/config-bound checkpoint
+records exactly which pages remain. Enable **Resume Interrupted Import** on the
+same PDF and settings to continue in the existing root collection without
+duplicating completed pages.
 
 Choose the representation you actually need: **Text** is flat editable Blender
 `FONT`, **3D Text** is extruded editable `FONT`, **Glyphs** is fixed `CURVE`
@@ -172,7 +182,7 @@ python -m blender_pdf_vector_importer.batch_cli "C:\path\to\pdfs" --recursive --
 | Compression filters | Decoding is delegated to PyMuPDF. Malformed or non-standard compressed object streams may fail to parse |
 | Raster-only scans | Pure raster PDFs produce no vector geometry |
 | Clipped/XObject-heavy PDFs | Complex clip stacks and deeply nested form XObjects can produce partial geometry |
-| Very large PDFs | Documents with >10,000 primitives may cause slow import due to per-object dependency graph updates |
+| Very large PDFs | Documents with >10,000 primitives can remain slow because Blender creates/verifies native objects individually; use the reported complexity/progress, cooperative Cancel, and page-resume checkpoint |
 | Missing or malformed exact font programs | The affected item walks the reported structural ladder to a verified raster patch; an unverified terminal patch is a loud item failure |
 | PyMuPDF required | Release ZIPs bundle PyMuPDF; source/dev installs can use the preferences-panel installer |
 | Legacy hosts | Blender/Python combinations outside the listed compatibility matrix are expected-only until verified |
@@ -180,6 +190,11 @@ python -m blender_pdf_vector_importer.batch_cli "C:\path\to\pdfs" --recursive --
 ## Import report / scale trust
 
 Imports emit `import_report.json` (`bcs.import_report/1.1`) with optional `extra.resolved_scale`.
+
+Every report also records the exact Blender host version, source-PDF SHA-256,
+importer version/tag/source commit, installed-package content hash, and the
+absolute paths plus SHA-256 hashes of the critical engine/text modules under
+`extra.package_identity`.
 
 - Use `factor` only when `confidence >= 0.70` and `fallback_reason` is not `no_scale_detected`.
 - Otherwise treat scale as unknown.
