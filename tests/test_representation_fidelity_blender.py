@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import builtins
+from dataclasses import replace
 from io import BytesIO
 import math
 from hashlib import sha256
@@ -21,8 +22,10 @@ if "bpy" not in sys.modules:
             VectorFont=object,
         )
     )
+if "bmesh" not in sys.modules:
+    sys.modules["bmesh"] = types.SimpleNamespace()
 
-from pdf_vector_importer import bl_text_builder
+from pdf_vector_importer import bl_import_engine, bl_text_builder
 from pdf_vector_importer.pdfcadcore.primitives import NormalizedText, TextCharLayout
 from pdf_vector_importer.text_delivery import AttemptOutcome, deliver_item, fallback_ladder
 
@@ -609,6 +612,40 @@ def test_requested_mode_creates_distinct_verified_host_entity(
     assert delivery["fallback_used"] is False
     assert delivery["attempts"][-1]["entity_ids"] == [obj.name]
     assert fake.data.fonts.loaded
+
+
+def test_nonfirst_page_selection_delivers_every_selected_page_with_exact_counts(
+    monkeypatch,
+):
+    _fake, collection = _install(monkeypatch)
+    selected_page_numbers = [
+        index + 1 for index in bl_import_engine._parse_pages("2,4", total_pages=4)
+    ]
+    records = []
+
+    for page_number in selected_page_numbers:
+        opts = types.SimpleNamespace(import_mode="vector", text_mode="text")
+        item = _item(span_id=40 + page_number)
+        font_asset = types.SimpleNamespace(**vars(item.font_asset))
+        font_asset.page_number = page_number
+        item = replace(item, page_number=page_number, font_asset=font_asset)
+        obj = bl_text_builder.build_text(
+            item,
+            collection,
+            page_number=page_number,
+            text_mode="text",
+            provenance_opts=opts,
+        )
+        assert obj is not None
+        assert obj["pdf_source_item_id"] == f"page:{page_number}:text:{40 + page_number}"
+        records.append(opts._text_delivery_records[-1])
+
+    assert selected_page_numbers == [2, 4]
+    assert {
+        "source_items": len(selected_page_numbers),
+        "delivered_items": sum(record["status"] == "delivered" for record in records),
+        "failed_items": sum(record["status"] != "delivered" for record in records),
+    } == {"source_items": 2, "delivered_items": 2, "failed_items": 0}
 
 
 def test_character_positioned_3d_text_stays_3d_text_and_records_every_entity(monkeypatch):

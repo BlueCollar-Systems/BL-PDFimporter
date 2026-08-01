@@ -47,6 +47,37 @@ def _complete_modes():
     }
 
 
+def _package_identity():
+    return {
+        "repo_root": "C:/synthetic/repo",
+        "importer_version": "1.0.74",
+        "modules": {
+            "pdf_vector_importer.bl_import_engine": {
+                "path": "C:/synthetic/repo/pdf_vector_importer/bl_import_engine.py",
+                "sha256": "a" * 64,
+            },
+            "pdf_vector_importer.bl_text_builder": {
+                "path": "C:/synthetic/repo/pdf_vector_importer/bl_text_builder.py",
+                "sha256": "b" * 64,
+            },
+        },
+    }
+
+
+def _nonfirst_page_delivery():
+    return {
+        "requested_pages": "2,4",
+        "selected_page_numbers": [2, 4],
+        "source_items": 2,
+        "delivered_items": 2,
+        "failed_items": 0,
+        "pages": {
+            "2": {"source_items": 1, "delivered_items": 1, "failed_items": 0},
+            "4": {"source_items": 1, "delivered_items": 1, "failed_items": 0},
+        },
+    }
+
+
 def test_second_owner_is_refused_and_first_owner_lock_is_preserved(
     monkeypatch,
     tmp_path,
@@ -151,6 +182,29 @@ def test_result_gate_requires_complete_per_mode_metrics_and_identity(monkeypatch
 
     with pytest.raises(driver.AcceptanceResultError, match="glyphs"):
         driver._finalize_results(results)
+
+
+def test_result_gate_emits_exact_per_mode_counts_and_requires_page_2_plus_delivery(
+    monkeypatch,
+):
+    driver = _load_driver(monkeypatch)
+    results = {
+        "modes": _complete_modes(),
+        "package_identity": _package_identity(),
+        "nonfirst_page_delivery": _nonfirst_page_delivery(),
+    }
+
+    finalized = driver._finalize_results(results)
+
+    assert finalized["per_mode_counts"] == {
+        mode: {"source_items": 1, "delivered_items": 1, "failed_items": 0}
+        for mode in ("3d_text", "geometry", "glyphs", "labels", "raster", "text")
+    }
+    invalid = dict(results)
+    invalid["nonfirst_page_delivery"] = _nonfirst_page_delivery()
+    invalid["nonfirst_page_delivery"]["pages"]["4"]["delivered_items"] = 0
+    with pytest.raises(driver.AcceptanceResultError, match="non-first-page"):
+        driver._finalize_results(invalid)
 
 
 def test_result_gate_rejects_cross_representation_delivery(monkeypatch):

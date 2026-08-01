@@ -215,11 +215,17 @@ def _finalize_results(results: dict) -> dict:
     modes = results.get("modes")
     if not isinstance(modes, dict) or set(modes) != expected_modes:
         raise AcceptanceResultError("per-mode delivery metrics are incomplete")
+    per_mode_counts = {}
     for mode in sorted(expected_modes):
         record = modes[mode]
         source_items = int(record.get("source_items", 0) or 0)
         delivered_items = int(record.get("delivered_items", 0) or 0)
         failed_items = int(record.get("failed_items", 0) or 0)
+        per_mode_counts[mode] = {
+            "source_items": source_items,
+            "delivered_items": delivered_items,
+            "failed_items": failed_items,
+        }
         expected_final = "text" if mode == "labels" else mode
         if (
             record.get("requested_representation") != mode
@@ -248,7 +254,66 @@ def _finalize_results(results: dict) -> dict:
         raise AcceptanceResultError("package identity is incomplete")
     if not critical_modules.issubset(identity["modules"]):
         raise AcceptanceResultError("critical module identity is incomplete")
+
+    nonfirst = results.get("nonfirst_page_delivery")
+    if not isinstance(nonfirst, dict):
+        raise AcceptanceResultError("non-first-page delivery metrics are missing")
+    try:
+        selected_pages = [int(value) for value in nonfirst["selected_page_numbers"]]
+        page_records = nonfirst["pages"]
+        source_items = int(nonfirst["source_items"])
+        delivered_items = int(nonfirst["delivered_items"])
+        failed_items = int(nonfirst["failed_items"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise AcceptanceResultError(
+            "non-first-page delivery metrics are incomplete"
+        ) from exc
+    if (
+        not str(nonfirst.get("requested_pages") or "").strip()
+        or not selected_pages
+        or any(page_number <= 1 for page_number in selected_pages)
+        or len(set(selected_pages)) != len(selected_pages)
+        or not isinstance(page_records, dict)
+        or set(page_records) != {str(page_number) for page_number in selected_pages}
+    ):
+        raise AcceptanceResultError("non-first-page selection is incomplete")
+    page_source = page_delivered = page_failed = 0
+    for page_number in selected_pages:
+        record = page_records[str(page_number)]
+        try:
+            current_source = int(record["source_items"])
+            current_delivered = int(record["delivered_items"])
+            current_failed = int(record["failed_items"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise AcceptanceResultError(
+                f"non-first-page {page_number} delivery metrics are incomplete"
+            ) from exc
+        if (
+            current_source <= 0
+            or current_delivered != current_source
+            or current_failed != 0
+        ):
+            raise AcceptanceResultError(
+                f"non-first-page {page_number} delivery is incomplete: "
+                f"source={current_source} delivered={current_delivered} "
+                f"failed={current_failed}"
+            )
+        page_source += current_source
+        page_delivered += current_delivered
+        page_failed += current_failed
+    if (
+        (source_items, delivered_items, failed_items)
+        != (page_source, page_delivered, page_failed)
+        or source_items <= 0
+        or delivered_items != source_items
+        or failed_items != 0
+    ):
+        raise AcceptanceResultError(
+            "non-first-page aggregate delivery is incomplete: "
+            f"source={source_items} delivered={delivered_items} failed={failed_items}"
+        )
     finalized = dict(results)
+    finalized["per_mode_counts"] = per_mode_counts
     finalized["result_status"] = "success"
     return finalized
 
@@ -562,6 +627,62 @@ def main() -> None:
         "reason": label_record["attempts"][0]["reason"],
     }
     _remove_collection(label_collection)
+    _heartbeat_active_lease()
+
+    # Exercise production page-range parsing and item delivery for pages beyond
+    # the first without depending on a particular multi-page acceptance PDF.
+    nonfirst_requested_pages = "2,4"
+    nonfirst_page_numbers = [
+        page_index + 1
+        for page_index in bl_import_engine._parse_pages(
+            nonfirst_requested_pages,
+            total_pages=4,
+        )
+    ]
+    nonfirst_collection = _new_collection("Acceptance_nonfirst_pages")
+    nonfirst_page_records = {}
+    for nonfirst_page_number in nonfirst_page_numbers:
+        nonfirst_opts = types.SimpleNamespace(import_mode="vector", text_mode="text")
+        nonfirst_font_asset = replace(
+            exact_item.font_asset,
+            page_number=nonfirst_page_number,
+        )
+        nonfirst_item = replace(
+            exact_item,
+            id=9_100_000 + nonfirst_page_number,
+            page_number=nonfirst_page_number,
+            font_asset=nonfirst_font_asset,
+        )
+        nonfirst_obj = bl_text_builder.build_text(
+            nonfirst_item,
+            nonfirst_collection,
+            page_number=nonfirst_page_number,
+            text_mode="text",
+            provenance_opts=nonfirst_opts,
+            terminal_raster_callback=terminal_raster,
+        )
+        assert nonfirst_obj is not None and nonfirst_obj.type == "FONT"
+        nonfirst_record = nonfirst_opts._text_delivery_records[-1]
+        _assert_delivery(nonfirst_record, "text", "text")
+        assert nonfirst_obj["pdf_source_item_id"] == (
+            f"page:{nonfirst_page_number}:text:{nonfirst_item.id}"
+        )
+        nonfirst_page_records[str(nonfirst_page_number)] = {
+            "source_items": 1,
+            "delivered_items": 1,
+            "failed_items": 0,
+            "entity_id": nonfirst_obj.name,
+        }
+    results["nonfirst_page_delivery"] = {
+        "kind": "synthetic_page_selection_and_delivery",
+        "requested_pages": nonfirst_requested_pages,
+        "selected_page_numbers": nonfirst_page_numbers,
+        "source_items": len(nonfirst_page_numbers),
+        "delivered_items": len(nonfirst_page_records),
+        "failed_items": 0,
+        "pages": nonfirst_page_records,
+    }
+    _remove_collection(nonfirst_collection)
     _heartbeat_active_lease()
 
     fallback_collection = _new_collection("Acceptance_missing_font")
