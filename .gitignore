@@ -46,20 +46,10 @@ PDFTest*/
 Imported Evidence/
 **/Imported Evidence/
 
-# --- BCS corpus name-stem guard (extension-less leak, 2026-07-31) ---
-# Two leaked files were PDFs with no extension, so extension rules alone are
-# not enough. Match the owner's corpus by name stem as well.
-*TX_Alvord*
-*SCOMBINED*
-*Attachment-C-Drawings*
-*AWSWeldSymbolchart*
-*Welding-Symbol-Chart*
-*CMJ Report*
-alvord*
-Alvord*
-*plant_list*
-*Zoning-Map*
-* - Rev 0*
-*PDF with embedded images*
-PDF_Vector_Importer_Master_Bundle*/
+# --- Private corpus/evidence guard (extension-less files included) ---
+# Project-specific stems belong only in .git/info/exclude; never publish them
+# in tracked repository metadata.
+*[Pp][Rr][Ii][Vv][Aa][Tt][Ee][-_ ][Cc][Oo][Rr][Pp][Uu][Ss]*
+*[Pp][Rr][Ii][Vv][Aa][Tt][Ee][-_ ][Ff][Ii][Xx][Tt][Uu][Rr][Ee]*
+*[Cc][Oo][Nn][Ff][Ii][Dd][Ee][Nn][Tt][Ii][Aa][Ll][-_ ][Ee][Vv][Ii][Dd][Ee][Nn][Cc][Ee]*
 # Product assets are re-included where they legitimately ship.

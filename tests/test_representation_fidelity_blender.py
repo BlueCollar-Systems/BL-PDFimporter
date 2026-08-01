@@ -1200,7 +1200,7 @@ def test_exact_font_glyph_visibility_distinguishes_ink_from_empty_advance():
 
 
 def test_positioned_glyph_metrics_use_blender_font_bbox_normalization():
-    # R-B regression contract (owner drawing 1015, v1.0.66..v1.0.68):
+    # R-B private-fixture regression contract (v1.0.66..v1.0.68):
     # Blender/FreeType normalizes a loaded vector font so one data.size spans
     # the font's GLOBAL bounding-box height (head.yMax - head.yMin), not the
     # hhea ascender-descender line box. The disproved assumption

@@ -501,11 +501,12 @@ def _blender_font_normalization_extent(asset) -> int:
     Blender (via FreeType) normalizes an imported vector font by its GLOBAL
     font bounding-box height — head.yMax - head.yMin for sfnt fonts — not by
     units_per_em and not by hhea ascender-descender. Measured on Blender 5.2
-    with the owner drawing's embedded Arial subset: advance, ink width, and
+    with the private regression fixture's embedded Arial subset: advance,
+    ink width, and
     ink height all implied exactly 2794.0 units per data.size, matching the
     head bbox (em 2048, hhea asc-desc 2288). Deriving glyph scale from the
     ascender-descender box rendered every positioned character at 2288/2794 =
-    0.819 of its true size (R-B regression, hot 379 -> 497 on 1015).
+    0.819 of its true size (R-B private-fixture regression, hot 379 -> 497).
     """
     digest = str(getattr(asset, "usable_sha256", "") or "")
     cached = _FONT_NORMALIZATION_CACHE.get(digest)
