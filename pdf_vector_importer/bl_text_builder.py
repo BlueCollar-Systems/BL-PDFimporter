@@ -2035,18 +2035,9 @@ def _attempt_glyphs(
             if callable(clear):
                 clear()
         if not list(getattr(curve_data, "splines", []) or []):
-            return AttemptOutcome.impossible(
-                "evaluated_font_to_curve_capability_absent_for_item",
-                evidence={
-                    **_host_capability_evidence(
-                        item_id,
-                        page_number,
-                        int(text_item.id),
-                        "Object.to_curve",
-                    ),
-                    "capability_present": False,
-                    "detail": "glyph_curve_has_no_verified_splines",
-                },
+            return AttemptOutcome.failed(
+                "glyph_curve_has_no_verified_splines",
+                evidence={"item_id": item_id},
                 owned_artifacts=(
                     *_owned_artifacts_for_text_entity(obj, data),
                     _artifact(None, curve_data),
@@ -2098,16 +2089,10 @@ def _attempt_glyphs(
             *_owned_artifacts_for_text_entity(obj, data),
             *_owned_artifacts_for_text_entity(final, curve_data),
         )
-        return AttemptOutcome.impossible(
-            "evaluated_font_to_curve_capability_absent_for_item",
+        return AttemptOutcome.failed(
+            "glyph_curve_conversion_failed_not_impossibility_proof",
             evidence={
-                **_host_capability_evidence(
-                    item_id,
-                    page_number,
-                    int(text_item.id),
-                    "Object.to_curve",
-                ),
-                "capability_present": False,
+                "item_id": item_id,
                 "exception_type": type(exc).__name__,
                 "detail": str(exc),
             },
@@ -2181,18 +2166,9 @@ def _attempt_geometry(
         evaluated = obj.evaluated_get(depsgraph)
         mesh = mesh_factory(evaluated, depsgraph=depsgraph)
         if not list(getattr(mesh, "vertices", []) or []):
-            return AttemptOutcome.impossible(
-                "evaluated_font_to_mesh_capability_absent_for_item",
-                evidence={
-                    **_host_capability_evidence(
-                        item_id,
-                        page_number,
-                        int(text_item.id),
-                        "meshes.new_from_object",
-                    ),
-                    "capability_present": False,
-                    "detail": "geometry_mesh_has_no_verified_vertices",
-                },
+            return AttemptOutcome.failed(
+                "geometry_mesh_has_no_verified_vertices",
+                evidence={"item_id": item_id},
                 owned_artifacts=(
                     *_owned_artifacts_for_text_entity(obj, data),
                     _artifact(None, mesh),
@@ -2244,16 +2220,10 @@ def _attempt_geometry(
             *_owned_artifacts_for_text_entity(obj, data),
             *_owned_artifacts_for_text_entity(final, mesh),
         )
-        return AttemptOutcome.impossible(
-            "evaluated_font_to_mesh_capability_absent_for_item",
+        return AttemptOutcome.failed(
+            "geometry_mesh_conversion_failed_not_impossibility_proof",
             evidence={
-                **_host_capability_evidence(
-                    item_id,
-                    page_number,
-                    int(text_item.id),
-                    "meshes.new_from_object",
-                ),
-                "capability_present": False,
+                "item_id": item_id,
                 "exception_type": type(exc).__name__,
                 "detail": str(exc),
             },
