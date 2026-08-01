@@ -70,6 +70,73 @@ def _active_blender_process_ids() -> tuple[int, ...]:
     return tuple(sorted(set(pids)))
 
 
+class _ExternalCadHostLease:
+    """Read-only binding to the global lease acquired by the host controller."""
+
+    def __init__(self, path: Path, *, agent_id: str, owner_pid: int, token: str) -> None:
+        self.path = Path(path)
+        self.agent_id = str(agent_id)
+        self.owner_pid = int(owner_pid)
+        self.token = str(token)
+
+    @classmethod
+    def from_environment(cls, env: Mapping[str, str]) -> "_ExternalCadHostLease":
+        agent_id = str(env.get("BC_CAD_HOST_LEASE_AGENT_ID") or "").strip()
+        owner_pid_raw = str(env.get("BC_CAD_HOST_LEASE_OWNER_PID") or "").strip()
+        token = str(env.get("BC_CAD_HOST_LEASE_TOKEN") or "").strip()
+        if not agent_id or not owner_pid_raw or not token:
+            raise AcceptanceOwnershipError(
+                "global CAD-host lease is not bound; acquire it with the external "
+                "Q&A host-lock helper and export its agent, owner PID, and token"
+            )
+        try:
+            owner_pid = int(owner_pid_raw)
+        except ValueError as exc:
+            raise AcceptanceOwnershipError(
+                "global CAD-host lease owner PID is invalid"
+            ) from exc
+        if owner_pid <= 0:
+            raise AcceptanceOwnershipError("global CAD-host lease owner PID is invalid")
+        path = Path(
+            str(env.get("BC_CAD_HOST_GLOBAL_LOCK") or r"C:\TMP\CAD-HOST-GLOBAL.lock")
+        ).expanduser().resolve()
+        binding = cls(path, agent_id=agent_id, owner_pid=owner_pid, token=token)
+        binding.validate()
+        return binding
+
+    def validate(self) -> dict:
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError) as exc:
+            raise AcceptanceOwnershipError(
+                f"global CAD-host lease is missing or unreadable: {self.path}"
+            ) from exc
+        if not isinstance(payload, dict):
+            raise AcceptanceOwnershipError("global CAD-host lease schema is invalid")
+        try:
+            schema_version = int(payload.get("schema_version", -1))
+            payload_owner_pid = int(payload.get("owner_pid", -1))
+        except (TypeError, ValueError) as exc:
+            raise AcceptanceOwnershipError(
+                "global CAD-host lease schema is invalid"
+            ) from exc
+        if (
+            schema_version != 1
+            or not str(payload.get("purpose") or "").strip()
+            or not str(payload.get("started_at") or "").strip()
+            or not str(payload.get("heartbeat_at") or "").strip()
+        ):
+            raise AcceptanceOwnershipError("global CAD-host lease schema is incomplete")
+        if (
+            str(payload.get("host") or "").casefold() != "blender"
+            or str(payload.get("agent_id") or "") != self.agent_id
+            or payload_owner_pid != self.owner_pid
+            or str(payload.get("token") or "") != self.token
+        ):
+            raise AcceptanceOwnershipError("global CAD-host lease ownership changed")
+        return payload
+
+
 class _AcceptanceLease:
     def __init__(
         self,
@@ -162,18 +229,22 @@ class _AcceptanceLease:
 
 
 _ACTIVE_LEASE: Optional[_AcceptanceLease] = None
+_ACTIVE_EXTERNAL_LEASE: Optional[_ExternalCadHostLease] = None
 
 
 def _heartbeat_active_lease() -> None:
+    if _ACTIVE_EXTERNAL_LEASE is not None:
+        _ACTIVE_EXTERNAL_LEASE.validate()
     if _ACTIVE_LEASE is not None:
         _ACTIVE_LEASE.heartbeat()
 
 
 def _release_active_lease() -> None:
-    global _ACTIVE_LEASE
+    global _ACTIVE_LEASE, _ACTIVE_EXTERNAL_LEASE
     if _ACTIVE_LEASE is not None:
         _ACTIVE_LEASE.release()
         _ACTIVE_LEASE = None
+    _ACTIVE_EXTERNAL_LEASE = None
 
 
 def _package_identity(
@@ -255,28 +326,31 @@ def _finalize_results(results: dict) -> dict:
     if not critical_modules.issubset(identity["modules"]):
         raise AcceptanceResultError("critical module identity is incomplete")
 
-    nonfirst = results.get("nonfirst_page_delivery")
-    if not isinstance(nonfirst, dict):
-        raise AcceptanceResultError("non-first-page delivery metrics are missing")
+    synthetic = results.get("synthetic_page_number_contract")
+    if not isinstance(synthetic, dict):
+        raise AcceptanceResultError("synthetic page-number contract is missing")
     try:
-        selected_pages = [int(value) for value in nonfirst["selected_page_numbers"]]
-        page_records = nonfirst["pages"]
-        source_items = int(nonfirst["source_items"])
-        delivered_items = int(nonfirst["delivered_items"])
-        failed_items = int(nonfirst["failed_items"])
+        selected_pages = [int(value) for value in synthetic["synthetic_page_numbers"]]
+        page_records = synthetic["pages"]
+        source_items = int(synthetic["source_items"])
+        delivered_items = int(synthetic["delivered_items"])
+        failed_items = int(synthetic["failed_items"])
     except (KeyError, TypeError, ValueError) as exc:
         raise AcceptanceResultError(
-            "non-first-page delivery metrics are incomplete"
+            "synthetic page-number contract metrics are incomplete"
         ) from exc
     if (
-        not str(nonfirst.get("requested_pages") or "").strip()
+        synthetic.get("kind") != "synthetic_page_number_contract"
+        or synthetic.get("actual_page_extraction") is not False
+        or int(synthetic.get("source_fixture_page_number", -1)) != 1
+        or not str(synthetic.get("requested_pages") or "").strip()
         or not selected_pages
         or any(page_number <= 1 for page_number in selected_pages)
         or len(set(selected_pages)) != len(selected_pages)
         or not isinstance(page_records, dict)
         or set(page_records) != {str(page_number) for page_number in selected_pages}
     ):
-        raise AcceptanceResultError("non-first-page selection is incomplete")
+        raise AcceptanceResultError("synthetic page-number contract is mislabeled")
     page_source = page_delivered = page_failed = 0
     for page_number in selected_pages:
         record = page_records[str(page_number)]
@@ -286,7 +360,7 @@ def _finalize_results(results: dict) -> dict:
             current_failed = int(record["failed_items"])
         except (KeyError, TypeError, ValueError) as exc:
             raise AcceptanceResultError(
-                f"non-first-page {page_number} delivery metrics are incomplete"
+                f"synthetic page-number {page_number} metrics are incomplete"
             ) from exc
         if (
             current_source <= 0
@@ -294,7 +368,7 @@ def _finalize_results(results: dict) -> dict:
             or current_failed != 0
         ):
             raise AcceptanceResultError(
-                f"non-first-page {page_number} delivery is incomplete: "
+                f"synthetic page-number {page_number} stamping is incomplete: "
                 f"source={current_source} delivered={current_delivered} "
                 f"failed={current_failed}"
             )
@@ -309,7 +383,7 @@ def _finalize_results(results: dict) -> dict:
         or failed_items != 0
     ):
         raise AcceptanceResultError(
-            "non-first-page aggregate delivery is incomplete: "
+            "synthetic page-number aggregate is incomplete: "
             f"source={source_items} delivered={delivered_items} failed={failed_items}"
         )
     finalized = dict(results)
@@ -455,11 +529,14 @@ def _assert_character_delivery(record, expected_type: str, source_text: str):
 
 
 def main() -> None:
-    global _ACTIVE_LEASE
+    global _ACTIVE_LEASE, _ACTIVE_EXTERNAL_LEASE
     welding_path, raster_path = _args()
     repo_root = Path(__file__).resolve().parents[1]
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
+
+    external_lease = _ExternalCadHostLease.from_environment(os.environ)
+    _ACTIVE_EXTERNAL_LEASE = external_lease
 
     lock_path = Path(
         os.environ.get("BC_BL_ACCEPTANCE_LOCK")
@@ -629,60 +706,63 @@ def main() -> None:
     _remove_collection(label_collection)
     _heartbeat_active_lease()
 
-    # Exercise production page-range parsing and item delivery for pages beyond
-    # the first without depending on a particular multi-page acceptance PDF.
-    nonfirst_requested_pages = "2,4"
-    nonfirst_page_numbers = [
+    # Synthetic-only contract: exercise production range parsing and page-number
+    # provenance stamping by deliberately relabeling one page-1 source item.
+    # This is not evidence of page-2+ extraction from a multi-page PDF.
+    synthetic_requested_pages = "2,4"
+    synthetic_page_numbers = [
         page_index + 1
         for page_index in bl_import_engine._parse_pages(
-            nonfirst_requested_pages,
+            synthetic_requested_pages,
             total_pages=4,
         )
     ]
-    nonfirst_collection = _new_collection("Acceptance_nonfirst_pages")
-    nonfirst_page_records = {}
-    for nonfirst_page_number in nonfirst_page_numbers:
-        nonfirst_opts = types.SimpleNamespace(import_mode="vector", text_mode="text")
-        nonfirst_font_asset = replace(
+    synthetic_collection = _new_collection("Acceptance_synthetic_page_numbers")
+    synthetic_page_records = {}
+    for synthetic_page_number in synthetic_page_numbers:
+        synthetic_opts = types.SimpleNamespace(import_mode="vector", text_mode="text")
+        synthetic_font_asset = replace(
             exact_item.font_asset,
-            page_number=nonfirst_page_number,
+            page_number=synthetic_page_number,
         )
-        nonfirst_item = replace(
+        synthetic_item = replace(
             exact_item,
-            id=9_100_000 + nonfirst_page_number,
-            page_number=nonfirst_page_number,
-            font_asset=nonfirst_font_asset,
+            id=9_100_000 + synthetic_page_number,
+            page_number=synthetic_page_number,
+            font_asset=synthetic_font_asset,
         )
-        nonfirst_obj = bl_text_builder.build_text(
-            nonfirst_item,
-            nonfirst_collection,
-            page_number=nonfirst_page_number,
+        synthetic_obj = bl_text_builder.build_text(
+            synthetic_item,
+            synthetic_collection,
+            page_number=synthetic_page_number,
             text_mode="text",
-            provenance_opts=nonfirst_opts,
+            provenance_opts=synthetic_opts,
             terminal_raster_callback=terminal_raster,
         )
-        assert nonfirst_obj is not None and nonfirst_obj.type == "FONT"
-        nonfirst_record = nonfirst_opts._text_delivery_records[-1]
-        _assert_delivery(nonfirst_record, "text", "text")
-        assert nonfirst_obj["pdf_source_item_id"] == (
-            f"page:{nonfirst_page_number}:text:{nonfirst_item.id}"
+        assert synthetic_obj is not None and synthetic_obj.type == "FONT"
+        synthetic_record = synthetic_opts._text_delivery_records[-1]
+        _assert_delivery(synthetic_record, "text", "text")
+        assert synthetic_obj["pdf_source_item_id"] == (
+            f"page:{synthetic_page_number}:text:{synthetic_item.id}"
         )
-        nonfirst_page_records[str(nonfirst_page_number)] = {
+        synthetic_page_records[str(synthetic_page_number)] = {
             "source_items": 1,
             "delivered_items": 1,
             "failed_items": 0,
-            "entity_id": nonfirst_obj.name,
+            "entity_id": synthetic_obj.name,
         }
-    results["nonfirst_page_delivery"] = {
-        "kind": "synthetic_page_selection_and_delivery",
-        "requested_pages": nonfirst_requested_pages,
-        "selected_page_numbers": nonfirst_page_numbers,
-        "source_items": len(nonfirst_page_numbers),
-        "delivered_items": len(nonfirst_page_records),
+    results["synthetic_page_number_contract"] = {
+        "kind": "synthetic_page_number_contract",
+        "actual_page_extraction": False,
+        "source_fixture_page_number": 1,
+        "requested_pages": synthetic_requested_pages,
+        "synthetic_page_numbers": synthetic_page_numbers,
+        "source_items": len(synthetic_page_numbers),
+        "delivered_items": len(synthetic_page_records),
         "failed_items": 0,
-        "pages": nonfirst_page_records,
+        "pages": synthetic_page_records,
     }
-    _remove_collection(nonfirst_collection)
+    _remove_collection(synthetic_collection)
     _heartbeat_active_lease()
 
     fallback_collection = _new_collection("Acceptance_missing_font")

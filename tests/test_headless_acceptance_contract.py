@@ -64,10 +64,13 @@ def _package_identity():
     }
 
 
-def _nonfirst_page_delivery():
+def _synthetic_page_number_contract():
     return {
+        "kind": "synthetic_page_number_contract",
+        "actual_page_extraction": False,
+        "source_fixture_page_number": 1,
         "requested_pages": "2,4",
-        "selected_page_numbers": [2, 4],
+        "synthetic_page_numbers": [2, 4],
         "source_items": 2,
         "delivered_items": 2,
         "failed_items": 0,
@@ -121,6 +124,48 @@ def test_other_blender_process_refuses_before_creating_lock(monkeypatch, tmp_pat
         lease.acquire()
 
     assert not lock_path.exists()
+
+
+def test_external_global_cad_host_lease_is_required_and_revalidated(
+    monkeypatch,
+    tmp_path,
+):
+    driver = _load_driver(monkeypatch)
+    with pytest.raises(driver.AcceptanceOwnershipError, match="global CAD-host lease"):
+        driver._ExternalCadHostLease.from_environment({})
+
+    lock_path = tmp_path / "CAD-HOST-GLOBAL.lock"
+    payload = {
+        "schema_version": 1,
+        "host": "Blender",
+        "agent_id": "acceptance-owner",
+        "owner_pid": 101,
+        "purpose": "bounded representation acceptance",
+        "token": "global-token",
+        "started_at": "2026-08-01T11:00:00-05:00",
+        "heartbeat_at": "2026-08-01T11:00:00-05:00",
+    }
+    lock_path.write_text(json.dumps(payload), encoding="utf-8")
+    binding = driver._ExternalCadHostLease.from_environment(
+        {
+            "BC_CAD_HOST_GLOBAL_LOCK": str(lock_path),
+            "BC_CAD_HOST_LEASE_AGENT_ID": "acceptance-owner",
+            "BC_CAD_HOST_LEASE_OWNER_PID": "101",
+            "BC_CAD_HOST_LEASE_TOKEN": "global-token",
+        }
+    )
+
+    assert binding.validate()["token"] == "global-token"
+    payload["token"] = "replacement-token"
+    lock_path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(driver.AcceptanceOwnershipError, match="ownership changed"):
+        binding.validate()
+
+    payload["token"] = "global-token"
+    del payload["schema_version"]
+    lock_path.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(driver.AcceptanceOwnershipError, match="schema"):
+        binding.validate()
 
 
 def test_release_does_not_remove_lock_replaced_by_another_owner(monkeypatch, tmp_path):
@@ -184,14 +229,14 @@ def test_result_gate_requires_complete_per_mode_metrics_and_identity(monkeypatch
         driver._finalize_results(results)
 
 
-def test_result_gate_emits_exact_per_mode_counts_and_requires_page_2_plus_delivery(
+def test_result_gate_emits_exact_counts_and_labels_page_numbers_synthetic_only(
     monkeypatch,
 ):
     driver = _load_driver(monkeypatch)
     results = {
         "modes": _complete_modes(),
         "package_identity": _package_identity(),
-        "nonfirst_page_delivery": _nonfirst_page_delivery(),
+        "synthetic_page_number_contract": _synthetic_page_number_contract(),
     }
 
     finalized = driver._finalize_results(results)
@@ -201,9 +246,9 @@ def test_result_gate_emits_exact_per_mode_counts_and_requires_page_2_plus_delive
         for mode in ("3d_text", "geometry", "glyphs", "labels", "raster", "text")
     }
     invalid = dict(results)
-    invalid["nonfirst_page_delivery"] = _nonfirst_page_delivery()
-    invalid["nonfirst_page_delivery"]["pages"]["4"]["delivered_items"] = 0
-    with pytest.raises(driver.AcceptanceResultError, match="non-first-page"):
+    invalid["synthetic_page_number_contract"] = _synthetic_page_number_contract()
+    invalid["synthetic_page_number_contract"]["actual_page_extraction"] = True
+    with pytest.raises(driver.AcceptanceResultError, match="synthetic page-number"):
         driver._finalize_results(invalid)
 
 

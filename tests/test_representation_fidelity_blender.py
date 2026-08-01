@@ -614,7 +614,7 @@ def test_requested_mode_creates_distinct_verified_host_entity(
     assert fake.data.fonts.loaded
 
 
-def test_nonfirst_page_selection_delivers_every_selected_page_with_exact_counts(
+def test_synthetic_page_number_contract_relabels_page_1_fixture_truthfully(
     monkeypatch,
 ):
     _fake, collection = _install(monkeypatch)
@@ -627,6 +627,7 @@ def test_nonfirst_page_selection_delivers_every_selected_page_with_exact_counts(
         opts = types.SimpleNamespace(import_mode="vector", text_mode="text")
         item = _item(span_id=40 + page_number)
         font_asset = types.SimpleNamespace(**vars(item.font_asset))
+        assert item.page_number == 2
         font_asset.page_number = page_number
         item = replace(item, page_number=page_number, font_asset=font_asset)
         obj = bl_text_builder.build_text(
