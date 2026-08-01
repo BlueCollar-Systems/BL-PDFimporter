@@ -90,6 +90,8 @@ def safe_open(path: str, *, prefer_lib_dir: Optional[str] = None) -> Any:
         raise PdfOpenError("not_a_pdf", "This file is not a valid PDF.")
 
     fitz = import_fitz(prefer_lib_dir=prefer_lib_dir)
+    # Delegate the path to PyMuPDF. Modern Windows builds accept Unicode paths,
+    # and path-based opening avoids duplicating the complete PDF in memory.
     try:
         doc = fitz.open(pdf_path)
     except Exception as exc:  # noqa: BLE001 — normalize host-facing open failures
