@@ -87,15 +87,17 @@ erases a structural text request.
 ## Regression and host gates
 
 - `tests/test_blender_source_fidelity.py` locks exact source text, transforms,
-  font evidence, and both welding PDFs.
+  font evidence, and explicitly configured local acceptance PDFs.
+  Set `BCS_PDF_TEST_FILES` or `BCS_CORPUS_ROOT` for discovery and provide a
+  `BCS_BLENDER_FIDELITY_EXPECTATIONS` JSON object that maps PDF basenames to
+  expected source-span counts; the paths and expectations stay outside git.
 - `tests/test_representation_fidelity_blender.py` locks ladders, distinct host
   types, transform/dimension verification, exception handling, identity, and
   exact rollback.
 - `tests/test_terminal_raster_delivery_blender.py` locks real item clips,
   structural-text orthogonality, report payloads, and raster rollback.
 - `tools/headless_text_representation_acceptance.py` proves the representations
-  in real Blender against `Welding-Symbol-Chart.pdf` and
-  `AWSWeldSymbolchart.pdf`.
+  in real Blender against two explicitly supplied local acceptance PDFs.
 
 All required paths are local and free to the user. No paid service or paid
 dependency is a required representation or fallback.

@@ -114,6 +114,22 @@ def _positioned_delivery_record(character_entities):
     }
 
 
+def test_acceptance_args_do_not_echo_missing_local_paths(monkeypatch, tmp_path):
+    driver = _load_driver(monkeypatch)
+    first = tmp_path / "outlined-text.pdf"
+    second = tmp_path / "font-text.pdf"
+    monkeypatch.setattr(driver.sys, "argv", ["blender", "--", str(first), str(second)])
+
+    with pytest.raises(SystemExit) as exc_info:
+        driver._args()
+
+    message = str(exc_info.value)
+    assert "missing acceptance input" in message
+    assert tmp_path.as_posix() not in message
+    assert first.name not in message
+    assert second.name not in message
+
+
 def test_second_owner_is_refused_and_first_owner_lock_is_preserved(
     monkeypatch,
     tmp_path,

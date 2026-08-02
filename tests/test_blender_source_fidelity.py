@@ -1,6 +1,7 @@
 """Owner-directive gates for Blender source text, transforms, and fonts."""
 from __future__ import annotations
 
+import json
 import math
 import os
 from io import BytesIO
@@ -28,7 +29,7 @@ except ImportError:  # pragma: no cover
     import fitz  # type: ignore
 
 
-def _find_welding_pdf(filename: str) -> Path | None:
+def _find_acceptance_pdf(filename: str) -> Path | None:
     candidates = []
     configured = os.environ.get("BCS_PDF_TEST_FILES", "").strip()
     if configured:
@@ -39,19 +40,10 @@ def _find_welding_pdf(filename: str) -> Path | None:
         candidates.extend(
             (
                 corpus_root,
-                corpus_root / "PDFTest Files",
                 corpus_root / "pdfs",
                 corpus_root / "source-pdfs",
             )
         )
-    repository = Path(__file__).resolve().parents[1]
-    candidates.extend(
-        (
-            repository / "tests" / "fixtures",
-            repository / "test-data",
-            Path.home() / "Desktop" / "PDFTest Files",
-        )
-    )
     seen = set()
     for root in candidates:
         key = str(root.resolve(strict=False)).lower()
@@ -64,12 +56,45 @@ def _find_welding_pdf(filename: str) -> Path | None:
     return None
 
 
-def test_welding_pdf_discovery_uses_configured_portable_root(monkeypatch, tmp_path):
-    fixture = tmp_path / "AWSWeldSymbolchart.pdf"
+def _configured_source_fidelity_cases() -> tuple[tuple[str, int], ...]:
+    raw = os.environ.get("BCS_BLENDER_FIDELITY_EXPECTATIONS", "").strip()
+    if not raw:
+        return ()
+    payload = json.loads(raw)
+    if not isinstance(payload, dict):
+        raise ValueError("BCS_BLENDER_FIDELITY_EXPECTATIONS must be a JSON object")
+    cases = []
+    for filename, expected_spans in payload.items():
+        name = str(filename or "").strip()
+        if not name or Path(name).name != name or not name.casefold().endswith(".pdf"):
+            raise ValueError("fidelity expectation keys must be PDF basenames")
+        if isinstance(expected_spans, bool) or not isinstance(expected_spans, int):
+            raise ValueError("fidelity expectation values must be integer span counts")
+        if expected_spans < 0:
+            raise ValueError("fidelity expectation span counts must be non-negative")
+        cases.append((name, expected_spans))
+    return tuple(sorted(cases))
+
+
+def test_acceptance_pdf_discovery_uses_explicit_portable_root(monkeypatch, tmp_path):
+    fixture = tmp_path / "outlined-text-fixture.pdf"
     fixture.write_bytes(b"%PDF-1.7\n")
     monkeypatch.setenv("BCS_PDF_TEST_FILES", str(tmp_path))
 
-    assert _find_welding_pdf(fixture.name) == fixture
+    assert _find_acceptance_pdf(fixture.name) == fixture
+
+
+def test_pdf_discovery_does_not_probe_implicit_local_paths(monkeypatch, tmp_path):
+    fixture_name = "outlined-text-fixture.pdf"
+    fake_test_path = tmp_path / "repository" / "tests" / Path(__file__).name
+    implicit_fixture = fake_test_path.parents[1] / "tests" / "fixtures" / fixture_name
+    implicit_fixture.parent.mkdir(parents=True)
+    implicit_fixture.write_bytes(b"%PDF-1.7\n")
+    monkeypatch.setitem(globals(), "__file__", str(fake_test_path))
+    monkeypatch.delenv("BCS_PDF_TEST_FILES", raising=False)
+    monkeypatch.delenv("BCS_CORPUS_ROOT", raising=False)
+
+    assert _find_acceptance_pdf(fixture_name) is None
 
 
 def test_page_font_inventory_failure_is_bound_to_each_span_and_not_absence():
@@ -748,18 +773,15 @@ def test_crop_rotate_and_userunit_use_page_rect_exactly(tmp_path):
 
 @pytest.mark.parametrize(
     ("filename", "expected_spans"),
-    [
-        ("AWSWeldSymbolchart.pdf", 0),
-        ("Welding-Symbol-Chart.pdf", 372),
-    ],
+    _configured_source_fidelity_cases(),
 )
-def test_welding_pdfs_preserve_source_truth_and_item_font_evidence(
+def test_configured_pdfs_preserve_source_truth_and_item_font_evidence(
     filename: str,
     expected_spans: int,
 ):
-    pdf_path = _find_welding_pdf(filename)
+    pdf_path = _find_acceptance_pdf(filename)
     if pdf_path is None:
-        pytest.skip(f"welding PDF fixture missing: {filename}")
+        pytest.skip(f"configured PDF fixture missing: {filename}")
 
     doc = fitz.open(str(pdf_path))
     try:

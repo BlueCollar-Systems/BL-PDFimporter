@@ -3,7 +3,7 @@
 Run with Blender, not CPython::
 
     blender --background --python tools/headless_text_representation_acceptance.py -- \
-        Welding-Symbol-Chart.pdf AWSWeldSymbolchart.pdf
+        outlined-text.pdf font-text.pdf
 """
 from __future__ import annotations
 
@@ -436,10 +436,10 @@ def _finalize_results(results: dict) -> dict:
 def _args() -> tuple[Path, Path]:
     values = sys.argv[sys.argv.index("--") + 1 :] if "--" in sys.argv else []
     if len(values) != 2:
-        raise SystemExit("expected Welding-Symbol-Chart.pdf and AWSWeldSymbolchart.pdf")
+        raise SystemExit("expected two local PDF paths")
     paths = tuple(Path(value).expanduser().resolve() for value in values)
     if not all(path.is_file() for path in paths):
-        raise SystemExit(f"missing acceptance input: {paths!r}")
+        raise SystemExit("missing acceptance input; verify both configured paths")
     return paths  # type: ignore[return-value]
 
 
