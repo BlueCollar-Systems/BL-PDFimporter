@@ -117,6 +117,10 @@ class _TextPixmap:
 
 
 class _TransparentTextPixmap(_TextPixmap):
+    width = 4
+    height = 4
+    n = 4
+    alpha = 1
     samples = b"\x00" * 64
 
     def save(self, path):
@@ -136,6 +140,16 @@ class _TransparentTextRasterPage(_TextRasterPage):
     def get_pixmap(self, **kwargs):
         self.calls.append(kwargs)
         return _TransparentTextPixmap()
+
+
+class _TransparentWhiteTextPixmap(_TransparentTextPixmap):
+    samples = b"\xff\xff\xff\x00" * 16
+
+
+class _TransparentWhiteTextRasterPage(_TextRasterPage):
+    def get_pixmap(self, **kwargs):
+        self.calls.append(kwargs)
+        return _TransparentWhiteTextPixmap()
 
 
 class _RotatedTextRasterPage(_TextRasterPage):
@@ -525,8 +539,130 @@ def test_whitespace_terminal_raster_accepts_verified_exact_transparent_clip(
     assert captured[0]["source_bbox_pdf"] == list(source_bbox)
     assert captured[0]["source_render_clip_pdf"] == list(source_bbox)
     assert captured[0]["source_expected_transparent"] is True
+    assert captured[0]["source_transparent_normalized"] is True
     assert expected["pdf_raster_expected_transparent"] is True
-    assert Path(captured[0]["path"]).read_bytes() == b"verified-transparent-png"
+    assert expected["pdf_raster_transparent_normalized"] is True
+    transparent_pixmap = fitz.Pixmap(captured[0]["path"])
+    assert transparent_pixmap.width == 1
+    assert transparent_pixmap.height == 1
+    assert transparent_pixmap.alpha == 1
+    assert bytes(transparent_pixmap.samples) == b"\x00\x00\x00\x00"
+    assert (
+        Path(captured[0]["path"]).read_bytes()
+        == bl_import_engine._BLENDER_SAFE_TRANSPARENT_PNG
+    )
+
+
+def test_whitespace_terminal_raster_uses_blender_safe_equivalent_transparent_png(
+    monkeypatch,
+    tmp_path,
+):
+    page = _TransparentTextRasterPage()
+    text_item = types.SimpleNamespace(
+        id=44,
+        text=" ",
+        source_bbox_pdf=(34.0, 50.0, 37.0, 68.0),
+        bbox=(12.0, 24.0, 13.0, 30.0),
+    )
+    expected = _RasterObject()
+
+    def _accept_only_blender_safe_transparent_png(placement, *_args, **_kwargs):
+        pixmap = fitz.Pixmap(placement["path"])
+        if (
+            Path(placement["path"]).read_bytes()
+            == bl_import_engine._BLENDER_SAFE_TRANSPARENT_PNG
+            and pixmap.width == 1
+            and pixmap.height == 1
+            and pixmap.alpha == 1
+            and not any(bytes(pixmap.samples)[3::4])
+        ):
+            return expected
+        return None
+
+    monkeypatch.setattr(
+        bl_import_engine,
+        "_create_image_plane",
+        _accept_only_blender_safe_transparent_png,
+    )
+
+    actual = bl_import_engine._render_text_item_raster(
+        page,
+        text_item,
+        object(),
+        page_num=2,
+        item_id="page:2:text:44",
+        import_cfg=types.SimpleNamespace(raster_dpi=300),
+        image_dir=str(tmp_path),
+    )
+
+    assert actual is expected
+    assert expected["pdf_raster_expected_transparent"] is True
+    assert expected["pdf_raster_transparent_normalized"] is True
+
+
+def test_whitespace_terminal_raster_proves_transparency_from_alpha_not_rgb(
+    monkeypatch,
+    tmp_path,
+):
+    expected = _RasterObject()
+
+    def _accept_only_canonical(placement, *_args, **_kwargs):
+        return (
+            expected
+            if Path(placement["path"]).read_bytes()
+            == bl_import_engine._BLENDER_SAFE_TRANSPARENT_PNG
+            else None
+        )
+
+    monkeypatch.setattr(bl_import_engine, "_create_image_plane", _accept_only_canonical)
+
+    actual = bl_import_engine._render_text_item_raster(
+        _TransparentWhiteTextRasterPage(),
+        types.SimpleNamespace(
+            id=45,
+            text="\t",
+            source_bbox_pdf=(34.0, 50.0, 37.0, 68.0),
+            bbox=(12.0, 24.0, 13.0, 30.0),
+        ),
+        object(),
+        page_num=2,
+        item_id="page:2:text:45",
+        import_cfg=types.SimpleNamespace(raster_dpi=300),
+        image_dir=str(tmp_path),
+    )
+
+    assert actual is expected
+
+
+def test_nontransparent_whitespace_terminal_raster_preserves_exact_clip(monkeypatch, tmp_path):
+    captured = []
+    expected = _RasterObject()
+    monkeypatch.setattr(
+        bl_import_engine,
+        "_create_image_plane",
+        lambda placement, *_args, **_kwargs: captured.append(dict(placement))
+        or expected,
+    )
+
+    actual = bl_import_engine._render_text_item_raster(
+        _TextRasterPage(),
+        types.SimpleNamespace(
+            id=46,
+            text=" ",
+            source_bbox_pdf=(34.0, 50.0, 37.0, 68.0),
+            bbox=(12.0, 24.0, 13.0, 30.0),
+        ),
+        object(),
+        page_num=2,
+        item_id="page:2:text:46",
+        import_cfg=types.SimpleNamespace(raster_dpi=300),
+        image_dir=str(tmp_path),
+    )
+
+    assert actual is expected
+    assert Path(captured[0]["path"]).read_bytes() == b"verified-png"
+    assert captured[0]["source_transparent_normalized"] is False
+    assert expected["pdf_raster_transparent_normalized"] is False
 
 
 def test_visible_text_terminal_raster_rejects_transparent_clip(monkeypatch, tmp_path):

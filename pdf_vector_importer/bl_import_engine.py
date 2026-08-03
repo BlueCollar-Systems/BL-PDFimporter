@@ -43,6 +43,14 @@ _AUTO_RECOGNITION_PRIMITIVE_LIMIT = 20_000
 _AUTO_RECOGNITION_TEXT_LIMIT = 3_000
 _AUTO_RECOGNITION_PAGE_AREA_MM2_LIMIT = 12_000_000.0
 _INLINE_IMAGE_COMPOSITE_THRESHOLD = 256
+# Canonical 1x1 RGBA PNG: transparent white (255, 255, 255, 0).  A PDF
+# whitespace span whose exact clip has zero alpha at every pixel is visually empty;
+# using this equivalent payload avoids host image-loader failures on larger
+# all-zero RGBA PNGs without expanding the clip into neighbouring artwork.
+_BLENDER_SAFE_TRANSPARENT_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4//8/"
+    "AwAI/AL+p5qgoAAAAABJRU5ErkJggg=="
+)
 
 
 class IncompleteImportError(RuntimeError):
@@ -1725,6 +1733,30 @@ def _raise_for_incomplete_raster_cleanup(*results: Dict[str, Any]) -> None:
         raise RuntimeError(f"terminal raster attempt cleanup failed: {incomplete!r}")
 
 
+def _pixmap_is_fully_transparent(pix, samples: bytes) -> bool:
+    """Prove that every rendered pixel has zero alpha without trusting RGB."""
+    if not samples or not bool(getattr(pix, "alpha", False)):
+        return False
+    try:
+        width = int(getattr(pix, "width", 0) or 0)
+        height = int(getattr(pix, "height", 0) or 0)
+        channels = int(getattr(pix, "n", 0) or 0)
+        stride = int(getattr(pix, "stride", 0) or (width * channels))
+    except (TypeError, ValueError):
+        return False
+    if width <= 0 or height <= 0 or channels <= 0 or stride < width * channels:
+        return False
+    if len(samples) < stride * height:
+        return False
+    alpha_offset = channels - 1
+    for row in range(height):
+        start = (row * stride) + alpha_offset
+        stop = (row * stride) + (width * channels)
+        if any(samples[start:stop:channels]):
+            return False
+    return True
+
+
 def _render_text_item_raster(
     page,
     text_item,
@@ -1796,9 +1828,13 @@ def _render_text_item_raster(
         if int(getattr(pix, "width", 0) or 0) <= 0 or int(getattr(pix, "height", 0) or 0) <= 0:
             return None
         samples = bytes(getattr(pix, "samples", b"") or b"")
-        if not samples or (not any(samples) and not source_expected_transparent):
+        fully_transparent = _pixmap_is_fully_transparent(pix, samples)
+        if not samples or (fully_transparent and not source_expected_transparent):
             return None
-        pix.save(image_path)
+        if source_expected_transparent and fully_transparent:
+            Path(image_path).write_bytes(_BLENDER_SAFE_TRANSPARENT_PNG)
+        else:
+            pix.save(image_path)
         if not os.path.isfile(image_path) or os.path.getsize(image_path) <= 0:
             return None
     except (RuntimeError, OSError, ValueError, TypeError):
@@ -1819,6 +1855,9 @@ def _render_text_item_raster(
         "source_render_clip_pdf": render_clip,
         "source_item_id": str(item_id),
         "source_expected_transparent": source_expected_transparent,
+        "source_transparent_normalized": bool(
+            source_expected_transparent and fully_transparent
+        ),
     }
     try:
         # A terminal fallback is an isolated delivery attempt. Its image,
@@ -1842,6 +1881,9 @@ def _render_text_item_raster(
         )
         obj["pdf_raster_dpi"] = dpi
         obj["pdf_raster_expected_transparent"] = source_expected_transparent
+        obj["pdf_raster_transparent_normalized"] = bool(
+            placement["source_transparent_normalized"]
+        )
     except Exception:
         plane_cleanup = _remove_created_image_plane(obj, collection)
         file_cleanup = (
