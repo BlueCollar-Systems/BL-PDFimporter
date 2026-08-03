@@ -175,6 +175,24 @@ def _prune_vendored_pymupdf() -> None:
         if path.exists():
             shutil.rmtree(path)
 
+    launcher = _VENDORED_LIB / "bin" / "pymupdf.exe"
+    if launcher.exists():
+        launcher.unlink()
+    if launcher.parent.is_dir() and not any(launcher.parent.iterdir()):
+        launcher.parent.rmdir()
+
+    for record in _VENDORED_LIB.glob("pymupdf-*.dist-info/RECORD"):
+        lines = record.read_text(encoding="utf-8").splitlines()
+        kept = []
+        for line in lines:
+            entry = line.partition(",")[0].replace("\\", "/").casefold()
+            if entry.endswith("/bin/pymupdf.exe") or entry == "bin/pymupdf.exe":
+                continue
+            kept.append(line)
+        with record.open("w", encoding="utf-8", newline="\n") as stream:
+            for line in kept:
+                stream.write(f"{line}\n")
+
 
 def _verify_vendored_runtime() -> None:
     missing = [path for path in _REQUIRED_RUNTIME_FILES if not path.exists()]

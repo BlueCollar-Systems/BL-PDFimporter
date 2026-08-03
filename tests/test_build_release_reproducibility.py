@@ -20,6 +20,31 @@ def test_release_excludes_environment_bound_runtime_metadata(tmp_path: Path) -> 
     )
 
 
+def test_prune_removes_launcher_and_its_record_entry(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    vendored = tmp_path / "lib"
+    launcher = vendored / "bin" / "pymupdf.exe"
+    record = vendored / "pymupdf-1.27.2.3.dist-info" / "RECORD"
+    launcher.parent.mkdir(parents=True)
+    record.parent.mkdir(parents=True)
+    launcher.write_bytes(b"machine-bound launcher")
+    record.write_text(
+        "../../bin/pymupdf.exe,sha256=local,123\n"
+        "pymupdf/__init__.py,sha256=portable,456\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(build_release, "_VENDORED_LIB", vendored)
+
+    build_release._prune_vendored_pymupdf()
+
+    assert not launcher.exists()
+    assert record.read_text(encoding="utf-8") == (
+        "pymupdf/__init__.py,sha256=portable,456\n"
+    )
+
+
 def test_release_zip_is_identical_after_source_mtimes_change(
     monkeypatch,
     tmp_path: Path,

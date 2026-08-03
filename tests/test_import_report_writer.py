@@ -20,10 +20,67 @@ if "bmesh" not in sys.modules:
 
 from pdf_vector_importer.bl_import_engine import write_import_report  # noqa: E402
 from pdf_vector_importer import bl_info  # noqa: E402
-from pdf_vector_importer.pdfcadcore.import_report import ImportReport  # noqa: E402
+from pdf_vector_importer.pdfcadcore.import_report import (  # noqa: E402
+    ImportReport,
+    build_import_contract_ready,
+    build_import_report,
+)
 
 
 class TestImportReportWriter(unittest.TestCase):
+    def test_clean_scale_evaluation_is_explicit_and_contract_ready(self) -> None:
+        report = build_import_report(
+            host_app="blender",
+            importer_version="1.0.78",
+            pdf_path="drawing.pdf",
+            mode="vector",
+            pages=1,
+            primitive_count=40,
+            import_text=False,
+            text_mode="none",
+            extra={
+                "resolved_scale": {
+                    "factor": 24.0,
+                    "notation": '1/2" = 1\'-0"',
+                    "source": "titleblock",
+                    "confidence": 0.98,
+                    "fallback_reason": "",
+                },
+                "scale_hints": {
+                    "title_block_detected": True,
+                    "dimension_count": 4,
+                    "alternate_scale_factors": [24.0],
+                },
+            },
+        )
+
+        extra = report.to_dict()["extra"]
+        self.assertEqual(
+            extra["scale_crosscheck"],
+            {"level": "ok", "reasons": [], "messages": []},
+        )
+        self.assertTrue(extra["import_contract_ready"]["ready"])
+        self.assertTrue(
+            extra["import_contract_ready"]["checks"]["scale_crosscheck"]
+        )
+
+    def test_malformed_scale_evaluation_remains_fail_closed(self) -> None:
+        report = build_import_report(
+            host_app="blender",
+            importer_version="1.0.78",
+            pdf_path="drawing.pdf",
+            mode="vector",
+            primitive_count=40,
+            import_text=False,
+            text_mode="none",
+        )
+        report.extra["scale_crosscheck"] = None
+
+        ready = build_import_contract_ready(report)
+
+        self.assertFalse(ready["ready"])
+        self.assertFalse(ready["checks"]["scale_crosscheck"])
+
     def test_write_import_report_records_raster_fallback_reason(self) -> None:
         with tempfile.TemporaryDirectory(prefix="bl_import_report_") as tmp:
             report_path = Path(tmp) / "import_report.json"
