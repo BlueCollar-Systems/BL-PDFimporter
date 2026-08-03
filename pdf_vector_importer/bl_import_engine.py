@@ -1766,6 +1766,10 @@ def _render_text_item_raster(
         import fitz  # type: ignore
 
     dpi = int(max(36, getattr(import_cfg, "raster_dpi", 300) or 300))
+    source_text = getattr(text_item, "text", None)
+    source_expected_transparent = bool(
+        isinstance(source_text, str) and source_text and not source_text.strip()
+    )
     matrix = fitz.Matrix(dpi / 72.0, dpi / 72.0)
     clip = fitz.Rect(sx0, sy0, sx1, sy1)
     try:
@@ -1792,7 +1796,7 @@ def _render_text_item_raster(
         if int(getattr(pix, "width", 0) or 0) <= 0 or int(getattr(pix, "height", 0) or 0) <= 0:
             return None
         samples = bytes(getattr(pix, "samples", b"") or b"")
-        if not samples or not any(samples):
+        if not samples or (not any(samples) and not source_expected_transparent):
             return None
         pix.save(image_path)
         if not os.path.isfile(image_path) or os.path.getsize(image_path) <= 0:
@@ -1814,6 +1818,7 @@ def _render_text_item_raster(
         "source_bbox_pdf": [sx0, sy0, sx1, sy1],
         "source_render_clip_pdf": render_clip,
         "source_item_id": str(item_id),
+        "source_expected_transparent": source_expected_transparent,
     }
     try:
         # A terminal fallback is an isolated delivery attempt. Its image,
@@ -1836,6 +1841,7 @@ def _render_text_item_raster(
             placement["source_render_clip_pdf"]
         )
         obj["pdf_raster_dpi"] = dpi
+        obj["pdf_raster_expected_transparent"] = source_expected_transparent
     except Exception:
         plane_cleanup = _remove_created_image_plane(obj, collection)
         file_cleanup = (

@@ -40,13 +40,13 @@ except ImportError:  # pragma: no cover
 
 def _bom_text_items() -> list[NormalizedText]:
     return [
-        NormalizedText(1, "1017FR1", "1017FR1", insertion=(10, 100), page_number=1),
-        NormalizedText(2, "1", "1", insertion=(20, 100), page_number=1),
-        NormalizedText(3, "W12X30", "W12X30", insertion=(30, 100), page_number=1),
-        NormalizedText(4, "13'-11 1/4\"", "13'-11 1/4\"", insertion=(40, 100), page_number=1),
-        NormalizedText(5, "417", "417", insertion=(50, 100), page_number=1),
-        NormalizedText(6, "GALV.", "GALV.", insertion=(60, 100), page_number=1),
-        NormalizedText(7, "A992", "A992", insertion=(70, 100), page_number=1),
+        NormalizedText(1, "ZX490Q2", "ZX490Q2", insertion=(10, 100), page_number=1),
+        NormalizedText(2, "3", "3", insertion=(20, 100), page_number=1),
+        NormalizedText(3, "W19X47", "W19X47", insertion=(30, 100), page_number=1),
+        NormalizedText(4, "8'-4 3/8\"", "8'-4 3/8\"", insertion=(40, 100), page_number=1),
+        NormalizedText(5, "263.5", "263.5", insertion=(50, 100), page_number=1),
+        NormalizedText(6, "SHOP PRIME", "SHOP PRIME", insertion=(60, 100), page_number=1),
+        NormalizedText(7, "SYN-GR50", "SYN-GR50", insertion=(70, 100), page_number=1),
     ]
 
 
@@ -80,8 +80,8 @@ class TestBlenderPartsBootstrapEmitters(unittest.TestCase):
             report = json.loads(report_path.read_text(encoding="utf-8"))
             self.assertEqual(report["extra"]["parts_bootstrap"]["row_count"], 1)
             sidecar = json.loads((tmp_path / "parts_bootstrap.json").read_text(encoding="utf-8"))
-            self.assertEqual(sidecar["rows"][0]["piece_mark"], "1017FR1")
-            self.assertEqual(sidecar["rows"][0]["profile_hint"], "W12X30")
+            self.assertEqual(sidecar["rows"][0]["piece_mark"], "ZX490Q2")
+            self.assertEqual(sidecar["rows"][0]["profile_hint"], "W19X47")
             self.assertIn("report_sha256", sidecar["import_build_stamp"])
 
     @mock.patch("pdf_vector_importer.bl_import_engine._pymupdf_version", return_value="1.24.0")
@@ -116,8 +116,8 @@ class TestBlenderPartsBootstrapEmitters(unittest.TestCase):
             report = json.loads(report_path.read_text(encoding="utf-8"))
             self.assertEqual(report["extra"]["parts_bootstrap"]["row_count"], 1)
             sidecar = json.loads((tmp_path / "parts_bootstrap.json").read_text(encoding="utf-8"))
-            self.assertEqual(sidecar["rows"][0]["piece_mark"], "1017FR1")
-            self.assertEqual(sidecar["rows"][0]["profile_hint"], "W12X30")
+            self.assertEqual(sidecar["rows"][0]["piece_mark"], "ZX490Q2")
+            self.assertEqual(sidecar["rows"][0]["profile_hint"], "W19X47")
             self.assertIn("report_sha256", sidecar["import_build_stamp"])
 
 

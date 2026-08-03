@@ -116,6 +116,13 @@ class _TextPixmap:
         Path(path).write_bytes(b"verified-png")
 
 
+class _TransparentTextPixmap(_TextPixmap):
+    samples = b"\x00" * 64
+
+    def save(self, path):
+        Path(path).write_bytes(b"verified-transparent-png")
+
+
 class _TextRasterPage:
     def __init__(self):
         self.calls = []
@@ -123,6 +130,12 @@ class _TextRasterPage:
     def get_pixmap(self, **kwargs):
         self.calls.append(kwargs)
         return _TextPixmap()
+
+
+class _TransparentTextRasterPage(_TextRasterPage):
+    def get_pixmap(self, **kwargs):
+        self.calls.append(kwargs)
+        return _TransparentTextPixmap()
 
 
 class _RotatedTextRasterPage(_TextRasterPage):
@@ -473,6 +486,75 @@ def test_item_terminal_raster_is_clipped_and_placed_at_the_item_target_bbox(
     assert placement["source_item_id"] == "page:2:text:41"
     assert Path(placement["path"]).read_bytes() == b"verified-png"
     assert expected["pdf_raster_source_item_id"] == "page:2:text:41"
+
+
+def test_whitespace_terminal_raster_accepts_verified_exact_transparent_clip(
+    monkeypatch,
+    tmp_path,
+):
+    page = _TransparentTextRasterPage()
+    source_bbox = (34.0, 50.0, 37.0, 68.0)
+    text_item = types.SimpleNamespace(
+        id=42,
+        text=" \t ",
+        source_bbox_pdf=source_bbox,
+        bbox=(12.0, 24.0, 13.0, 30.0),
+    )
+    captured = []
+    expected = _RasterObject()
+    monkeypatch.setattr(
+        bl_import_engine,
+        "_create_image_plane",
+        lambda placement, *_args, **_kwargs: captured.append(dict(placement))
+        or expected,
+    )
+
+    actual = bl_import_engine._render_text_item_raster(
+        page,
+        text_item,
+        object(),
+        page_num=2,
+        item_id="page:2:text:42",
+        import_cfg=types.SimpleNamespace(raster_dpi=300),
+        image_dir=str(tmp_path),
+    )
+
+    assert actual is expected
+    assert len(page.calls) == 1
+    assert tuple(page.calls[0]["clip"]) == pytest.approx(source_bbox)
+    assert captured[0]["source_bbox_pdf"] == list(source_bbox)
+    assert captured[0]["source_render_clip_pdf"] == list(source_bbox)
+    assert captured[0]["source_expected_transparent"] is True
+    assert expected["pdf_raster_expected_transparent"] is True
+    assert Path(captured[0]["path"]).read_bytes() == b"verified-transparent-png"
+
+
+def test_visible_text_terminal_raster_rejects_transparent_clip(monkeypatch, tmp_path):
+    plane_calls = []
+    monkeypatch.setattr(
+        bl_import_engine,
+        "_create_image_plane",
+        lambda *_args, **_kwargs: plane_calls.append(True) or _RasterObject(),
+    )
+
+    actual = bl_import_engine._render_text_item_raster(
+        _TransparentTextRasterPage(),
+        types.SimpleNamespace(
+            id=43,
+            text="VISIBLE",
+            source_bbox_pdf=(34.0, 50.0, 70.0, 68.0),
+            bbox=(12.0, 24.0, 24.0, 30.0),
+        ),
+        object(),
+        page_num=2,
+        item_id="page:2:text:43",
+        import_cfg=types.SimpleNamespace(raster_dpi=300),
+        image_dir=str(tmp_path),
+    )
+
+    assert actual is None
+    assert plane_calls == []
+    assert list(tmp_path.glob("*.png")) == []
 
 
 def test_item_terminal_raster_uses_attempt_owned_resources(monkeypatch, tmp_path):
