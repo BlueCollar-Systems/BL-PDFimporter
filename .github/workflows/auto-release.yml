@@ -151,16 +151,23 @@ jobs:
           TITLE="v${{ steps.version.outputs.version }} — PDF Vector Importer for Blender"
           RELEASE_JSON="$RUNNER_TEMP/release.json"
           refresh_release() {
-            gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" > "$RUNNER_TEMP/releases.json"
-            local discovery
-            discovery="$(python "$RUNNER_TEMP/release_safety.py" discover-release \
-              --releases-json "$RUNNER_TEMP/releases.json" --tag "$TAG")"
-            RELEASE_STATE="$(printf '%s' "$discovery" | jq -r .release_state)"
-            RELEASE_ID="$(printf '%s' "$discovery" | jq -r .release_id)"
-            if [ -z "$RELEASE_ID" ]; then
-              return 1
-            fi
-            gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" > "$RELEASE_JSON"
+            local attempt discovery
+            for attempt in 1 2 3 4 5; do
+              gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" > "$RUNNER_TEMP/releases.json"
+              discovery="$(python "$RUNNER_TEMP/release_safety.py" discover-release \
+                --releases-json "$RUNNER_TEMP/releases.json" --tag "$TAG")"
+              RELEASE_STATE="$(printf '%s' "$discovery" | jq -r .release_state)"
+              RELEASE_ID="$(printf '%s' "$discovery" | jq -r .release_id)"
+              if [ -n "$RELEASE_ID" ]; then
+                gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" > "$RELEASE_JSON"
+                return 0
+              fi
+              if [ "$attempt" -lt 5 ]; then
+                sleep $((attempt * 2))
+              fi
+            done
+            echo "Release $TAG did not become visible after five attempts." >&2
+            return 1
           }
           shopt -s nullglob
           ASSETS=(dist/*.zip)

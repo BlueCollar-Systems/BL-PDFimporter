@@ -766,6 +766,9 @@ class ReleaseSafetyTest:
         assert 'repos/${GITHUB_REPOSITORY}/releases?per_page=100' in workflow
         assert re.search(r'release_safety\.py"? discover-release', workflow)
         assert 'repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}' in workflow
+        assert "for attempt in 1 2 3 4 5" in workflow
+        assert 'if [ "$attempt" -lt 5 ]; then' in workflow
+        assert "sleep $((attempt * 2))" in workflow
         assert 'releases/tags/${TAG}' not in workflow
         plan_at = re.search(r'release_safety\.py"? plan-release', workflow).start()
         checkout_at = workflow.index('git checkout --detach "${{ steps.release_plan.outputs.build_ref }}"')
