@@ -36,6 +36,9 @@ from .pdfcadcore.primitive_extractor import (
     _transform_pdf_point,
 )
 from .text_delivery import normalize_representation
+from .transparent_assets import (
+    BLENDER_SAFE_TRANSPARENT_PNG as _BLENDER_SAFE_TRANSPARENT_PNG,
+)
 
 _MM_PER_PT = 25.4 / 72.0
 _MM_TO_M = 0.001
@@ -43,14 +46,6 @@ _AUTO_RECOGNITION_PRIMITIVE_LIMIT = 20_000
 _AUTO_RECOGNITION_TEXT_LIMIT = 3_000
 _AUTO_RECOGNITION_PAGE_AREA_MM2_LIMIT = 12_000_000.0
 _INLINE_IMAGE_COMPOSITE_THRESHOLD = 256
-# Canonical 1x1 RGBA PNG: transparent white (255, 255, 255, 0).  A PDF
-# whitespace span whose exact clip has zero alpha at every pixel is visually empty;
-# using this equivalent payload avoids host image-loader failures on larger
-# all-zero RGBA PNGs without expanding the clip into neighbouring artwork.
-_BLENDER_SAFE_TRANSPARENT_PNG = base64.b64decode(
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4//8/"
-    "AwAI/AL+p5qgoAAAAABJRU5ErkJggg=="
-)
 
 
 class IncompleteImportError(RuntimeError):
@@ -1831,7 +1826,10 @@ def _render_text_item_raster(
         fully_transparent = _pixmap_is_fully_transparent(pix, samples)
         if not samples or (fully_transparent and not source_expected_transparent):
             return None
-        if source_expected_transparent and fully_transparent:
+        # A whitespace source item has no attributable glyph ink.  Always use
+        # the visually-empty canonical texture so page geometry overlapping
+        # its bbox is not copied into the text layer.
+        if source_expected_transparent:
             Path(image_path).write_bytes(_BLENDER_SAFE_TRANSPARENT_PNG)
         else:
             pix.save(image_path)
@@ -1855,9 +1853,8 @@ def _render_text_item_raster(
         "source_render_clip_pdf": render_clip,
         "source_item_id": str(item_id),
         "source_expected_transparent": source_expected_transparent,
-        "source_transparent_normalized": bool(
-            source_expected_transparent and fully_transparent
-        ),
+        "source_clip_fully_transparent": fully_transparent,
+        "source_transparent_normalized": source_expected_transparent,
     }
     try:
         # A terminal fallback is an isolated delivery attempt. Its image,
@@ -1881,6 +1878,9 @@ def _render_text_item_raster(
         )
         obj["pdf_raster_dpi"] = dpi
         obj["pdf_raster_expected_transparent"] = source_expected_transparent
+        obj["pdf_raster_source_clip_fully_transparent"] = bool(
+            placement["source_clip_fully_transparent"]
+        )
         obj["pdf_raster_transparent_normalized"] = bool(
             placement["source_transparent_normalized"]
         )

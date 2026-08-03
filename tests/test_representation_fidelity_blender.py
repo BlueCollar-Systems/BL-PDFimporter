@@ -1801,6 +1801,8 @@ def _raster_callback_for_test(
     explode_during_verification=False,
     broken_texture_binding=False,
     nonfinite_location=False,
+    expected_transparent=False,
+    transparent_normalized=False,
 ):
     def _callback(_text_item, collection, _page_number, item_id):
         class _VerificationExplodingObject(_Object):
@@ -1849,6 +1851,8 @@ def _raster_callback_for_test(
         plane["pdf_image_datablock_owned"] = True
         plane["pdf_image_packed"] = True
         plane["pdf_image_sha256"] = sha256(Path(path).read_bytes()).hexdigest()
+        plane["pdf_raster_expected_transparent"] = expected_transparent
+        plane["pdf_raster_transparent_normalized"] = transparent_normalized
         collection.objects.link(plane)
         return plane
 
@@ -1874,7 +1878,59 @@ def test_raster_delivery_verifies_real_plane_and_reports_owned_clip(monkeypatch,
     attempt = opts._text_delivery_records[-1]["attempts"][0]
     assert attempt["status"] == "delivered"
     assert attempt["evidence"]["placement_verified"] is True
+    assert attempt["evidence"]["expected_transparent"] is False
+    assert attempt["evidence"]["transparent_normalized"] is False
     assert attempt["owned_artifacts"][0]["file_path"] == str(clip)
+
+
+def test_whitespace_raster_delivery_reports_canonical_normalization(monkeypatch, tmp_path):
+    _fake, collection = _install(monkeypatch)
+    clip = tmp_path / "item-41.png"
+    clip.write_bytes(bl_import_engine._BLENDER_SAFE_TRANSPARENT_PNG)
+    opts = types.SimpleNamespace(import_mode="vector", text_mode="raster")
+
+    obj = bl_text_builder.build_text(
+        replace(_item(), text=" ", normalized=""),
+        collection,
+        page_number=2,
+        text_mode="raster",
+        provenance_opts=opts,
+        terminal_raster_callback=_raster_callback_for_test(
+            clip,
+            expected_transparent=True,
+            transparent_normalized=True,
+        ),
+    )
+
+    assert obj is not None
+    evidence = opts._text_delivery_records[-1]["attempts"][0]["evidence"]
+    assert evidence["expected_transparent"] is True
+    assert evidence["transparent_normalized"] is True
+
+
+def test_visible_raster_rejects_whitespace_normalization_metadata(monkeypatch, tmp_path):
+    _fake, collection = _install(monkeypatch)
+    clip = tmp_path / "item-41.png"
+    clip.write_bytes(bl_import_engine._BLENDER_SAFE_TRANSPARENT_PNG)
+    opts = types.SimpleNamespace(import_mode="vector", text_mode="raster")
+
+    obj = bl_text_builder.build_text(
+        _item(),
+        collection,
+        page_number=2,
+        text_mode="raster",
+        provenance_opts=opts,
+        terminal_raster_callback=_raster_callback_for_test(
+            clip,
+            expected_transparent=True,
+            transparent_normalized=True,
+        ),
+    )
+
+    assert obj is None
+    attempt = opts._text_delivery_records[-1]["attempts"][0]
+    assert attempt["status"] == "failed"
+    assert "raster_transparency_metadata_mismatch" in attempt["evidence"]["failures"]
 
 
 def test_raster_visual_mismatch_fails_and_cleans_plane_and_clip(monkeypatch, tmp_path):

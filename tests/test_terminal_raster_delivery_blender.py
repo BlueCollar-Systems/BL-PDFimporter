@@ -157,6 +157,45 @@ class _RotatedTextRasterPage(_TextRasterPage):
     rotation_matrix = fitz.Matrix(0.0, 1.0, -1.0, 0.0, 3024.0, 0.0)
 
 
+def test_pixmap_transparency_ignores_stride_padding_and_hidden_rgb():
+    pixmap = types.SimpleNamespace(
+        alpha=1,
+        width=2,
+        height=2,
+        n=4,
+        stride=12,
+    )
+    samples = (
+        b"\xff\x80\x40\x00" * 2
+        + b"\xff\xff\xff\xff"
+        + b"\x20\x40\x60\x00" * 2
+        + b"\xff\xff\xff\xff"
+    )
+
+    assert bl_import_engine._pixmap_is_fully_transparent(pixmap, samples) is True
+
+
+@pytest.mark.parametrize(
+    ("pixmap", "samples"),
+    [
+        (
+            types.SimpleNamespace(alpha=1, width=1, height=1, n=4, stride=4),
+            b"\xff\xff\xff\x01",
+        ),
+        (
+            types.SimpleNamespace(alpha=1, width=2, height=1, n=4, stride=8),
+            b"\x00\x00\x00\x00",
+        ),
+        (
+            types.SimpleNamespace(alpha=1, width=2, height=1, n=4, stride=4),
+            b"\x00" * 8,
+        ),
+    ],
+)
+def test_pixmap_transparency_fails_closed_for_ink_or_invalid_layout(pixmap, samples):
+    assert bl_import_engine._pixmap_is_fully_transparent(pixmap, samples) is False
+
+
 def _raster_placement():
     return {
         "path": "rendered-page.png",
@@ -634,7 +673,10 @@ def test_whitespace_terminal_raster_proves_transparency_from_alpha_not_rgb(
     assert actual is expected
 
 
-def test_nontransparent_whitespace_terminal_raster_preserves_exact_clip(monkeypatch, tmp_path):
+def test_nontransparent_whitespace_terminal_raster_does_not_borrow_clip_ink(
+    monkeypatch,
+    tmp_path,
+):
     captured = []
     expected = _RasterObject()
     monkeypatch.setattr(
@@ -660,9 +702,13 @@ def test_nontransparent_whitespace_terminal_raster_preserves_exact_clip(monkeypa
     )
 
     assert actual is expected
-    assert Path(captured[0]["path"]).read_bytes() == b"verified-png"
-    assert captured[0]["source_transparent_normalized"] is False
-    assert expected["pdf_raster_transparent_normalized"] is False
+    assert (
+        Path(captured[0]["path"]).read_bytes()
+        == bl_import_engine._BLENDER_SAFE_TRANSPARENT_PNG
+    )
+    assert captured[0]["source_clip_fully_transparent"] is False
+    assert captured[0]["source_transparent_normalized"] is True
+    assert expected["pdf_raster_transparent_normalized"] is True
 
 
 def test_visible_text_terminal_raster_rejects_transparent_clip(monkeypatch, tmp_path):

@@ -24,6 +24,7 @@ from .text_delivery import (
     deliver_item,
     normalize_representation,
 )
+from .transparent_assets import BLENDER_SAFE_TRANSPARENT_PNG_SHA256
 
 
 MM_TO_M = 0.001
@@ -2319,6 +2320,15 @@ def _attempt_raster_impl(
         image_name = str(obj.get("pdf_image_datablock", "") or "")
         image_packed = bool(obj.get("pdf_image_packed", False))
         image_metadata_sha = str(obj.get("pdf_image_sha256", "") or "")
+        actual_expected_transparent = bool(
+            obj.get("pdf_raster_expected_transparent", False)
+        )
+        actual_transparent_normalized = bool(
+            obj.get("pdf_raster_transparent_normalized", False)
+        )
+        source_clip_fully_transparent = bool(
+            obj.get("pdf_raster_source_clip_fully_transparent", False)
+        )
     except (AttributeError, TypeError, ValueError):
         actual_item_id = ""
         actual_source_bbox = []
@@ -2326,11 +2336,28 @@ def _attempt_raster_impl(
         image_name = ""
         image_packed = False
         image_metadata_sha = ""
+        actual_expected_transparent = False
+        actual_transparent_normalized = False
+        source_clip_fully_transparent = False
     expected_source_bbox = [float(value) for value in (getattr(text_item, "source_bbox_pdf", None) or [])]
     verification_evidence["source_item_id"] = actual_item_id
     verification_evidence["source_bbox_pdf"] = actual_source_bbox
     verification_evidence["image_path"] = image_path
     verification_evidence["image_datablock"] = image_name
+    source_text = getattr(text_item, "text", None)
+    expected_transparent = bool(
+        isinstance(source_text, str) and source_text and not source_text.strip()
+    )
+    verification_evidence["expected_transparent"] = actual_expected_transparent
+    verification_evidence["transparent_normalized"] = actual_transparent_normalized
+    verification_evidence["source_clip_fully_transparent"] = (
+        source_clip_fully_transparent
+    )
+    if (
+        actual_expected_transparent != expected_transparent
+        or actual_transparent_normalized != expected_transparent
+    ):
+        failures.append("raster_transparency_metadata_mismatch")
     if actual_item_id != item_id:
         failures.append("source_item_identity_mismatch")
     if not all(
@@ -2359,6 +2386,11 @@ def _attempt_raster_impl(
             failures.append("raster_image_not_marked_packed")
         if not clip_sha or image_metadata_sha != clip_sha:
             failures.append("raster_image_digest_metadata_mismatch")
+        if (
+            actual_transparent_normalized
+            and clip_sha != BLENDER_SAFE_TRANSPARENT_PNG_SHA256
+        ):
+            failures.append("raster_transparent_payload_not_canonical")
         images = getattr(getattr(bpy, "data", None), "images", None)
         get_image = getattr(images, "get", None)
         image = get_image(image_name) if callable(get_image) and image_name else None
