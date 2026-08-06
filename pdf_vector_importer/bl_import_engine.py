@@ -378,6 +378,32 @@ def _text_delivery_from_provenance(provenance_opts: Any) -> Dict[str, Any]:
     }
 
 
+def _write_resume_checkpoint_guarded(
+    checkpoint_path: str,
+    state: Any,
+    stats: Dict,
+) -> bool:
+    """Checkpoint after a page without letting the filesystem end the import.
+
+    This runs inside the page loop, so an unguarded OSError here threw away
+    every page already delivered -- to protect a file whose only purpose is
+    making a *future* run resumable. Losing resume support is a real loss, so
+    it is recorded on stats and surfaced, but it is not a delivery failure.
+
+    The writer is resolved through module globals first so tests can substitute
+    it; import_pdf imports the real one locally.
+    """
+    writer = globals().get("write_resume_checkpoint")
+    if writer is None:  # pragma: no cover - exercised via import_pdf
+        from .import_session import write_resume_checkpoint as writer
+    try:
+        writer(checkpoint_path, state)
+        return True
+    except OSError as exc:
+        stats["resume_unavailable"] = f"{type(exc).__name__}: {exc}"
+        return False
+
+
 def _import_housekeeping_warnings(stats: Dict) -> List[str]:
     """Non-delivery problems worth surfacing that must NOT discard the import.
 
@@ -3456,7 +3482,9 @@ def import_pdf(
                 list(page_stats.get("geometry_delivery_issues") or [])
             )
             completed_pages.append(page_num)
-            write_resume_checkpoint(checkpoint_path, _current_resume_state())
+            _write_resume_checkpoint_guarded(
+                checkpoint_path, _current_resume_state(), total_stats
+            )
             _progress(
                 _page_progress(i, 1.0),
                 f"Finished page {page_num}/{len(page_indices)} "
@@ -3472,7 +3500,7 @@ def import_pdf(
             resume_state = _current_resume_state()
             total_stats["resume"] = resume_state
             total_stats["resume_checkpoint_path"] = checkpoint_path
-            write_resume_checkpoint(checkpoint_path, resume_state)
+            _write_resume_checkpoint_guarded(checkpoint_path, resume_state, total_stats)
 
         phase_timings_ms["pages_import_ms"] = (time.perf_counter() - t_pages_phase) * 1000.0
         t_phase = time.perf_counter()

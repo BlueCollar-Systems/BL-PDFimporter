@@ -192,6 +192,56 @@ def test_intact_install_still_reports_verified(monkeypatch):
 # --- the packager and the runtime hasher must agree on what counts -----------
 
 
+# --- a resume checkpoint is a convenience, not a deliverable -----------------
+
+
+def test_checkpoint_write_failure_does_not_stop_the_page_loop(monkeypatch):
+    """Checkpointing runs after every page, inside the loop.
+
+    An unguarded OSError there discarded every page already imported, to
+    protect a file whose only purpose is making a *future* run resumable.
+    """
+    stats = {}
+
+    def _explode(path, state):
+        raise PermissionError("checkpoint locked")
+
+    monkeypatch.setattr(bl_import_engine, "write_resume_checkpoint", _explode, raising=False)
+
+    ok = bl_import_engine._write_resume_checkpoint_guarded(
+        "C:/tmp/checkpoint.json", {"pages": [1]}, stats
+    )
+
+    assert ok is False
+    assert stats.get("resume_unavailable"), (
+        "losing resume support must be recorded so the user is told why "
+        "Resume Interrupted Import will not work"
+    )
+    assert "checkpoint locked" in str(stats["resume_unavailable"])
+
+
+def test_successful_checkpoint_records_nothing(monkeypatch):
+    stats = {}
+    monkeypatch.setattr(
+        bl_import_engine, "write_resume_checkpoint", lambda p, s: None, raising=False
+    )
+
+    ok = bl_import_engine._write_resume_checkpoint_guarded(
+        "C:/tmp/checkpoint.json", {"pages": [1]}, stats
+    )
+
+    assert ok is True
+    assert "resume_unavailable" not in stats
+
+
+def test_checkpoint_failure_is_not_a_terminal_failure():
+    stats = {
+        "text_source_spans": 1,
+        "resume_unavailable": "PermissionError: checkpoint locked",
+    }
+    assert _failures(stats) == []
+
+
 @pytest.mark.parametrize(
     "relative",
     [
