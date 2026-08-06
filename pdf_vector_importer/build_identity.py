@@ -20,6 +20,44 @@ class BuildIdentityError(RuntimeError):
     """Raised when distributable identity is absent, malformed, or mismatched."""
 
 
+# THE single definition of what is not part of the distributed package.
+#
+# build_release.py strips these from the published ZIP, and the runtime identity
+# hasher below must skip exactly the same things. When the two lists disagreed,
+# anything the packager dropped but the hasher counted could never hash equal --
+# and because the add-on installs PyMuPDF into its own directory (creating
+# lib/bin/** and *.dist-info/RECORD, both stripped from the ZIP), an install
+# could permanently brick itself: every later import failed on a stale hash.
+# Keep both callers pointed at this function; do not re-inline either list.
+_EXCLUDE_DIR_NAMES = frozenset({"__pycache__", "tests", ".pytest_cache", "_archived"})
+_EXCLUDE_SUFFIXES = frozenset({".pyc", ".pyo"})
+
+
+def is_excluded_package_member(relative_path: str | Path) -> bool:
+    """True if this path is stripped from the release and must not be hashed.
+
+    Accepts an absolute or package-relative path; every rule is an "any part"
+    test, so both forms agree for paths inside the package.
+    """
+    path = Path(str(relative_path).replace("\\", "/"))
+    parts = path.parts
+    if any(part in _EXCLUDE_DIR_NAMES for part in parts):
+        return True
+    folded = tuple(part.casefold() for part in parts)
+    # Vendored native binaries are re-created by pip, never shipped.
+    if any(folded[index : index + 2] == ("lib", "bin")
+           for index in range(len(folded) - 1)):
+        return True
+    # pip rewrites RECORD on every (re)install, so its bytes are not stable.
+    if path.name.casefold() == "record" and any(
+        part.endswith(".dist-info") for part in folded
+    ):
+        return True
+    if path.suffix in _EXCLUDE_SUFFIXES:
+        return True
+    return False
+
+
 def content_manifest_sha256(entries: Iterable[Tuple[str, bytes]]) -> str:
     """Hash sorted package paths and per-file bytes without self-reference."""
     digest = hashlib.sha256()
@@ -76,12 +114,10 @@ def _package_entries(package_root: Path) -> list[tuple[str, bytes]]:
     for path in package_root.rglob("*"):
         if not path.is_file():
             continue
-        rel_parts = path.relative_to(package_root).parts
-        if (
-            path.name == IDENTITY_FILENAME
-            or "__pycache__" in rel_parts
-            or path.suffix.casefold() in {".pyc", ".pyo"}
-        ):
+        relative = path.relative_to(package_root)
+        # IDENTITY_FILENAME is in the ZIP but cannot hash itself; everything
+        # else defers to the shared packaging rule so the two can never drift.
+        if path.name == IDENTITY_FILENAME or is_excluded_package_member(relative):
             continue
         entries.append((path.relative_to(parent).as_posix(), path.read_bytes()))
     return entries
