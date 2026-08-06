@@ -29,9 +29,11 @@ DIST = ROOT / "dist"
 PKG = ROOT / "pdf_vector_importer"
 LIB_DIR = PKG / "lib"
 
-# Patterns to exclude from the release zip
-_EXCLUDE_DIRS = {"__pycache__", "tests", ".pytest_cache", "_archived"}
-_EXCLUDE_SUFFIXES = {".pyc", ".pyo"}
+# What to exclude from the release zip now lives in exactly one place:
+# pdf_vector_importer.build_identity.is_excluded_package_member, which the
+# runtime identity hasher uses too. Two copies drifted apart once already and
+# left installs unable to match their own release hash -- do not re-add a list
+# here; extend that function instead.
 _ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 _ZIP_FILE_MODE = 0o100644
 _VENDORED_LIB = PKG / "lib"
@@ -62,23 +64,18 @@ def _read_version() -> str:
 
 
 def _should_exclude(path: Path) -> bool:
-    """Return True if a file should be excluded from the zip."""
-    for part in path.parts:
-        if part in _EXCLUDE_DIRS:
-            return True
-    normalized_parts = tuple(part.casefold() for part in path.parts)
-    if any(
-        normalized_parts[index : index + 2] == ("lib", "bin")
-        for index in range(len(normalized_parts) - 1)
-    ):
-        return True
-    if path.name.casefold() == "record" and any(
-        part.endswith(".dist-info") for part in normalized_parts
-    ):
-        return True
-    if path.suffix in _EXCLUDE_SUFFIXES:
-        return True
-    return False
+    """Return True if a file should be excluded from the zip.
+
+    Delegates to pdf_vector_importer.build_identity so the packager and the
+    runtime identity hasher can never disagree about what belongs to the
+    package. They previously kept separate lists, and anything stripped here
+    but hashed there made the installed tree unable to match its own release
+    identity -- which the add-on triggered on itself by pip-installing PyMuPDF
+    into its own directory.
+    """
+    from pdf_vector_importer.build_identity import is_excluded_package_member
+
+    return is_excluded_package_member(path)
 
 
 def _write_deterministic_file(

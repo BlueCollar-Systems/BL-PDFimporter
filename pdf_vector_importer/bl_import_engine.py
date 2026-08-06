@@ -199,6 +199,35 @@ def runtime_package_identity() -> Dict[str, Any]:
     return _identity()
 
 
+def safe_runtime_package_identity() -> Dict[str, Any]:
+    """Identity for the report, degrading to a status instead of raising.
+
+    A tree that no longer hashes to its release manifest is a fact worth
+    recording, not a reason to destroy an import. Raising here escaped
+    write_import_report, landed in `import_report_error`, and was terminal --
+    so one stray file in the add-on directory made every later import fail,
+    permanently and with no way for the user to connect cause to effect.
+
+    The add-on can cause this to itself: installing PyMuPDF writes into its own
+    package directory, and anything the packager stripped from the published
+    ZIP but the runtime hasher still counts can never hash equal again.
+
+    Verification is not weakened -- a mismatch is still reported, and callers
+    that require a verified identity can check `status`.
+    """
+    from .build_identity import BuildIdentityError
+
+    try:
+        return dict(runtime_package_identity())
+    except BuildIdentityError as exc:
+        return {"status": "modified_install", "error": str(exc)}
+    except (OSError, ValueError, TypeError) as exc:
+        return {
+            "status": "identity_unavailable",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+
 def _merge_scale_into_stats(stats: Dict, page_data) -> None:
     """Accumulate resolved_scale telemetry for import_report cross-check."""
 
@@ -349,14 +378,40 @@ def _text_delivery_from_provenance(provenance_opts: Any) -> Dict[str, Any]:
     }
 
 
+def _import_housekeeping_warnings(stats: Dict) -> List[str]:
+    """Non-delivery problems worth surfacing that must NOT discard the import.
+
+    Both of these are evaluated after every page has been delivered, raster
+    floor included, so no rung of the ladder can rescue them and failing on
+    them throws away work that already succeeded. The operator surfaces both
+    to the user and still reports the import as finished.
+    """
+    warnings: List[str] = []
+    report_error = str(stats.get("import_report_error") or "").strip()
+    if report_error:
+        warnings.append(f"mandatory import report failed ({report_error})")
+    cleanup_error = str(stats.get("temp_cleanup_error") or "").strip()
+    if cleanup_error:
+        warnings.append(f"owned temporary cleanup failed ({cleanup_error})")
+    return warnings
+
+
 def _terminal_import_failures(config: Dict, stats: Dict, provenance_opts: Any) -> List[str]:
-    """Return mandatory delivery failures that must make import_pdf fail closed."""
+    """Return mandatory delivery failures that must make import_pdf fail closed.
+
+    DELIVERY only -- text, raster, geometry. Housekeeping failures (writing the
+    report, deleting our scratch directory) are deliberately excluded: they
+    cannot un-deliver content that is already in the scene, and treating them
+    as terminal destroyed completed imports over transient conditions such as
+    an antivirus lock on the temp directory. The `finally` block already
+    retries that same rmtree and ignores the error, so the cleanup reported as
+    fatal here has usually succeeded moments later.
+
+    See _import_housekeeping_warnings for where those now go.
+    """
     if bool(stats.get("cancelled")):
         return []
     failures: List[str] = []
-    report_error = str(stats.get("import_report_error") or "").strip()
-    if report_error:
-        failures.append(f"mandatory import report failed ({report_error})")
 
     summary = _text_delivery_from_provenance(provenance_opts)["summary"]
     text_mode = str(config.get("text_mode") or "3d_text").strip().lower()
@@ -384,9 +439,6 @@ def _terminal_import_failures(config: Dict, stats: Dict, provenance_opts: Any) -
     if geometry_failures:
         failures.append(f"geometry delivery failed ({len(geometry_failures)} primitive(s))")
 
-    cleanup_error = str(stats.get("temp_cleanup_error") or "").strip()
-    if cleanup_error:
-        failures.append(f"owned temporary cleanup failed ({cleanup_error})")
     return failures
 
 
@@ -527,8 +579,12 @@ def write_import_report(
         terminal_failure["raster_delivery"] = list(raster_delivery_failures)
     if geometry_delivery_failures:
         terminal_failure["geometry_delivery"] = list(geometry_delivery_failures)
+    # Recorded, but NOT as a terminal failure: it would otherwise stamp the
+    # report result_status "incomplete" for an import that delivered every page
+    # and now finishes successfully. See _terminal_import_failures.
+    housekeeping_warnings = {}
     if stats.get("temp_cleanup_error"):
-        terminal_failure["temp_cleanup"] = str(stats.get("temp_cleanup_error"))
+        housekeeping_warnings["temp_cleanup"] = str(stats.get("temp_cleanup_error"))
     extra = {
         "curves": int(stats.get("curves", 0) or 0),
         "meshes": int(stats.get("meshes", 0) or 0),
@@ -543,7 +599,7 @@ def write_import_report(
             if bool(stats.get("cancelled"))
             else ("incomplete" if terminal_failure else "success")
         ),
-        "package_identity": runtime_package_identity(),
+        "package_identity": safe_runtime_package_identity(),
     }
     if stats.get("resume"):
         extra["resume"] = dict(stats.get("resume") or {})
@@ -551,6 +607,8 @@ def write_import_report(
         extra["complexity"] = dict(stats.get("complexity") or {})
     if terminal_failure:
         extra["terminal_failure"] = terminal_failure
+    if housekeeping_warnings:
+        extra["housekeeping_warnings"] = housekeeping_warnings
     if int(text_delivery_summary["source_items"]) > 0:
         extra["text_delivery"] = text_delivery
     if text_source_spans > 0 or int(text_delivery_summary["source_items"]) > 0:
