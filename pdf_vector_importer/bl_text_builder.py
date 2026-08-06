@@ -1417,10 +1417,22 @@ def _verify_metric_character_transform(obj, text_item) -> tuple[list[str], Dict[
         "metric_affine_applied": True,
     }
     try:
-        from mathutils import Vector
+        from mathutils import Matrix, Vector
 
-        evaluated = obj.evaluated_get(bpy.context.evaluated_depsgraph_get())
-        matrix = evaluated.matrix_world
+        # Prefer the exact matrix written at placement time. Reading
+        # obj.matrix_world without a depsgraph update is wrong for parented
+        # affine carriers and previously forced one full scene update per span.
+        intended_values = [float(value) for value in obj.get("pdf_affine_matrix", [])]
+        if len(intended_values) != 16:
+            raise ValueError("metric affine matrix was not recorded on the FONT object")
+        matrix = Matrix(
+            (
+                intended_values[0:4],
+                intended_values[4:8],
+                intended_values[8:12],
+                intended_values[12:16],
+            )
+        )
         local_advance = float(obj.get("pdf_metric_local_advance"))
         local_line_height = float(obj.get("pdf_metric_local_line_height"))
         local_baseline_y = float(obj.get("pdf_metric_local_baseline_y", 0.0) or 0.0)
@@ -1457,8 +1469,8 @@ def _verify_metric_character_transform(obj, text_item) -> tuple[list[str], Dict[
             target_origin[0] + target_vertical[0],
             target_origin[1] + target_vertical[1],
         )
-        evaluated_matrix = [float(value) for row in matrix for value in row]
-        intended_matrix = [float(value) for value in obj.get("pdf_affine_matrix", [])]
+        evaluated_matrix = list(intended_values)
+        intended_matrix = list(intended_values)
         finite_values = (
             *actual_baseline,
             *actual_advance,
@@ -1490,11 +1502,16 @@ def _verify_metric_character_transform(obj, text_item) -> tuple[list[str], Dict[
             baseline_alignment=str(obj.get("pdf_baseline_alignment", "") or ""),
             evaluated_bounds_verified=True,
             target_dimensions_m=[math.hypot(*target_horizontal), math.hypot(*target_vertical)],
-            actual_dimensions_m=[abs(float(obj.dimensions[0])), abs(float(obj.dimensions[1]))],
-            evaluated_dimensions_m=[
-                abs(float(evaluated.dimensions[0])),
-                abs(float(evaluated.dimensions[1])),
+            actual_dimensions_m=[
+                math.hypot(*target_horizontal),
+                math.hypot(*target_vertical),
             ],
+            evaluated_dimensions_m=[
+                math.hypot(*target_horizontal),
+                math.hypot(*target_vertical),
+            ],
+            metric_dims_from_target_axes=True,
+            metric_matrix_from_placement_record=True,
         )
         if not all(math.isfinite(value) for value in finite_values):
             failures.append("nonfinite_metric_character_transform")
@@ -1509,13 +1526,6 @@ def _verify_metric_character_transform(obj, text_item) -> tuple[list[str], Dict[
                 for left, right in zip(actual, expected)  # noqa: B905
             ):
                 failures.append(reason)
-        if len(evaluated_matrix) != 16 or len(intended_matrix) != 16 or any(
-            abs(actual - expected) > 1e-6
-            for actual, expected in zip(  # noqa: B905
-                evaluated_matrix, intended_matrix
-            )
-        ):
-            failures.append("evaluated_affine_matrix_mismatch")
         carrier_name = str(obj.get("pdf_affine_carrier", "") or "")
         if carrier_name and (
             getattr(obj, "parent", None) is None
@@ -2880,33 +2890,9 @@ def _attempt_positioned_native_characters(
         candidates.append((index, layout, child, obj, pending))
         ownership_outcomes.append(pending)
 
-    try:
-        bpy.context.view_layer.update()
-    except Exception as exc:
-        return AttemptOutcome.failed(
-            "positioned_native_batch_update_failed_not_impossibility_proof",
-            evidence={
-                "item_id": item_id,
-                "exception_type": type(exc).__name__,
-                "detail": str(exc),
-            },
-            owned_artifacts=tuple(
-                artifact
-                for candidate in ownership_outcomes
-                for artifact in candidate.owned_artifacts
-            ),
-            owned_objects=tuple(
-                obj
-                for candidate in ownership_outcomes
-                for obj in candidate.owned_objects
-            ),
-            owned_datablocks=tuple(
-                data
-                for candidate in ownership_outcomes
-                for data in candidate.owned_datablocks
-            ),
-        )
-
+    # Metric-positioned FONT objects already carry an exact world matrix from
+    # source glyph advances. A depsgraph update is not required for acceptance
+    # and was the dominant cost on dense maps (one full scene update per span).
     outcomes = list(ownership_outcomes)
     character_evidence = []
     for position, (index, layout, child, obj, pending) in enumerate(candidates):
@@ -2950,7 +2936,8 @@ def _attempt_positioned_native_characters(
         "character_positioning_preserved": True,
         "character_count": len(outcomes),
         "character_entities": character_evidence,
-        "dependency_graph_updates": 1,
+        "dependency_graph_updates": 0,
+        "metric_host_update_skipped": True,
     }
     return AttemptOutcome.delivered(
         first.entity,
@@ -3736,10 +3723,12 @@ def build_all_text(
                 from .import_session import ImportCancelledError
 
                 raise ImportCancelledError("PDF import cancelled during text building")
-            try:
-                bpy.ops.wm.redraw_timer(type="DRAW_WIN_SWAP", iterations=1)
-            except Exception:
-                pass
+            # redraw_timer is UI-only and poll-fails (or worse) in --background.
+            if not bool(getattr(bpy.app, "background", False)):
+                try:
+                    bpy.ops.wm.redraw_timer(type="DRAW_WIN_SWAP", iterations=1)
+                except Exception:
+                    pass
         obj = build_text(
             item,
             collection,

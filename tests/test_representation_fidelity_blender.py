@@ -712,8 +712,10 @@ def test_character_positioned_3d_text_stays_3d_text_and_records_every_entity(mon
     assert evidence["font_asset_page_number"] == 2
     assert evidence["expected_text_rgba"] == evidence["actual_text_rgba"]
     assert evidence["expected_location_m"] == evidence["actual_baseline_anchor_m"]
-    assert fake.view_update_count == 1
-    assert verification_update_counts == [1, 1]
+    assert evidence["dependency_graph_updates"] == 0
+    assert evidence["metric_host_update_skipped"] is True
+    assert fake.view_update_count == 0
+    assert verification_update_counts == [0, 0]
 
 
 def test_positioned_native_text_omits_proven_zero_ink_character_objects(monkeypatch):
@@ -764,7 +766,7 @@ def test_positioned_native_text_omits_proven_zero_ink_character_objects(monkeypa
     assert whitespace["verification"]["zero_ink_identity"] is True
     assert whitespace["verification"]["visible_geometry_omitted"] is True
     assert whitespace["verification"]["advance_preserved"] is True
-    assert fake.view_update_count == 1
+    assert fake.view_update_count == 0
 
 
 @pytest.mark.parametrize(
