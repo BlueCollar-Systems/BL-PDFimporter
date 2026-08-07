@@ -2915,12 +2915,15 @@ def import_pdf(
                 "performance_phases": phase_timings_ms,
             }
 
+        # write_resume_checkpoint is intentionally absent: both call sites now go
+        # through _write_resume_checkpoint_guarded, which resolves the writer
+        # itself. A function-local import would not be visible to it anyway,
+        # since it looks in module globals before falling back to its own import.
         from .import_session import (
             ImportCancelledError,
             build_resume_state,
             load_resume_checkpoint,
             resume_config_sha256,
-            write_resume_checkpoint,
         )
 
         source_sha256 = _sha256_path(filepath)
