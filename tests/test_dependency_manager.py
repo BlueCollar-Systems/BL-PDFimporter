@@ -75,6 +75,58 @@ class TestDependencyManager(unittest.TestCase):
                 backup.read_text(encoding="utf-8"),
             )
 
+    def test_failed_install_restores_the_bundled_runtime(self) -> None:
+        # The clean-machine trap the third-party advice recommends walking into:
+        # auto-install rmtree'd the bundled pymupdf BEFORE a pip call that an
+        # offline machine cannot complete, leaving no runtime at all. A failed
+        # install must leave the bundle exactly as it found it.
+        with tempfile.TemporaryDirectory() as tmp:
+            lib = Path(tmp)
+            (lib / "pymupdf").mkdir()
+            (lib / "pymupdf" / "__init__.py").write_text("x", encoding="utf-8")
+            (lib / "fitz").mkdir()
+            (lib / "fitz" / "__init__.py").write_text("x", encoding="utf-8")
+            (lib / "pymupdf-1.27.2.3.dist-info").mkdir()
+            (lib / "pymupdf-1.27.2.3.dist-info" / "WHEEL").write_text("t", encoding="utf-8")
+
+            def _fail(*_a, **_k):
+                raise subprocess.CalledProcessError(1, ["pip"])
+
+            with patch.object(dependency_manager, "get_lib_dir", return_value=lib), \
+                    patch("subprocess.check_call", _fail):
+                ok = dependency_manager.install_pymupdf(clear_vendored=True)
+
+            self.assertFalse(ok, "a failed offline install must report failure")
+            self.assertTrue(
+                (lib / "pymupdf" / "__init__.py").is_file(),
+                "the bundled pymupdf must survive a failed install",
+            )
+            self.assertTrue((lib / "fitz" / "__init__.py").is_file())
+            self.assertTrue((lib / "pymupdf-1.27.2.3.dist-info" / "WHEEL").is_file())
+            leftovers = [p.name for p in lib.glob("*.quarantine*")]
+            self.assertEqual([], leftovers, f"no quarantine debris: {leftovers}")
+
+    def test_successful_install_clears_the_old_bundle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            lib = Path(tmp)
+            (lib / "pymupdf").mkdir()
+            (lib / "pymupdf" / "stale.py").write_text("old", encoding="utf-8")
+
+            def _ok(*_a, **_k):
+                return 0
+
+            with patch.object(dependency_manager, "get_lib_dir", return_value=lib), \
+                    patch("subprocess.check_call", _ok), \
+                    patch.object(dependency_manager, "_purge_stale_pymupdf_modules"), \
+                    patch.object(dependency_manager, "ensure_lib_path"), \
+                    patch.object(dependency_manager, "check_pymupdf", return_value=True):
+                ok = dependency_manager.install_pymupdf(clear_vendored=True)
+
+            self.assertTrue(ok)
+            # The stale bundle was moved aside before the (successful) install and
+            # not restored; no quarantine debris remains.
+            self.assertEqual([], [p.name for p in lib.glob("*.quarantine*")])
+
     def test_ensure_lib_path_adds_addon_dir_for_bundled_pdfcadcore(self) -> None:
         with tempfile.TemporaryDirectory(prefix="bl_dep_path_") as tmp:
             addon_dir = Path(tmp) / "pdf_vector_importer"
