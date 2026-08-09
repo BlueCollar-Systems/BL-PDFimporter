@@ -56,6 +56,27 @@ def _write_synthetic_release_zip(path: Path, *, include_fonttools: bool) -> None
 
 
 class TestDependencyManager(unittest.TestCase):
+    def test_runtime_check_never_invokes_pip_repair(self) -> None:
+        """Import-time dependency checks must stay offline and non-mutating."""
+        with patch.object(dependency_manager, "check_pymupdf", return_value=False), \
+                patch.object(dependency_manager, "_import_error_detail", return_value="missing"), \
+                patch.object(
+                    dependency_manager,
+                    "install_pymupdf",
+                    side_effect=AssertionError("runtime checks must not invoke pip"),
+                ) as installer:
+            available = dependency_manager.ensure_pymupdf_runtime(auto_install=True)
+
+        self.assertFalse(available)
+        installer.assert_not_called()
+
+    def test_import_hot_path_requests_offline_dependency_check(self) -> None:
+        source = Path(dependency_manager.__file__).with_name("bl_import_engine.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("ensure_pymupdf_runtime(auto_install=False)", source)
+        self.assertNotIn("ensure_pymupdf_runtime(auto_install=True)", source)
+
     def test_repairs_missing_pymupdf_extra_helper_from_backup(self) -> None:
         with tempfile.TemporaryDirectory(prefix="bl_dep_repair_") as tmp:
             addon_dir = Path(tmp) / "pdf_vector_importer"
