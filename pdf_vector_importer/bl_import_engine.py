@@ -2857,7 +2857,7 @@ def import_pdf(
                 raise RuntimeError(
                     "The bundled PyMuPDF runtime could not load. Reinstall the "
                     "official PDF Vector Importer release ZIP. Import did not "
-                    "download packages, run pip, or modify the add-on."
+                    "download packages or run pip."
                 )
 
         ensure_lib_path()

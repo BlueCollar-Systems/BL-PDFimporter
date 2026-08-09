@@ -57,7 +57,7 @@ def _write_synthetic_release_zip(path: Path, *, include_fonttools: bool) -> None
 
 class TestDependencyManager(unittest.TestCase):
     def test_runtime_check_never_invokes_pip_repair(self) -> None:
-        """Import-time dependency checks must stay offline and non-mutating."""
+        """Import-time checks must never invoke package-manager/network repair."""
         with patch.object(dependency_manager, "check_pymupdf", return_value=False), \
                 patch.object(dependency_manager, "_import_error_detail", return_value="missing"), \
                 patch.object(

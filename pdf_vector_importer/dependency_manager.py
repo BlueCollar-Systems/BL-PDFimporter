@@ -218,9 +218,11 @@ def ensure_pymupdf_runtime(*, auto_install: bool = False) -> bool:
     Verify PyMuPDF can load in the current Blender Python process.
 
     ``auto_install`` is retained only for compatibility with older callers.
-    Runtime checks never invoke pip, contact the network, or modify the bundled
-    dependency tree.  Official release ZIPs are required to carry a complete
-    compatible runtime; a damaged or incompatible package fails closed.
+    Runtime checks never invoke pip or contact the network.  They may perform
+    only the deterministic helper restoration already bundled by
+    ``repair_vendored_pymupdf``.  Official release ZIPs are required to carry a
+    complete compatible runtime; any other damage or incompatibility fails
+    closed.
     """
     if check_pymupdf():
         return True

@@ -35,10 +35,11 @@ Powered by the pdfcadcore shared extraction library and PyMuPDF.
 
 Release ZIPs include a private PyMuPDF runtime under `pdf_vector_importer/lib`,
 so users do not need system Python, pip, or operating-system packages. Import
-never runs pip, downloads packages, or modifies that runtime. The preferences-
+never runs pip or downloads packages. It may restore only the exact bundled
+`extra.py` helper from the copy already inside the release. The preferences-
 panel **Install PyMuPDF** button is an explicit source/development tool only;
-customers should reinstall the official release ZIP if its bundled runtime is
-damaged.
+customers should reinstall the official release ZIP for any other runtime
+damage.
 
 **Offline install:** Release ZIPs from GitHub work without internet after download.
 
