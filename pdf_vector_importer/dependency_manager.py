@@ -9,6 +9,7 @@ Handles checking availability, installing to addon lib dir, and path setup.
 from __future__ import annotations
 
 import importlib
+import os
 import shutil
 import subprocess
 import sys
@@ -86,20 +87,64 @@ def check_pymupdf() -> bool:
     return not _import_error_detail()
 
 
-def _clear_vendored_pymupdf_binaries() -> None:
-    """Remove ABI-mismatched vendored wheels before a fresh pip install."""
+def _vendored_pymupdf_paths() -> "list[Path]":
     lib_dir = get_lib_dir()
-    for rel in (
-        Path("pymupdf"),
-        Path("fitz"),
-    ):
-        target = lib_dir / rel
-        if target.exists():
-            shutil.rmtree(target, ignore_errors=True)
-    for dist_info in lib_dir.glob("pymupdf-*.dist-info"):
-        shutil.rmtree(dist_info, ignore_errors=True)
-    for dist_info in lib_dir.glob("PyMuPDF-*.dist-info"):
-        shutil.rmtree(dist_info, ignore_errors=True)
+    paths = []
+    seen = set()
+    candidates = [lib_dir / "pymupdf", lib_dir / "fitz"]
+    # Both patterns match the same dist-info on case-insensitive filesystems
+    # (Windows); dedupe by resolved path so a path is never quarantined twice --
+    # the second pass would otherwise delete the first pass's quarantine.
+    for pattern in ("pymupdf-*.dist-info", "PyMuPDF-*.dist-info"):
+        candidates.extend(lib_dir.glob(pattern))
+    for target in candidates:
+        if not target.exists():
+            continue
+        key = os.path.normcase(str(target.resolve()))
+        if key in seen:
+            continue
+        seen.add(key)
+        paths.append(target)
+    return paths
+
+
+def _quarantine_vendored_pymupdf() -> "list[tuple[Path, Path]]":
+    """Move the vendored wheels aside so a failed install can restore them.
+
+    The old code rmtree'd them BEFORE the pip call. On an offline clean machine
+    the pip call cannot complete, and the bundle was then gone for good --
+    exactly the destructive auto-install pattern the Phase 3 audit flagged.
+    Renaming is atomic on the same volume, so nothing is lost until the install
+    actually succeeds.
+    """
+    moved: "list[tuple[Path, Path]]" = []
+    for target in _vendored_pymupdf_paths():
+        quarantine = target.with_name(target.name + ".quarantine")
+        if quarantine.exists():
+            shutil.rmtree(quarantine, ignore_errors=True)
+        try:
+            target.rename(quarantine)
+            moved.append((target, quarantine))
+        except OSError:
+            # Could not move it aside; leave it in place rather than risk
+            # destroying it, and let pip --upgrade overwrite what it can.
+            pass
+    return moved
+
+
+def _restore_quarantined(moved: "list[tuple[Path, Path]]") -> None:
+    for original, quarantine in moved:
+        if original.exists():
+            shutil.rmtree(original, ignore_errors=True)
+        try:
+            quarantine.rename(original)
+        except OSError:
+            pass
+
+
+def _discard_quarantined(moved: "list[tuple[Path, Path]]") -> None:
+    for _original, quarantine in moved:
+        shutil.rmtree(quarantine, ignore_errors=True)
 
 
 def install_pymupdf(*, clear_vendored: bool = True) -> bool:
@@ -114,10 +159,17 @@ def install_pymupdf(*, clear_vendored: bool = True) -> bool:
     lib_dir = get_lib_dir()
     lib_dir.mkdir(parents=True, exist_ok=True)
 
-    if clear_vendored:
-        _clear_vendored_pymupdf_binaries()
+    # Quarantine, don't delete: a failed offline install must leave the bundled
+    # runtime intact. The old code removed it first, so a network-less machine
+    # ended up with no PyMuPDF at all -- and PyMuPDF is the sole rasteriser, so
+    # that took out even the terminal Raster rung.
+    moved = _quarantine_vendored_pymupdf() if clear_vendored else []
 
     python_exe = sys.executable
+
+    def _restore_and_fail() -> bool:
+        _restore_quarantined(moved)
+        return False
 
     try:
         subprocess.check_call(
@@ -138,20 +190,27 @@ def install_pymupdf(*, clear_vendored: bool = True) -> bool:
         print(f"[PDF Vector Importer] Command: {exc.cmd}")
         print(
             "[PDF Vector Importer] Check that Blender's bundled Python has network "
-            "access and pip is available."
+            "access and pip is available. The bundled runtime was left in place."
         )
-        return False
+        return _restore_and_fail()
     except FileNotFoundError:
         print(f"[PDF Vector Importer] Python executable not found: {python_exe}")
         print("[PDF Vector Importer] Cannot install PyMuPDF without a valid Python binary.")
-        return False
-    except OSError as exc:
-        print(f"[PDF Vector Importer] OS error during pip install: {exc}")
-        return False
+        return _restore_and_fail()
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"[PDF Vector Importer] error during pip install: {exc}")
+        return _restore_and_fail()
 
     _purge_stale_pymupdf_modules()
     ensure_lib_path()
-    return check_pymupdf()
+    if check_pymupdf():
+        _discard_quarantined(moved)
+        return True
+    # pip reported success but the result does not import (e.g. an ABI wheel
+    # that still cannot load): keep the freshly installed tree but also keep the
+    # known-good bundle available for restoration rather than silently discarding
+    # it. Restore it so the addon stays in the state it started from.
+    return _restore_and_fail()
 
 
 def ensure_pymupdf_runtime(*, auto_install: bool = False) -> bool:
