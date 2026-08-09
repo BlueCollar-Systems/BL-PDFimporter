@@ -7,7 +7,12 @@ Modes are extraction **strategy** (Auto / Vector / Raster / Hybrid), not quality
 
 ## Minimum host version
 
-**Blender 3.0** (`bl_info["blender"]` minimum). **Recommended: Blender 3.6 LTS or 5.x**.
+**Blender 3.1** (`bl_info["blender"]` minimum). **Recommended: Blender 3.6 LTS or 5.x**.
+
+Blender 3.0 is **not supported**: it bundles CPython 3.9.7, and the release ZIP
+ships a cp310-abi3 PyMuPDF wheel (`Requires-Python: >=3.10`) with no cp39
+fallback. Raising the floor to 3.1 matches the packaged ABI (Blender 3.1+
+bundles Python 3.10+).
 
 ## Oldest tested
 
@@ -17,16 +22,17 @@ Modes are extraction **strategy** (Auto / Vector / Raster / Hybrid), not quality
 | Blender 5.0–5.1 | ✅ Smoke-tested (v1.0.42+ cp310-abi3 wheel) |
 | Blender 4.5 LTS / 4.0–4.2 | ⚠️ Expected |
 | Blender 3.6 LTS | ⚠️ Expected |
-| Blender 3.0–3.5 | ⚠️ Expected after manual PyMuPDF install |
-| Blender 2.83–2.93 | ⚠️ Legacy testing only |
+| Blender 3.1–3.5 | ⚠️ Expected (Python 3.10 host matches vendored wheel) |
+| Blender 3.0.x | ❌ Not supported (Python 3.9; wheel ABI floor) |
+| Blender 2.83–2.93 | ❌ Not supported |
 | Blender 2.79 and earlier | ❌ Not supported |
 
 ## Ruby / Python ABI
 
 | Runtime | Notes |
 |---------|-------|
-| **Blender bundled Python** | 3.10 (3.6 LTS) through 3.13 (5.x) |
-| cp310-abi3 PyMuPDF wheel | v1.0.42+ for Blender 5.x |
+| **Blender bundled Python** | 3.10 (3.1–3.6) through 3.13 (5.x) |
+| cp310-abi3 PyMuPDF wheel | v1.0.42+; requires host Python >=3.10 |
 | Ruby | Not used |
 
 ## Bundled dependencies
@@ -76,7 +82,8 @@ blender --background --python-expr "import addon_utils; addon_utils.enable('pdf_
 | 4.5 LTS | 3.11 | >=1.24,<2.0 | ⚠️ Expected |
 | 4.0–4.2 | 3.11 | >=1.24,<2.0 | ⚠️ Expected |
 | 3.6 LTS | 3.10 | >=1.24,<2.0 | ⚠️ Expected |
-| 3.0–3.5 | 3.10 | >=1.24,<2.0 | ⚠️ Expected after manual install |
+| 3.1–3.5 | 3.10 | >=1.24,<2.0 | ⚠️ Expected |
+| 3.0.x | 3.9.7 | (none packaged) | ❌ Not supported |
 
 ### Blender 5.x PyMuPDF bootstrap (v1.0.42+)
 

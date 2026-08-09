@@ -299,17 +299,39 @@ class TestModel3DGeneration(unittest.TestCase):
 
 
 class TestBlenderVersionFloor(unittest.TestCase):
-    """bl_info minimum Blender version must match COMPATIBILITY.md (3.0+)."""
+    """bl_info minimum Blender version must match COMPATIBILITY.md (3.1+)."""
 
     ADDON_INIT = REPO_ROOT / "pdf_vector_importer" / "__init__.py"
 
-    def test_primary_addon_declares_blender_3_0(self) -> None:
+    def test_primary_addon_declares_blender_3_1(self) -> None:
         source = self.ADDON_INIT.read_text(encoding="utf-8")
-        self.assertIn('"blender": (3, 0, 0)', source)
+        self.assertIn('"blender": (3, 1, 0)', source)
 
     def test_legacy_entrypoint_matches_primary_floor(self) -> None:
         source = LEGACY_ADDON_INIT_PY.read_text(encoding="utf-8")
-        self.assertIn('"blender": (3, 0, 0)', source)
+        self.assertIn('"blender": (3, 1, 0)', source)
+
+    def test_vendored_pymupdf_python_floor_matches_declared_host(self) -> None:
+        """Packaged wheel must not require a newer CPython than Blender 3.1."""
+        lib = REPO_ROOT / "pdf_vector_importer" / "lib"
+        metas = sorted(lib.glob("pymupdf-*.dist-info/METADATA")) + sorted(
+            lib.glob("PyMuPDF-*.dist-info/METADATA")
+        )
+        self.assertTrue(metas, "expected vendored PyMuPDF METADATA")
+        text = metas[0].read_text(encoding="utf-8", errors="replace")
+        requires = [
+            line.split(":", 1)[1].strip()
+            for line in text.splitlines()
+            if line.lower().startswith("requires-python:")
+        ]
+        self.assertTrue(requires, "expected Requires-Python in PyMuPDF METADATA")
+        # Blender 3.1 ships Python 3.10; refuse a wheel that needs 3.11+.
+        req = requires[0].replace(" ", "")
+        self.assertTrue(
+            req.startswith(">=") and tuple(int(p) for p in req[2:].split(".")[:2])
+            <= (3, 10),
+            f"PyMuPDF Requires-Python {requires[0]!r} exceeds Blender 3.1 Python 3.10",
+        )
 
 
 class TestReleasePackaging(unittest.TestCase):

@@ -6,8 +6,8 @@ from .importer import run_import  # noqa: F401
 bl_info = {
     "name": "PDF Vector Importer for Blender",
     "author": "BlueCollar Systems",
-    "version": (1, 0, 80),
-    "blender": (3, 0, 0),
+    "version": (1, 0, 81),
+    "blender": (3, 1, 0),
     "location": "File > Import > PDF Vector Drawing (.pdf)",
     "description": "Import vector geometry, text, and images from PDFs",
     "category": "Import-Export",

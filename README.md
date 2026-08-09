@@ -1,6 +1,6 @@
 # PDF Vector Importer for Blender
 
-[![Version](https://img.shields.io/badge/Version-1.0.80-blue.svg)]()
+[![Version](https://img.shields.io/badge/Version-1.0.81-blue.svg)]()
 
 **BUILT. NOT BOUGHT.** -- BlueCollar Systems
 
@@ -145,7 +145,7 @@ Evidence levels:
 
 ## Requirements
 
-- Blender 3.0 or newer
+- Blender 3.1 or newer (Blender 3.0 ships Python 3.9; the vendored PyMuPDF wheel requires Python >=3.10)
 - Bundled Blender Python 3.10+
 - PyMuPDF >=1.24,<2.0, bundled in release ZIPs
 

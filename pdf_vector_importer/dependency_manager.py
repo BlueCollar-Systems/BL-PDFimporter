@@ -200,6 +200,24 @@ def runtime_diagnostics() -> str:
     return f"Python {py} — PyMuPDF {ver or 'unknown'}"
 
 
+def host_python_meets_floor() -> bool:
+    """Return True when the host CPython can load the vendored cp310-abi3 wheel."""
+    return sys.version_info[:2] >= (3, 10)
+
+
+def report_host_python_floor() -> bool:
+    """Emit one actionable sentence when the host Python is below the package floor."""
+    if host_python_meets_floor():
+        return True
+    py = f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+    print(
+        "[PDF Vector Importer] Host Python "
+        f"{py} is below the packaged floor (requires Python >=3.10 / Blender 3.1+). "
+        "The vendored PyMuPDF wheel cannot load on this host."
+    )
+    return False
+
+
 def print_diagnostics() -> None:
     """Print first-run diagnostic info: Blender version, Python version, PyMuPDF version."""
     print("[PDF Vector Importer] --- Dependency Diagnostics ---")
@@ -215,4 +233,5 @@ def print_diagnostics() -> None:
         print("[PDF Vector Importer] Blender: not available (headless/CLI mode)")
 
     print(f"[PDF Vector Importer] {runtime_diagnostics()}")
+    report_host_python_floor()
     print("[PDF Vector Importer] --- End Diagnostics ---")
