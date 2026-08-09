@@ -65,7 +65,9 @@ python preflight_check.py
 python preflight_check.py --diagnostics
 ```
 
-In Blender: enable add-on → Preferences → **Install PyMuPDF** if import fails on 5.x.
+If an official release install cannot load PyMuPDF, reinstall the official
+release ZIP. The Preferences installer is hidden in packaged releases; it is an
+explicit source/development tool that confirms network use and package mutation.
 
 Headless diagnostics:
 
@@ -91,7 +93,11 @@ blender --background --python-expr "import addon_utils; addon_utils.enable('pdf_
 
 1. Vendored **cp310-abi3** wheel under `pdf_vector_importer/lib/`
 2. Self-heal for missing `pymupdf/extra.py`
-3. Preferences → **Install PyMuPDF**
+3. Official release damage/incompatibility → reinstall the official release ZIP
+
+Unmanifested source/development trees may deliberately use the separately
+labelled Preferences installer after accepting its network/package-mutation
+confirmation.
 
 ### Text rendering
 
