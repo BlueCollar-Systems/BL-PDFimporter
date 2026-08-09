@@ -217,18 +217,22 @@ def ensure_pymupdf_runtime(*, auto_install: bool = False) -> bool:
     """
     Verify PyMuPDF can load in the current Blender Python process.
 
-    When *auto_install* is True and import fails (common on Blender 5.x when
-    vendored cp311 wheels ship with cp312), attempt a pip install into lib/.
+    ``auto_install`` is retained only for compatibility with older callers.
+    Runtime checks never invoke pip, contact the network, or modify the bundled
+    dependency tree.  Official release ZIPs are required to carry a complete
+    compatible runtime; a damaged or incompatible package fails closed.
     """
     if check_pymupdf():
         return True
     detail = _import_error_detail()
     if detail:
         print(f"[PDF Vector Importer] PyMuPDF import failed: {detail}")
-    if not auto_install:
-        return False
-    print("[PDF Vector Importer] Attempting automatic PyMuPDF install for this Blender Python...")
-    return install_pymupdf(clear_vendored=True)
+    if auto_install:
+        print(
+            "[PDF Vector Importer] Automatic dependency installation is disabled. "
+            "Reinstall the official release ZIP; import did not run pip or access the network."
+        )
+    return False
 
 
 def get_pymupdf_version() -> str:

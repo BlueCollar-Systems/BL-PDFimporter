@@ -39,10 +39,11 @@ bundles Python 3.10+).
 
 | Dependency | Release ZIP | Fallback |
 |------------|-------------|----------|
-| PyMuPDF (>=1.24, &lt;2.0) | ✅ Vendored under `pdf_vector_importer/lib/` | Preferences → **Install PyMuPDF** |
+| PyMuPDF (>=1.24, &lt;2.0) | ✅ Vendored under `pdf_vector_importer/lib/` | Reinstall the official release ZIP; explicit source/dev installs may use Preferences → **Install PyMuPDF** |
 | pdfcadcore | ✅ In add-on | Same |
 
-No system Python or pip required when release ZIP vendored wheel loads.
+No system Python or pip is required. Import-time checks never run pip, contact
+the network, or modify the bundled runtime.
 
 ## Legacy hardware notes
 

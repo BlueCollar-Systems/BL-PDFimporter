@@ -34,9 +34,11 @@ Powered by the pdfcadcore shared extraction library and PyMuPDF.
 4. Enable **PDF Vector Importer**
 
 Release ZIPs include a private PyMuPDF runtime under `pdf_vector_importer/lib`,
-so users do not need system Python, pip, or operating-system packages. The
-preferences-panel **Install PyMuPDF** button remains for source/dev installs and
-repairing a manually modified add-on folder.
+so users do not need system Python, pip, or operating-system packages. Import
+never runs pip, downloads packages, or modifies that runtime. The preferences-
+panel **Install PyMuPDF** button is an explicit source/development tool only;
+customers should reinstall the official release ZIP if its bundled runtime is
+damaged.
 
 **Offline install:** Release ZIPs from GitHub work without internet after download.
 

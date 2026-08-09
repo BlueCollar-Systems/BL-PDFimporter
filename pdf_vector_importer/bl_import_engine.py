@@ -2853,11 +2853,11 @@ def import_pdf(
         if not check_pymupdf():
             from .dependency_manager import ensure_pymupdf_runtime
 
-            if not ensure_pymupdf_runtime(auto_install=True):
+            if not ensure_pymupdf_runtime(auto_install=False):
                 raise RuntimeError(
-                    "PyMuPDF is not installed for this Blender Python build. "
-                    "Open addon preferences (Edit > Preferences > Add-ons > "
-                    "PDF Vector Importer) and click 'Install PyMuPDF'."
+                    "The bundled PyMuPDF runtime could not load. Reinstall the "
+                    "official PDF Vector Importer release ZIP. Import did not "
+                    "download packages, run pip, or modify the add-on."
                 )
 
         ensure_lib_path()
