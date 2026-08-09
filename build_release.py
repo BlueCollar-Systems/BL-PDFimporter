@@ -125,6 +125,13 @@ def _release_source_commit() -> str:
 def _verify_vendored_pymupdf() -> None:
     """Ensure release ZIPs include their private offline runtimes."""
     _verify_vendored_runtime()
+    runtime_helper = _VENDORED_LIB / "pymupdf" / "extra.py"
+    repair_helper = PKG / "_vendored_pymupdf_extra.py"
+    if repair_helper.read_bytes() != runtime_helper.read_bytes():
+        raise RuntimeError(
+            "Vendored PyMuPDF repair helper must be byte-identical to "
+            "pdf_vector_importer/lib/pymupdf/extra.py"
+        )
     fonttools_code = (
         "import sys; "
         f"sys.path.insert(0, r'{LIB_DIR}'); "

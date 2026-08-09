@@ -43,7 +43,8 @@ def register():
     if not ensure_pymupdf_runtime(auto_install=False):
         print(
             "[PDF Vector Importer] PyMuPDF unavailable at register time. "
-            "Open addon preferences and click Install PyMuPDF before importing."
+            "Reinstall the official release ZIP; runtime checks do not run pip "
+            "or access the network."
         )
 
 

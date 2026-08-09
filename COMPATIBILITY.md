@@ -39,10 +39,12 @@ bundles Python 3.10+).
 
 | Dependency | Release ZIP | Fallback |
 |------------|-------------|----------|
-| PyMuPDF (>=1.24, &lt;2.0) | ✅ Vendored under `pdf_vector_importer/lib/` | Preferences → **Install PyMuPDF** |
+| PyMuPDF (>=1.24, &lt;2.0) | ✅ Vendored under `pdf_vector_importer/lib/` | Reinstall the official release ZIP; explicit source/dev installs may use Preferences → **Install PyMuPDF** |
 | pdfcadcore | ✅ In add-on | Same |
 
-No system Python or pip required when release ZIP vendored wheel loads.
+No system Python or pip is required. Import-time checks never run pip or contact
+the network; they may restore only the exact bundled `extra.py` helper from the
+copy already shipped inside the release.
 
 ## Legacy hardware notes
 
@@ -63,7 +65,9 @@ python preflight_check.py
 python preflight_check.py --diagnostics
 ```
 
-In Blender: enable add-on → Preferences → **Install PyMuPDF** if import fails on 5.x.
+If an official release install cannot load PyMuPDF, reinstall the official
+release ZIP. The Preferences installer is hidden in packaged releases; it is an
+explicit source/development tool that confirms network use and package mutation.
 
 Headless diagnostics:
 
@@ -89,7 +93,11 @@ blender --background --python-expr "import addon_utils; addon_utils.enable('pdf_
 
 1. Vendored **cp310-abi3** wheel under `pdf_vector_importer/lib/`
 2. Self-heal for missing `pymupdf/extra.py`
-3. Preferences → **Install PyMuPDF**
+3. Official release damage/incompatibility → reinstall the official release ZIP
+
+Unmanifested source/development trees may deliberately use the separately
+labelled Preferences installer after accepting its network/package-mutation
+confirmation.
 
 ### Text rendering
 

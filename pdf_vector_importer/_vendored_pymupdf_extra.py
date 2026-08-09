@@ -4,7 +4,7 @@
 # Do not make changes to this file unless you know what you are doing - modify
 # the SWIG interface file instead.
 
-from sys import version_info as _swig_python_version_info  # noqa: F401
+from sys import version_info as _swig_python_version_info
 # Import the low-level C/C++ module
 if getattr(globals().get("__spec__"), "parent", None) or __package__ or "." in __name__:
     from . import _extra
@@ -217,4 +217,3 @@ def pixmap_copy(pm, src, n):
 
 def ll_JM_color_count(pm, clip):
     return _extra.ll_JM_color_count(pm, clip)
-

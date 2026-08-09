@@ -12,7 +12,12 @@ from pdf_vector_importer import dependency_manager
 from scripts import smoke_release_zip
 
 
-def _write_synthetic_release_zip(path: Path, *, include_fonttools: bool) -> None:
+def _write_synthetic_release_zip(
+    path: Path,
+    *,
+    include_fonttools: bool,
+    repair_helper_matches: bool = True,
+) -> None:
     fonttools_members = {
         "pdf_vector_importer/lib/fontTools/__init__.py",
         "pdf_vector_importer/lib/fontTools/ttLib/__init__.py",
@@ -36,6 +41,10 @@ def _write_synthetic_release_zip(path: Path, *, include_fonttools: bool) -> None
             "class _Fitz:\n    open = staticmethod(lambda *_a, **_k: None)\n"
             "def import_fitz(**_kwargs):\n    return _Fitz()\n"
         ),
+        "pdf_vector_importer/lib/pymupdf/extra.py": "# controlled helper\n",
+        "pdf_vector_importer/_vendored_pymupdf_extra.py": (
+            "# controlled helper\n" if repair_helper_matches else "# stale helper\n"
+        ),
         "pdf_vector_importer/lib/fontTools/__init__.py": "__version__ = '4.60.2'\n",
         "pdf_vector_importer/lib/fontTools/ttLib/__init__.py": "class TTFont:\n    pass\n",
         "pdf_vector_importer/lib/fontTools/cffLib/__init__.py": "class CFFFontSet:\n    pass\n",
@@ -56,13 +65,33 @@ def _write_synthetic_release_zip(path: Path, *, include_fonttools: bool) -> None
 
 
 class TestDependencyManager(unittest.TestCase):
+    def test_runtime_check_never_invokes_pip_repair(self) -> None:
+        """Import-time checks must never invoke package-manager/network repair."""
+        with patch.object(dependency_manager, "check_pymupdf", return_value=False), \
+                patch.object(dependency_manager, "_import_error_detail", return_value="missing"), \
+                patch.object(
+                    dependency_manager,
+                    "install_pymupdf",
+                    side_effect=AssertionError("runtime checks must not invoke pip"),
+                ) as installer:
+            available = dependency_manager.ensure_pymupdf_runtime(auto_install=True)
+
+        self.assertFalse(available)
+        installer.assert_not_called()
+
     def test_repairs_missing_pymupdf_extra_helper_from_backup(self) -> None:
+        canonical = (
+            Path(dependency_manager.__file__).resolve().parent
+            / "lib"
+            / "pymupdf"
+            / "extra.py"
+        ).read_bytes()
         with tempfile.TemporaryDirectory(prefix="bl_dep_repair_") as tmp:
             addon_dir = Path(tmp) / "pdf_vector_importer"
             pymupdf_dir = addon_dir / "lib" / "pymupdf"
             pymupdf_dir.mkdir(parents=True)
             backup = addon_dir / "_vendored_pymupdf_extra.py"
-            backup.write_text("# repaired helper\nVALUE = 42\n", encoding="utf-8")
+            backup.write_bytes(canonical)
             (pymupdf_dir / "_extra.pyd").write_bytes(b"compiled")
 
             fake_file = addon_dir / "dependency_manager.py"
@@ -70,10 +99,7 @@ class TestDependencyManager(unittest.TestCase):
                 repaired = dependency_manager.repair_vendored_pymupdf()
 
             self.assertTrue(repaired)
-            self.assertEqual(
-                (pymupdf_dir / "extra.py").read_text(encoding="utf-8"),
-                backup.read_text(encoding="utf-8"),
-            )
+            self.assertEqual((pymupdf_dir / "extra.py").read_bytes(), canonical)
 
     def test_failed_install_restores_the_bundled_runtime(self) -> None:
         # The clean-machine trap the third-party advice recommends walking into:
@@ -141,12 +167,12 @@ class TestDependencyManager(unittest.TestCase):
             finally:
                 sys.path[:] = original_path
 
-    def test_build_release_requires_pymupdf_extra_and_repair_backup(self) -> None:
-        source = Path(__file__).resolve().parents[1].joinpath("build_release.py").read_text(
-            encoding="utf-8"
+    def test_repair_helper_is_byte_identical_to_bundled_runtime(self) -> None:
+        package = Path(dependency_manager.__file__).resolve().parent
+        self.assertEqual(
+            (package / "_vendored_pymupdf_extra.py").read_bytes(),
+            (package / "lib" / "pymupdf" / "extra.py").read_bytes(),
         )
-        self.assertIn('_VENDORED_LIB / "pymupdf" / "extra.py"', source)
-        self.assertIn('PKG / "_vendored_pymupdf_extra.py"', source)
 
     def test_vendored_fonttools_runtime_is_pure_python_and_licensed(self) -> None:
         lib_dir = Path(__file__).resolve().parents[1] / "pdf_vector_importer" / "lib"
@@ -211,6 +237,24 @@ class TestDependencyManager(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+
+    def test_release_zip_smoke_rejects_stale_repair_helper(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="bl_zip_smoke_") as tmp:
+            zip_path = Path(tmp) / "stale-helper.zip"
+            _write_synthetic_release_zip(
+                zip_path,
+                include_fonttools=True,
+                repair_helper_matches=False,
+            )
+            script = Path(smoke_release_zip.__file__).resolve()
+            result = subprocess.run(
+                [sys.executable, str(script), str(zip_path)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("repair helper", (result.stderr + result.stdout).lower())
 
 
 if __name__ == "__main__":
