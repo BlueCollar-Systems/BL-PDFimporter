@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import os
+import types
 from pathlib import Path
 from zipfile import ZipFile
 
 import build_release
+import pytest
 
 
 def test_release_excludes_environment_bound_runtime_metadata(tmp_path: Path) -> None:
@@ -43,6 +45,33 @@ def test_prune_removes_launcher_and_its_record_entry(
     assert record.read_text(encoding="utf-8") == (
         "pymupdf/__init__.py,sha256=portable,456\n"
     )
+
+
+def test_release_validation_rejects_stale_pymupdf_repair_helper(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    package = tmp_path / "pdf_vector_importer"
+    runtime = package / "lib" / "pymupdf"
+    runtime.mkdir(parents=True)
+    (runtime / "extra.py").write_bytes(b"current helper\n")
+    (package / "_vendored_pymupdf_extra.py").write_bytes(b"stale helper\n")
+    monkeypatch.setattr(build_release, "PKG", package)
+    monkeypatch.setattr(build_release, "LIB_DIR", package / "lib")
+    monkeypatch.setattr(build_release, "_VENDORED_LIB", package / "lib")
+    monkeypatch.setattr(build_release, "_verify_vendored_runtime", lambda: None)
+    monkeypatch.setattr(
+        build_release.subprocess,
+        "run",
+        lambda *_args, **_kwargs: types.SimpleNamespace(
+            returncode=0,
+            stdout="4.60.2\n",
+            stderr="",
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="repair helper"):
+        build_release._verify_vendored_pymupdf()
 
 
 def test_release_zip_is_identical_after_source_mtimes_change(
