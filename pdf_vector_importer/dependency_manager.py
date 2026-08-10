@@ -354,6 +354,40 @@ def runtime_diagnostics() -> str:
     return f"Python {py} — PyMuPDF {ver or 'unknown'}"
 
 
+def bundled_runtime_platform_supported() -> bool:
+    """Whether the vendored PyMuPDF wheel can load on this platform at all.
+
+    The bundle is ``cp310-abi3-win_amd64`` and ships only ``.pyd``/``.dll``
+    binaries, so it is Windows-x64-only as a matter of fact, not policy.
+    """
+    return sys.platform == "win32"
+
+
+def runtime_unavailable_message() -> str:
+    """Platform-accurate text for "the bundled runtime will not load".
+
+    The previous single message told every user to "reinstall the official release
+    ZIP". On macOS and Linux that is advice to repeat the one action that cannot
+    possibly work: the ZIP contains Windows-only binaries, and since this add-on
+    no longer registers a pip installer for packaged releases there is no
+    in-product recovery path either. Saying so plainly is not a support promise --
+    it is the difference between a user who understands their situation and one who
+    reinstalls three times and concludes the product is broken.
+    """
+    if bundled_runtime_platform_supported():
+        return (
+            "The bundled PyMuPDF runtime could not load. Reinstall the official "
+            "PDF Vector Importer release ZIP. Import did not download packages or "
+            "run pip."
+        )
+    return (
+        "This release bundles a Windows-x64-only PyMuPDF runtime "
+        "(cp310-abi3-win_amd64), so it cannot load on %s. Reinstalling the release "
+        "ZIP will not change that. Import did not download packages or run pip."
+        % sys.platform
+    )
+
+
 def host_python_meets_floor() -> bool:
     """Return True when the host CPython can load the vendored cp310-abi3 wheel."""
     return sys.version_info[:2] >= (3, 10)

@@ -2854,11 +2854,12 @@ def import_pdf(
             from .dependency_manager import ensure_pymupdf_runtime
 
             if not ensure_pymupdf_runtime(auto_install=False):
-                raise RuntimeError(
-                    "The bundled PyMuPDF runtime could not load. Reinstall the "
-                    "official PDF Vector Importer release ZIP. Import did not "
-                    "download packages or run pip."
-                )
+                from .dependency_manager import runtime_unavailable_message
+
+                # Platform-accurate: on macOS/Linux the bundled wheel is
+                # Windows-only, so "reinstall the ZIP" is advice to repeat the one
+                # action that cannot work.
+                raise RuntimeError(runtime_unavailable_message())
 
         ensure_lib_path()
         from .pdfcadcore.fitz_loader import import_fitz

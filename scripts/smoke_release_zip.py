@@ -14,6 +14,12 @@ from pathlib import Path
 
 REQUIRED_MEMBERS = {
     "pdf_vector_importer/__init__.py",
+    # The single discriminator for the production pip gate. preferences.py
+    # _is_packaged_release() keys on this file, and it controls operator
+    # registration plus poll/invoke/execute. If a packaging regression drops
+    # it, every customer install silently becomes an "unmanifested source
+    # tree" and the pip/network installer re-registers -- with CI still green.
+    "pdf_vector_importer/_release_identity.json",
     "pdf_vector_importer/bl_import_engine.py",
     "pdf_vector_importer/operators.py",
     "pdf_vector_importer/pdfcadcore/fitz_loader.py",
@@ -98,6 +104,18 @@ def main() -> int:
                 raise SystemExit("pdf_vector_importer.bl_info version is invalid")
             if not callable(getattr(addon, "register", None)):
                 raise SystemExit("pdf_vector_importer.register is missing")
+            # The vendored wheel is cp310-abi3-win_amd64, so this is the only
+            # check that proves the shipped runtime actually loads -- and it can
+            # only run on Windows. Announce the skip: a silently skipped proof
+            # reads exactly like a passed one, and on ubuntu runners this branch
+            # never executed at all (see the release-zip-windows CI job).
+            if sys.platform != "win32":
+                print(
+                    "  SKIP: vendored PyMuPDF import check requires Windows "
+                    "(bundle is cp310-abi3-win_amd64); running on %s. This is NOT "
+                    "a pass -- the release-zip-windows CI job covers it."
+                    % sys.platform
+                )
             if sys.platform == "win32":
                 lib_dir = str(lib_dir)
                 code = (
