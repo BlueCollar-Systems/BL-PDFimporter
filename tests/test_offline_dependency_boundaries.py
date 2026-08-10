@@ -181,7 +181,12 @@ def test_real_import_dependency_failure_stays_offline_and_before_scene_mutation(
     monkeypatch.setattr(engine, "check_pymupdf", lambda: False)
     monkeypatch.setattr(dependency_manager, "ensure_pymupdf_runtime", offline_check)
 
-    with pytest.raises(RuntimeError, match="official PDF Vector Importer release ZIP"):
+    # Match the offline claim, not the remediation wording. The remediation text is
+    # now platform-aware (the bundle is Windows-only, so telling a macOS/Linux user
+    # to reinstall the ZIP is advice that cannot work), but "did not download
+    # packages or run pip" is invariant -- and it is the assertion this test is
+    # actually about, given its name.
+    with pytest.raises(RuntimeError, match="did not download packages or run pip"):
         engine.import_pdf("C:/controlled/missing.pdf")
 
     assert calls == [False]

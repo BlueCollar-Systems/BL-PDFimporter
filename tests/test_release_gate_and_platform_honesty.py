@@ -74,10 +74,13 @@ class TestReleaseIdentityIsContractual(unittest.TestCase):
 
 class TestPlatformHonesty(unittest.TestCase):
     def test_windows_keeps_the_reinstall_guidance(self) -> None:
+        # Both calls must sit INSIDE the patch: bundled_runtime_platform_supported()
+        # reads sys.platform at call time, so asserting it outside only passed
+        # because the author happened to be on Windows. CI runs Linux and caught it.
         with patch.object(dependency_manager.sys, "platform", "win32"):
             msg = dependency_manager.runtime_unavailable_message()
+            self.assertTrue(dependency_manager.bundled_runtime_platform_supported())
         self.assertIn("Reinstall", msg)
-        self.assertTrue(dependency_manager.bundled_runtime_platform_supported())
 
     def test_non_windows_does_not_advise_a_futile_reinstall(self) -> None:
         for plat in ("darwin", "linux"):
