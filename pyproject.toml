@@ -22,6 +22,9 @@ where = ["."]
 include = ["pdf_vector_importer*", "blender_pdf_vector_importer*"]
 
 [tool.pytest.ini_options]
+markers = [
+    "allow_network: test legitimately uses the network",
+]
 testpaths = ["tests"]
 pythonpath = ["."]
 norecursedirs = [
