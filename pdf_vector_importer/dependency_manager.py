@@ -13,6 +13,7 @@ import os
 import shutil
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 
 
@@ -108,38 +109,89 @@ def _vendored_pymupdf_paths() -> "list[Path]":
     return paths
 
 
-def _quarantine_vendored_pymupdf() -> "list[tuple[Path, Path]]":
+def _quarantine_vendored_pymupdf() -> "tuple[list[tuple[Path, Path]], list[Path]]":
     """Move the vendored wheels aside so a failed install can restore them.
 
-    The old code rmtree'd them BEFORE the pip call. On an offline clean machine
-    the pip call cannot complete, and the bundle was then gone for good --
-    exactly the destructive auto-install pattern the Phase 3 audit flagged.
-    Renaming is atomic on the same volume, so nothing is lost until the install
-    actually succeeds.
+    Returns ``(moved, unsecured)``. The caller MUST abort when *unsecured* is
+    non-empty.
+
+    Three defects an independent review reproduced by execution shaped this:
+
+    * The old code rmtree'd the bundle BEFORE the pip call, so an offline
+      machine ended up with no PyMuPDF at all. Renaming instead keeps the
+      known-good tree until the install actually succeeds.
+    * A pre-existing ``.quarantine`` directory was rmtree'd on entry. After a
+      failed restore that stale directory is the ONLY surviving copy, so
+      deleting it turned a recoverable orphan into permanent loss. The
+      quarantine name is now unique per run and we never touch one we did not
+      create.
+    * A failed rename used to be swallowed with "let pip --upgrade overwrite
+      what it can". That reasoning is wrong: ``pip install --target --upgrade``
+      rmtree's the destination directory before installing, so pip is precisely
+      the thing that destroys an unsecured bundle. Failures are now reported so
+      the caller can refuse to run pip at all.
     """
     moved: "list[tuple[Path, Path]]" = []
+    unsecured: "list[Path]" = []
+    token = uuid.uuid4().hex[:8]
     for target in _vendored_pymupdf_paths():
-        quarantine = target.with_name(target.name + ".quarantine")
-        if quarantine.exists():
-            shutil.rmtree(quarantine, ignore_errors=True)
+        quarantine = target.with_name("%s.quarantine-%s" % (target.name, token))
         try:
             target.rename(quarantine)
             moved.append((target, quarantine))
-        except OSError:
-            # Could not move it aside; leave it in place rather than risk
-            # destroying it, and let pip --upgrade overwrite what it can.
-            pass
-    return moved
+        except OSError as exc:
+            # Windows holds a directory open while its .pyd/.dll is mapped, which
+            # is the common case once anything has tried to import PyMuPDF.
+            print(
+                "[PDF Vector Importer] Could not secure a backup of "
+                f"{target.name}: {exc}"
+            )
+            unsecured.append(target)
+    return moved, unsecured
 
 
-def _restore_quarantined(moved: "list[tuple[Path, Path]]") -> None:
+def _restore_quarantined(moved: "list[tuple[Path, Path]]") -> "list[Path]":
+    """Put the quarantined bundle back. Returns the paths that could NOT be restored.
+
+    The previous version was ``except OSError: pass``, which silently orphaned the
+    only good copy: a partial rmtree of the destination leaves it existing, the
+    rename back then raises FileExistsError, and nothing ever looks in a
+    ``.quarantine`` directory again. Restore is now verified and, when a rename
+    cannot work, falls back to a copy so the bytes come back even if the
+    directory entry cannot be reused.
+    """
+    failed: "list[Path]" = []
     for original, quarantine in moved:
+        if not quarantine.exists():
+            failed.append(original)
+            continue
         if original.exists():
             shutil.rmtree(original, ignore_errors=True)
         try:
             quarantine.rename(original)
+            continue
         except OSError:
             pass
+        try:
+            # Rename refused (destination remnants, or a locked handle). Copy the
+            # contents back instead of giving up on the only good copy.
+            if quarantine.is_dir():
+                shutil.copytree(quarantine, original, dirs_exist_ok=True)
+            else:
+                shutil.copy2(quarantine, original)
+            shutil.rmtree(quarantine, ignore_errors=True)
+        except OSError as exc:
+            print(
+                "[PDF Vector Importer] COULD NOT RESTORE the bundled runtime to "
+                f"{original}: {exc}"
+            )
+            print(
+                "[PDF Vector Importer] A known-good copy is still on disk at "
+                f"{quarantine} -- move it back to {original.name} manually. "
+                "Do not delete it."
+            )
+            failed.append(original)
+    return failed
 
 
 def _discard_quarantined(moved: "list[tuple[Path, Path]]") -> None:
@@ -163,54 +215,91 @@ def install_pymupdf(*, clear_vendored: bool = True) -> bool:
     # runtime intact. The old code removed it first, so a network-less machine
     # ended up with no PyMuPDF at all -- and PyMuPDF is the sole rasteriser, so
     # that took out even the terminal Raster rung.
-    moved = _quarantine_vendored_pymupdf() if clear_vendored else []
+    moved: "list[tuple[Path, Path]]" = []
+    unsecured: "list[Path]" = []
+    if clear_vendored:
+        moved, unsecured = _quarantine_vendored_pymupdf()
+        if unsecured:
+            # Refuse to run pip at all. pip --target --upgrade rmtree's the
+            # destination, so proceeding here would destroy the very bytes we
+            # just failed to back up. Doing nothing is always recoverable;
+            # continuing is not.
+            _restore_quarantined(moved)
+            print(
+                "[PDF Vector Importer] Install aborted: could not back up "
+                + ", ".join(p.name for p in unsecured)
+                + ". Nothing was changed. Close other applications using PyMuPDF "
+                "(or restart Blender) and try again."
+            )
+            return False
 
     python_exe = sys.executable
+    restored_cleanly = True
 
     def _restore_and_fail() -> bool:
-        _restore_quarantined(moved)
+        nonlocal restored_cleanly
+        failed = _restore_quarantined(moved)
+        restored_cleanly = not failed
         return False
 
     try:
-        subprocess.check_call(
-            [
-                python_exe,
-                "-m",
-                "pip",
-                "install",
-                "--target",
-                str(lib_dir),
-                "--upgrade",
-                "PyMuPDF>=1.24,<2.0",
-            ],
-            timeout=300,
-        )
-    except subprocess.CalledProcessError as exc:
-        print(f"[PDF Vector Importer] pip install failed (exit code {exc.returncode}).")
-        print(f"[PDF Vector Importer] Command: {exc.cmd}")
-        print(
-            "[PDF Vector Importer] Check that Blender's bundled Python has network "
-            "access and pip is available. The bundled runtime was left in place."
-        )
-        return _restore_and_fail()
-    except FileNotFoundError:
-        print(f"[PDF Vector Importer] Python executable not found: {python_exe}")
-        print("[PDF Vector Importer] Cannot install PyMuPDF without a valid Python binary.")
-        return _restore_and_fail()
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        print(f"[PDF Vector Importer] error during pip install: {exc}")
-        return _restore_and_fail()
+        try:
+            subprocess.check_call(
+                [
+                    python_exe,
+                    "-m",
+                    "pip",
+                    "install",
+                    "--target",
+                    str(lib_dir),
+                    "--upgrade",
+                    "PyMuPDF>=1.24,<2.0",
+                ],
+                timeout=300,
+            )
+        except subprocess.CalledProcessError as exc:
+            print(f"[PDF Vector Importer] pip install failed (exit code {exc.returncode}).")
+            print(f"[PDF Vector Importer] Command: {exc.cmd}")
+            print(
+                "[PDF Vector Importer] Check that Blender's bundled Python has network "
+                "access and pip is available."
+            )
+            return _restore_and_fail()
+        except FileNotFoundError:
+            print(f"[PDF Vector Importer] Python executable not found: {python_exe}")
+            print("[PDF Vector Importer] Cannot install PyMuPDF without a valid Python binary.")
+            return _restore_and_fail()
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            print(f"[PDF Vector Importer] error during pip install: {exc}")
+            return _restore_and_fail()
 
-    _purge_stale_pymupdf_modules()
-    ensure_lib_path()
-    if check_pymupdf():
-        _discard_quarantined(moved)
-        return True
-    # pip reported success but the result does not import (e.g. an ABI wheel
-    # that still cannot load): keep the freshly installed tree but also keep the
-    # known-good bundle available for restoration rather than silently discarding
-    # it. Restore it so the addon stays in the state it started from.
-    return _restore_and_fail()
+        _purge_stale_pymupdf_modules()
+        ensure_lib_path()
+        if check_pymupdf():
+            _discard_quarantined(moved)
+            return True
+        # pip reported success but the result does not import (e.g. an ABI wheel
+        # that still cannot load): restore the known-good bundle so the addon
+        # stays in the state it started from.
+        return _restore_and_fail()
+    except BaseException:
+        # Any unhandled failure -- including one raised by a stubbed subprocess in
+        # a test, or a KeyboardInterrupt mid-install -- must not leave the bundle
+        # stranded in quarantine with nothing at lib/pymupdf.
+        _restore_and_fail()
+        raise
+    finally:
+        # Report the difference between "install failed, bundle intact" and
+        # "install failed, bundle NOT restored". These used to be the same
+        # message, so a user whose runtime had just been destroyed was told
+        # nothing was lost.
+        if moved and not restored_cleanly:
+            print(
+                "[PDF Vector Importer] WARNING: the bundled PyMuPDF was NOT fully "
+                "restored. See the quarantine path printed above before reinstalling."
+            )
+        elif moved and restored_cleanly:
+            print("[PDF Vector Importer] The bundled runtime was left in place.")
 
 
 def ensure_pymupdf_runtime(*, auto_install: bool = False) -> bool:
