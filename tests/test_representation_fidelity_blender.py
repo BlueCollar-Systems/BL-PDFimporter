@@ -2387,6 +2387,31 @@ def test_font_cache_uses_unique_attempt_temp_files_and_leaves_none_behind(
     assert not list(cache_path.parent.glob("*.tmp"))
 
 
+def test_disk_font_sha_memo_avoids_reread_when_identity_unchanged(
+    monkeypatch,
+    tmp_path,
+):
+    item = _item()
+    digest = item.font_asset.usable_sha256
+    cache_path = tmp_path / "bc_bl_pdf_exact_fonts" / f"{digest}.ttf"
+    cache_path.parent.mkdir(parents=True)
+    cache_path.write_bytes(item.font_asset.usable_bytes)
+    bl_text_builder._DISK_FONT_SHA_MEMO.clear()
+    reads = {"count": 0}
+    original = bl_text_builder.Path.read_bytes
+
+    def counting_read(self):
+        if self.resolve() == cache_path.resolve():
+            reads["count"] += 1
+        return original(self)
+
+    monkeypatch.setattr(bl_text_builder.Path, "read_bytes", counting_read)
+
+    assert bl_text_builder._disk_font_cache_matches(cache_path, digest) is True
+    assert bl_text_builder._disk_font_cache_matches(cache_path, digest) is True
+    assert reads["count"] == 1
+
+
 def test_missing_delivered_identity_retains_owned_refs_for_cleanup():
     owned_object = object()
     owned_data = object()

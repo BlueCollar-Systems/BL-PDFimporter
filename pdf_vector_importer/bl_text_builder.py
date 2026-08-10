@@ -34,6 +34,8 @@ _FONT_GLYPH_INK_CACHE: Dict[Tuple[str, int], bool] = {}
 _FONT_GLYPH_INK_PREFETCH_LIMIT = 4096
 _VERIFIED_FONT_ASSET_BYTES: Dict[int, Tuple[Any, str, bytes]] = {}
 _VERIFIED_PACKED_FONTS: Dict[str, Any] = {}
+# Import-session memo: resolved path → ((size, mtime_ns), sha256 hex)
+_DISK_FONT_SHA_MEMO: Dict[str, Tuple[Tuple[int, int], str]] = {}
 _TEXT_MODES = {"labels", "text", "3d_text", "glyphs", "geometry", "raster"}
 LOGGER = logging.getLogger(__name__)
 
@@ -45,6 +47,39 @@ class _OwnedConstructionError(RuntimeError):
         super().__init__(message)
         self.owned_objects = tuple(owned_objects)
         self.owned_datablocks = tuple(owned_datablocks)
+
+
+def _disk_font_cache_matches(path: Path, expected_sha: str) -> bool:
+    """True when on-disk font bytes match expected_sha.
+
+    Memoize by (path, size, mtime_ns) so dense pages do not re-read and
+    re-hash the same staged TTF/OTF for every span. Identity changes force a
+    fresh content hash; packed-byte certification remains unchanged.
+    """
+    try:
+        if not path.is_file():
+            return False
+        stat = path.stat()
+        identity = (
+            int(stat.st_size),
+            int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1e9))),
+        )
+        key = str(path.resolve())
+    except OSError:
+        return False
+    cached = _DISK_FONT_SHA_MEMO.get(key)
+    if (
+        cached is not None
+        and cached[0] == identity
+        and cached[1] == expected_sha
+    ):
+        return True
+    try:
+        actual = sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return False
+    _DISK_FONT_SHA_MEMO[key] = (identity, actual)
+    return actual == expected_sha
 
 
 def _proof_identity(item_id: str, page_number: int, source_span_id: int) -> Dict[str, Any]:
@@ -970,10 +1005,7 @@ def _load_exact_font(text_item: NormalizedText, item_id: str, page_number: int):
     font = None
     try:
         cache_dir.mkdir(parents=True, exist_ok=True)
-        cache_matches = (
-            path.exists()
-            and sha256(path.read_bytes()).hexdigest() == expected_sha
-        )
+        cache_matches = _disk_font_cache_matches(path, expected_sha)
         if not cache_matches:
             temp_path = None
             try:
@@ -3707,6 +3739,7 @@ def build_all_text(
     # so dense drawings do not re-hash identical font payloads thousands of times.
     _VERIFIED_FONT_ASSET_BYTES.clear()
     _VERIFIED_PACKED_FONTS.clear()
+    _DISK_FONT_SHA_MEMO.clear()
     count = 0
     total = max(1, len(text_items or []))
     from .import_session import cancel_heartbeat_interval
