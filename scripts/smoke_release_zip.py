@@ -55,6 +55,13 @@ def main() -> int:
                 "Release ZIP is missing required add-on members: "
                 + ", ".join(missing)
             )
+        runtime_helper = "pdf_vector_importer/lib/pymupdf/extra.py"
+        repair_helper = "pdf_vector_importer/_vendored_pymupdf_extra.py"
+        if zf.read(repair_helper) != zf.read(runtime_helper):
+            raise SystemExit(
+                "Release ZIP PyMuPDF repair helper is not byte-identical to "
+                "the bundled runtime helper"
+            )
         with tempfile.TemporaryDirectory(prefix="bl_addon_zip_") as tmp:
             zf.extractall(tmp)
             lib_dir = Path(tmp) / "pdf_vector_importer" / "lib"
