@@ -104,6 +104,18 @@ def main() -> int:
                 raise SystemExit("pdf_vector_importer.bl_info version is invalid")
             if not callable(getattr(addon, "register", None)):
                 raise SystemExit("pdf_vector_importer.register is missing")
+            # The vendored wheel is cp310-abi3-win_amd64, so this is the only
+            # check that proves the shipped runtime actually loads -- and it can
+            # only run on Windows. Announce the skip: a silently skipped proof
+            # reads exactly like a passed one, and on ubuntu runners this branch
+            # never executed at all (see the release-zip-windows CI job).
+            if sys.platform != "win32":
+                print(
+                    "  SKIP: vendored PyMuPDF import check requires Windows "
+                    "(bundle is cp310-abi3-win_amd64); running on %s. This is NOT "
+                    "a pass -- the release-zip-windows CI job covers it."
+                    % sys.platform
+                )
             if sys.platform == "win32":
                 lib_dir = str(lib_dir)
                 code = (

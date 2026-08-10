@@ -54,6 +54,33 @@ jobs:
             exit 1
           fi
 
+
+  # The bundled PyMuPDF is cp310-abi3-win_amd64. smoke_release_zip.py only performs
+  # the "does the vendored runtime actually import" check under sys.platform ==
+  # "win32", and every other job here runs ubuntu-latest -- so that check had never
+  # executed in CI. A release could have shipped a runtime that cannot load, with CI
+  # fully green. This job exists solely to run it on the platform the bundle targets.
+  release-zip-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Install build dependencies
+        run: pip install "fonttools==4.60.2"
+
+      - name: Build shipped add-on ZIP
+        run: python build_release.py
+
+      - name: Smoke the ZIP (exercises the vendored PyMuPDF import on Windows)
+        shell: bash
+        run: python scripts/smoke_release_zip.py "dist/Blender-PDF-Importer_*.zip"
+
   syntax-check:
     runs-on: ubuntu-latest
     strategy:
