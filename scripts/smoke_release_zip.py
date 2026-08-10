@@ -14,6 +14,12 @@ from pathlib import Path
 
 REQUIRED_MEMBERS = {
     "pdf_vector_importer/__init__.py",
+    # The single discriminator for the production pip gate. preferences.py
+    # _is_packaged_release() keys on this file, and it controls operator
+    # registration plus poll/invoke/execute. If a packaging regression drops
+    # it, every customer install silently becomes an "unmanifested source
+    # tree" and the pip/network installer re-registers -- with CI still green.
+    "pdf_vector_importer/_release_identity.json",
     "pdf_vector_importer/bl_import_engine.py",
     "pdf_vector_importer/operators.py",
     "pdf_vector_importer/pdfcadcore/fitz_loader.py",
