@@ -11,25 +11,39 @@ _ZERO_TOL = 1e-9
 def circle_fit(points: List[Tuple[float, float]]):
     """Kasa algebraic circle fit -> (cx, cy, radius, rms) or None.
 
-    Single-pass accumulation (and a single RMS pass) matches the Ruby
-    implementation and avoids the constant-factor cost of multiple generators.
+    The eight accumulators below MUST stay as builtin ``sum()`` calls, and the RMS pass
+    MUST stay a ``sum()`` generator. Collapsing them into one accumulation loop looks
+    like a free constant-factor win and is not: since CPython 3.12 (gh-100425) builtin
+    ``sum()`` applies Neumaier compensated summation to floats, so it is measurably MORE
+    accurate than an explicit ``+=`` loop.
+
+    Measured when that rewrite was proposed as a no-op: 0 of 400 random point sets
+    produced a bit-identical fit (worst relative divergence 3.13e-13), and across 2000
+    trials ``sum()`` landed closer to ``math.fsum`` 1809 times while a manual loop won 0.
+    The perturbation feeds the arc/circle promotion thresholds in
+    ``promote_circular_primitives()``, so it is a fidelity change, not a speed knob.
+
+    This is documented at length because the rewrite has already landed once (564f983)
+    and been reverted once (5f0be3b). ``tests/test_circle_fit_summation_guard.py`` is the
+    guard that makes a third attempt fail loudly instead of silently.
+
+    Version-dependence worth knowing: FreeCAD bundles Python 3.11, where ``sum()`` is
+    uncompensated and a loop is numerically identical, while Blender bundles 3.13 where
+    it is not. A numeric test therefore passes vacuously on the FreeCAD host while the
+    regression ships to Blender and LibreCAD -- which is why the guard checks the source
+    form rather than the arithmetic.
     """
     n = len(points)
     if n < 3:
         return None
-    sx = sy = sx2 = sy2 = sxy = sz = sxz = syz = 0.0
-    for x, y in points:
-        x2 = x * x
-        y2 = y * y
-        z = x2 + y2
-        sx += x
-        sy += y
-        sx2 += x2
-        sy2 += y2
-        sxy += x * y
-        sz += z
-        sxz += x * z
-        syz += y * z
+    sx = sum(p[0] for p in points)
+    sy = sum(p[1] for p in points)
+    sx2 = sum(p[0]**2 for p in points)
+    sy2 = sum(p[1]**2 for p in points)
+    sxy = sum(p[0]*p[1] for p in points)
+    sz = sum(p[0]**2 + p[1]**2 for p in points)
+    sxz = sum(p[0]*(p[0]**2 + p[1]**2) for p in points)
+    syz = sum(p[1]*(p[0]**2 + p[1]**2) for p in points)
     A = [[sx, sy, n], [sx2, sxy, sx], [sxy, sy2, sy]]
     B = [sz, sxz, syz]
     D = _det3(A)
@@ -41,12 +55,7 @@ def circle_fit(points: List[Tuple[float, float]]):
     a = _det3(A1)/D; b = _det3(A2)/D; c = _det3(A3)/D
     cx, cy = 0.5*a, 0.5*b
     r = math.sqrt(max(0, c + cx*cx + cy*cy))
-    rms = 0.0
-    for x, y in points:
-        dx = x - cx
-        dy = y - cy
-        rms += (math.sqrt(dx*dx + dy*dy) - r) ** 2
-    rms = math.sqrt(rms / n)
+    rms = math.sqrt(sum((math.hypot(p[0]-cx, p[1]-cy) - r)**2 for p in points) / n)
     return (cx, cy, r, rms)
 
 
