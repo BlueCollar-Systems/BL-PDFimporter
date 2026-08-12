@@ -1,6 +1,6 @@
 # PDF Vector Importer for Blender
 
-[![Version](https://img.shields.io/badge/Version-1.0.84-blue.svg)]()
+[![Version](https://img.shields.io/badge/Version-1.0.85-blue.svg)]()
 
 **BUILT. NOT BOUGHT.** -- BlueCollar Systems
 
