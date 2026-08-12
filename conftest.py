@@ -7,8 +7,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 root_s = str(ROOT)
-if root_s not in sys.path:
-    sys.path.insert(0, root_s)
+pdfcadcore_parent = str(ROOT / "pdf_vector_importer")
+for path_s in (pdfcadcore_parent, root_s):
+    if path_s not in sys.path:
+        sys.path.insert(0, path_s)
 
 # Avoid permission errors on a read-only or locked .pytest_cache in the repo.
 if os.environ.get("PYTEST_CACHE_DIR") is None:

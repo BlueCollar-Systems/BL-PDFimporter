@@ -2,16 +2,6 @@
 """Gate 0 REMEDIATE: circle_fit must preserve reviewed arc-promotion decisions."""
 from __future__ import annotations
 
-import sys
-from pathlib import Path
-
-_REPO_ROOT = Path(__file__).resolve().parents[1]
-_PDFCADCORE_PARENT = _REPO_ROOT / "pdf_vector_importer"
-for _path in (_PDFCADCORE_PARENT, _REPO_ROOT):
-    _path_s = str(_path)
-    if _path_s not in sys.path:
-        sys.path.insert(0, _path_s)
-
 import hashlib
 import json
 import math
