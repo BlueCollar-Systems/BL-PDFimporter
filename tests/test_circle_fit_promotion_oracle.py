@@ -8,7 +8,7 @@ import math
 import random
 from types import SimpleNamespace
 
-from pdfcadcore.geometry_cleanup import promote_circular_primitives
+from pdf_vector_importer.pdfcadcore.geometry_cleanup import promote_circular_primitives
 
 
 def _seed_81011_case_143_points():

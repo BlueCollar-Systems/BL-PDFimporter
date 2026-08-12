@@ -12,10 +12,10 @@ import math
 
 import pytest
 
-from pdfcadcore import stage_timing
-from pdfcadcore.stage_timing import SCHEMA, StageTimer
-from pdfcadcore.streaming import iter_pages
-from pdfcadcore.fitz_loader import import_fitz
+from pdf_vector_importer.pdfcadcore import stage_timing
+from pdf_vector_importer.pdfcadcore.stage_timing import SCHEMA, StageTimer
+from pdf_vector_importer.pdfcadcore.streaming import iter_pages
+from pdf_vector_importer.pdfcadcore.fitz_loader import import_fitz
 
 fitz = import_fitz()
 
