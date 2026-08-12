@@ -2,7 +2,10 @@
 """Gate 0 REMEDIATE: circle_fit must preserve reviewed arc-promotion decisions."""
 from __future__ import annotations
 
+import sys
 import base64
+
+import pytest
 import struct
 from types import SimpleNamespace
 
@@ -22,6 +25,10 @@ def _case_143_points():
     ]
 
 
+@pytest.mark.skipif(
+    sys.version_info < (3, 12),
+    reason="builtin sum() Neumaier compensation (3.12+) is part of the reviewed circle_fit contract",
+)
 def test_circle_fit_seed_81011_case_143_promotes_reviewed_arc():
     points = _case_143_points()
     assert len(points) == 15
