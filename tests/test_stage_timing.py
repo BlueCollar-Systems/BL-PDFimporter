@@ -9,12 +9,21 @@
 from __future__ import annotations
 
 import math
+import sys
+from pathlib import Path
 
 import pytest
 
-from pdfcadcore import stage_timing
-from pdfcadcore.stage_timing import SCHEMA, StageTimer
-from pdfcadcore.streaming import iter_pages
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_PDFCADCORE_PARENT = _REPO_ROOT / "pdf_vector_importer"
+for _path in (_PDFCADCORE_PARENT, _REPO_ROOT):
+    _path_s = str(_path)
+    if _path_s not in sys.path:
+        sys.path.insert(0, _path_s)
+
+from pdfcadcore import stage_timing  # noqa: E402
+from pdfcadcore.stage_timing import SCHEMA, StageTimer  # noqa: E402
+from pdfcadcore.streaming import iter_pages  # noqa: E402
 
 fitz = pytest.importorskip("pymupdf", reason="PyMuPDF required to build a test PDF")
 
