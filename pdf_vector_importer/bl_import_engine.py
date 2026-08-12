@@ -3121,17 +3121,19 @@ def import_pdf(
                             return False
                     return False if stream_cancelled else None
 
-                for loop_i, (page_num, page_data) in enumerate(
-                    iter_pages(
-                        doc,
-                        pages=page_numbers,
-                        progress=_on_stream_progress,
-                        **extract_kwargs,
-                    )
-                ):
-                    page_idx = page_num - 1
-                    page = doc.load_page(page_idx)
-                    yield loop_i, page_idx, page_num, page, page_data
+                stream = iter_pages(
+                    doc,
+                    pages=page_numbers,
+                    progress=_on_stream_progress,
+                    **extract_kwargs,
+                )
+                try:
+                    for loop_i, (page_num, page_data) in enumerate(stream):
+                        page_idx = page_num - 1
+                        page = doc.load_page(page_idx)
+                        yield loop_i, page_idx, page_num, page, page_data
+                finally:
+                    stream.close()
             else:
                 page_idx = page_indices[0]
                 page_num = page_idx + 1
