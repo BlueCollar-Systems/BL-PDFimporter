@@ -110,6 +110,13 @@ jobs:
       - name: Verify pdfcadcore sync manifest
         run: python pdfcadcore_sync_check.py --skip-cross-repo
 
+      - name: Show which pdfcadcore these tests import
+        # In the FreeCAD repo, a promotion-oracle failure took a full diagnostic cycle
+        # because nothing recorded which copy of the shared core the interpreter loaded
+        # (a stray editable install can shadow the repo's own). One printed line makes
+        # that class of confusion impossible to have twice.
+        run: python -c "import inspect, pdf_vector_importer.pdfcadcore as core; print('pdfcadcore ->', inspect.getfile(core))"
+
       - name: Run unit tests
         run: python -m pytest tests/ -v
 
