@@ -2615,7 +2615,7 @@ def _world_xy_close(actual, expected):
         return False
     if len(actual) < 2 or len(expected) < 2:
         return False
-    for actual_value, expected_value in zip(actual[:2], expected[:2]):
+    for actual_value, expected_value in zip(actual[:2], expected[:2]):  # noqa: B905
         actual_f = float(actual_value)
         expected_f = float(expected_value)
         if not (math.isfinite(actual_f) and math.isfinite(expected_f)):
