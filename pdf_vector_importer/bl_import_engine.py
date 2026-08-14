@@ -2603,6 +2603,29 @@ def _delivery_expected_locations(attempt_evidence, entity_ids):
     return expected
 
 
+def _world_xy_close(actual, expected):
+    """Compare world XY after page stacking.
+
+    Blender stores object world translation in float32. Absolute 1e-7 m is
+    tighter than one ULP once |coord| exceeds ~1 m (later stacked pages).
+    Scale the floor with magnitude so page-local proofs stay tight while
+    stacked-page rasters are not deleted for quantization noise.
+    """
+    if actual is None or expected is None:
+        return False
+    if len(actual) < 2 or len(expected) < 2:
+        return False
+    for actual_value, expected_value in zip(actual[:2], expected[:2]):  # noqa: B905
+        actual_f = float(actual_value)
+        expected_f = float(expected_value)
+        if not (math.isfinite(actual_f) and math.isfinite(expected_f)):
+            return False
+        scale = max(1.0, abs(expected_f), abs(actual_f))
+        if abs(actual_f - expected_f) > max(1e-7, scale * 2e-7):
+            return False
+    return True
+
+
 def _reverify_text_delivery_after_stack(
     delivery_records,
     *,
@@ -2671,12 +2694,7 @@ def _reverify_text_delivery_after_stack(
                     prior_location[1] + float(stack_offset_m),
                 ]
                 proof["expected_location_m"] = expected_location
-                if len(location) < 2 or any(
-                    abs(actual - expected) > 1e-7
-                    for actual, expected in zip(  # noqa: B905
-                        location[:2], expected_location
-                    )
-                ):
+                if not _world_xy_close(location, expected_location):
                     record_failures.append(f"final_entity_location_mismatch:{entity_id}")
             entity_proofs.append(proof)
         if not entity_ids:

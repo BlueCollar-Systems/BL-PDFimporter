@@ -1506,6 +1506,114 @@ def test_post_stack_reverification_binds_final_entity_locations(monkeypatch):
     assert proof["entities"][0]["actual_location_m"] == [0.01, -0.08, 0.0]
 
 
+def test_post_stack_reverification_accepts_float32_world_noise_on_stacked_pages(
+    monkeypatch,
+):
+    """Keep stacked-page rasters that only miss 1e-7 m in world XY.
+
+    N3 text_heavy (tracemonkey) on published v1.0.85 failed 1054 items with
+    ``final_entity_location_mismatch`` starting at page 8. The raster mesh was
+    created and ``placement_verified``; post-stack re-read of world Y differed
+    by ≈1.11e-7 m at |Y|≈2.12 m (stack offset ≈2.35 m). Absolute 1e-7 m is
+    tighter than Blender float32 ULP at that magnitude, so verification
+    deleted delivered terminal rasters and raised IncompleteImportError
+    12323/13377. Stay on the raster rung — this is a transform/proof epsilon,
+    not a mode change.
+    """
+    obj = types.SimpleNamespace(
+        name="PDF_Image_8_-1000096",
+        type="MESH",
+        location=[
+            0.0190499946475029,
+            -2.1225438117980957,
+            0.0003499999875202775,
+        ],
+    )
+    monkeypatch.setattr(
+        bl_import_engine,
+        "bpy",
+        types.SimpleNamespace(
+            data=types.SimpleNamespace(
+                objects=types.SimpleNamespace(
+                    get=lambda name: obj if name == obj.name else None
+                )
+            ),
+            context=types.SimpleNamespace(
+                view_layer=types.SimpleNamespace(update=lambda: None),
+            ),
+        ),
+    )
+    record = {
+        "page": 8,
+        "status": "delivered",
+        "final_representation": "raster",
+        "entity_ids": [obj.name],
+        "attempts": [{
+            "status": "delivered",
+            "evidence": {
+                "actual_location_m": [0.0190499946475029, 0.2244160771369934],
+                "placement_verified": True,
+                "raster_verified": True,
+            },
+        }],
+    }
+
+    failures = bl_import_engine._reverify_text_delivery_after_stack(
+        [record],
+        page_number=8,
+        stack_offset_m=-2.3469599999999997,
+    )
+
+    assert failures == []
+    proof = record["final_state_verification"]
+    assert proof["status"] == "verified"
+    assert proof["representation"] == "raster"
+
+
+def test_post_stack_reverification_still_rejects_millimetre_world_drift(monkeypatch):
+    """A 1 mm stacked-page miss must still fail closed."""
+    obj = types.SimpleNamespace(
+        name="PDF_Image_8_drift",
+        type="MESH",
+        location=[0.0190499946475029, -2.1215439228630063, 0.0],
+    )
+    monkeypatch.setattr(
+        bl_import_engine,
+        "bpy",
+        types.SimpleNamespace(
+            data=types.SimpleNamespace(
+                objects=types.SimpleNamespace(
+                    get=lambda name: obj if name == obj.name else None
+                )
+            ),
+            context=types.SimpleNamespace(
+                view_layer=types.SimpleNamespace(update=lambda: None),
+            ),
+        ),
+    )
+    record = {
+        "page": 8,
+        "status": "delivered",
+        "final_representation": "raster",
+        "entity_ids": [obj.name],
+        "attempts": [{
+            "status": "delivered",
+            "evidence": {
+                "actual_location_m": [0.0190499946475029, 0.2244160771369934],
+            },
+        }],
+    }
+
+    failures = bl_import_engine._reverify_text_delivery_after_stack(
+        [record],
+        page_number=8,
+        stack_offset_m=-2.3469599999999997,
+    )
+
+    assert failures
+    assert "final_entity_location_mismatch:PDF_Image_8_drift" in failures[0]["failures"]
+
+
 def test_post_stack_failure_cleans_owned_delivery_and_repairs_runtime_truth(monkeypatch):
     class Registry:
         def __init__(self, values=()):
