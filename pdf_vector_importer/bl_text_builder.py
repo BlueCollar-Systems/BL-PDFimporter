@@ -3979,7 +3979,7 @@ def _flush_converted_page_jobs(
     failure = _sync_view_layer(
         "positioned_conversion_final_batch_update_failed_not_impossibility_proof"
     )
-    for work, convert_failure in zip(pending, convert_failures):
+    for work, convert_failure in zip(pending, convert_failures):  # noqa: B905
         if failure is not None and convert_failure is None:
             outcome = work.aggregate_failure(failure, records=work.source_records)
         elif convert_failure is not None:
