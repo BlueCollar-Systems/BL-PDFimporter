@@ -11,7 +11,7 @@ from __future__ import annotations
 bl_info = {
     "name": "PDF Vector Importer",
     "author": "BlueCollar Systems",
-    "version": (1, 0, 86),
+    "version": (1, 0, 87),
     "blender": (3, 1, 0),
     "location": "File > Import > PDF Vector (.pdf)",
     "description": "Import PDF vector drawings as native Blender geometry",
