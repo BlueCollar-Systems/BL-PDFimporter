@@ -839,6 +839,67 @@ def test_positioned_conversion_batches_source_and_final_dependency_graph_updates
     ]
 
 
+@pytest.mark.parametrize(
+    ("mode", "expected_type"),
+    [("glyphs", "CURVE"), ("geometry", "MESH")],
+)
+def test_page_positioned_conversion_shares_two_dependency_graph_updates(
+    monkeypatch,
+    mode,
+    expected_type,
+):
+    fake, collection = _install(monkeypatch)
+    monkeypatch.setattr(
+        bl_text_builder,
+        "_apply_target_quad_affine",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        bl_text_builder,
+        "_verify_transform_and_dimensions",
+        lambda *_args, **_kwargs: (
+            [],
+            {"evaluated_bounds_verified": True},
+        ),
+    )
+    opts = types.SimpleNamespace(import_mode="vector", text_mode=mode)
+    items = []
+    for span_id in (41, 42):
+        item = _item(span_id)
+        item.text = "AB"
+        item.normalized = "AB"
+        item.source_char_layout = _character_layout()
+        item.requires_individual_positioning = True
+        items.append(item)
+
+    count = bl_text_builder.build_all_text(
+        items,
+        collection,
+        page_number=2,
+        text_mode=mode,
+        provenance_opts=opts,
+    )
+
+    assert count == 2
+    assert len(collection.objects.items) == 4
+    assert {candidate.type for candidate in collection.objects.items} == {
+        expected_type
+    }
+    assert fake.view_update_count == 2
+    records = opts._text_delivery_records
+    assert len(records) == 2
+    assert {record["final_representation"] for record in records} == {mode}
+    assert all(record["fallback_used"] is False for record in records)
+    assert all(
+        record["attempts"][-1]["evidence"].get("page_shared_dependency_graph") is True
+        for record in records
+    )
+    assert all(
+        record["attempts"][-1]["evidence"].get("dependency_graph_updates") == 2
+        for record in records
+    )
+
+
 @pytest.mark.parametrize("mode", ["text", "3d_text", "glyphs", "geometry"])
 def test_positioned_characters_share_one_attempt_owned_material(monkeypatch, mode):
     """Catch per-character shader construction returning to dense text paths."""
