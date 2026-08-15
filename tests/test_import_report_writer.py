@@ -22,6 +22,7 @@ from pdf_vector_importer.bl_import_engine import write_import_report  # noqa: E4
 from pdf_vector_importer import bl_info  # noqa: E402
 from pdf_vector_importer.pdfcadcore.import_report import (  # noqa: E402
     ImportReport,
+    build_fallback_transitions,
     build_import_contract_ready,
     build_import_report,
 )
@@ -435,6 +436,7 @@ class TestImportReportWriter(unittest.TestCase):
             self.assertEqual(data["extra"]["text_mode"], "glyphs")
             self.assertEqual(data["extra"]["text_source_spans"], 4)
             self.assertEqual(data["extra"]["text_glyph_estimate"], 22)
+            self.assertEqual(data["extra"]["fallback_transitions"], [])
             self.assertEqual(data["extra"]["actual_text_entity_types"]["entity_type"], "glyphs")
             self.assertEqual(data["extra"]["actual_text_entity_types"]["outline_curve_or_mesh"], 3)
             diagnostics = data["extra"]["diagnostics"]
@@ -487,6 +489,48 @@ class TestImportReportWriter(unittest.TestCase):
                 "retry",
             ):
                 self.assertNotIn(roadblock, recommendations)
+
+    def test_fallback_transitions_expand_from_text_delivery_items(self) -> None:
+        transitions = build_fallback_transitions(
+            {
+                "text_delivery": {
+                    "items": [
+                        {
+                            "source_span_id": 4,
+                            "requested_representation": "text",
+                            "final_representation": "raster",
+                            "fallback_used": True,
+                            "failure_reason": "exact_source_font_unavailable_for_item",
+                            "attempts": [
+                                {
+                                    "status": "impossible",
+                                    "reason": "exact_source_font_unavailable_for_item",
+                                    "evidence": {
+                                        "item_specific_proven_impossible": True,
+                                        "page_number": 1,
+                                    },
+                                }
+                            ],
+                        }
+                    ]
+                }
+            }
+        )
+        self.assertEqual(
+            transitions,
+            [
+                {
+                    "source_span_id": "4",
+                    "from_mode": "text",
+                    "to_mode": "raster",
+                    "reason_code": "exact_source_font_unavailable_for_item",
+                    "page_number": 1,
+                    "page": 1,
+                    "affirmative_impossibility": True,
+                    "generic_failure": False,
+                }
+            ],
+        )
 
 
 if __name__ == "__main__":

@@ -3106,42 +3106,54 @@ def _prepare_positioned_converted_candidate(
         )
 
 
-def _attempt_positioned_converted_characters(
-    text_item,
-    collection,
-    *,
-    page_number,
-    requested,
-    delivered,
-    item_id,
-    visual_style,
-    z_offset_m,
-):
-    """Batch positioned FONT evaluation and CURVE/MESH verification by item."""
-    layouts = tuple(getattr(text_item, "source_char_layout", ()) or ())
-    omit_whitespace_sources = any(
-        not str(getattr(layout, "text", "") or "").isspace()
-        for layout in layouts
-    )
-    mesh_factory = None
-    if delivered == "geometry":
-        mesh_factory = getattr(getattr(bpy.data, "meshes", None), "new_from_object", None)
-        if not callable(mesh_factory):
-            return AttemptOutcome.impossible(
-                "evaluated_font_to_mesh_capability_absent_for_item",
-                evidence=_host_capability_evidence(
-                    item_id,
-                    page_number,
-                    int(text_item.id),
-                    "meshes.new_from_object",
-                ),
-            )
+def _sync_view_layer(reason, *, item_id=None):
+    try:
+        bpy.context.view_layer.update()
+        return None
+    except Exception as exc:
+        evidence = {
+            "exception_type": type(exc).__name__,
+            "detail": str(exc),
+        }
+        if item_id is not None:
+            evidence["item_id"] = item_id
+        return AttemptOutcome.failed(reason, evidence=evidence)
 
-    candidates = []
-    character_evidence = []
-    shared_material = None
 
-    def character_record(candidate, outcome):
+class _PositionedConvertedWork:
+    """Create FONT sources, convert, and verify one positioned glyphs/geometry item.
+
+    ``build_all_text`` runs create for every item, then one page-level source
+    update, convert, one page-level final update, and verify. Single-item
+    delivery still uses two updates so existing per-span certificates hold.
+    """
+
+    def __init__(
+        self,
+        text_item,
+        collection,
+        *,
+        page_number,
+        requested,
+        delivered,
+        item_id,
+        visual_style,
+        z_offset_m,
+    ):
+        self.text_item = text_item
+        self.collection = collection
+        self.page_number = page_number
+        self.requested = requested
+        self.delivered = delivered
+        self.item_id = item_id
+        self.visual_style = visual_style
+        self.z_offset_m = z_offset_m
+        self.candidates = []
+        self.source_records = []
+        self.mesh_factory = None
+        self.zero_ink_carrier_index = None
+
+    def character_record(self, candidate, outcome):
         layout = candidate["layout"]
         child = candidate["child"]
         return {
@@ -3159,7 +3171,7 @@ def _attempt_positioned_converted_characters(
             "verification": dict(outcome.evidence or {}),
         }
 
-    def ownership(extra_outcomes=()):
+    def ownership(self, extra_outcomes=()):
         artifacts = []
         objects = []
         datablocks = []
@@ -3175,7 +3187,7 @@ def _attempt_positioned_converted_characters(
             ):
                 datablocks.append(data)
 
-        for candidate in candidates:
+        for candidate in self.candidates:
             add_entity(candidate.get("source"), candidate.get("source_data"))
             add_entity(candidate.get("final"), candidate.get("final_data"))
         for outcome in extra_outcomes:
@@ -3192,8 +3204,8 @@ def _attempt_positioned_converted_characters(
                     datablocks.append(value)
         return tuple(artifacts), tuple(objects), tuple(datablocks)
 
-    def aggregate_failure(failed, index=None, records=None, *, extra_evidence=None):
-        artifacts, objects, datablocks = ownership((failed,))
+    def aggregate_failure(self, failed, index=None, records=None, *, extra_evidence=None):
+        artifacts, objects, datablocks = self.ownership((failed,))
         evidence = {**dict(failed.evidence or {})}
         if index is not None:
             evidence["failed_character_index"] = index
@@ -3214,316 +3226,366 @@ def _attempt_positioned_converted_characters(
             owned_datablocks=datablocks,
         )
 
-    for index, layout in enumerate(layouts):
-        child = _character_text_item(text_item, layout)
-        glyph_id = getattr(layout, "glyph_id", None)
-        zero_ink = str(getattr(layout, "text", "") or "").isspace()
-        zero_ink_reason = "source_whitespace" if zero_ink else ""
-        source_glyph_visible_ink = None
-        if (
-            not zero_ink
-            and glyph_id is not None
-            and getattr(child, "font_asset", None) is not None
-        ):
-            try:
-                source_glyph_visible_ink = _exact_font_glyph_has_visible_ink(
-                    child.font_asset,
-                    int(glyph_id),
+    def create_sources(self):
+        layouts = tuple(getattr(self.text_item, "source_char_layout", ()) or ())
+        omit_whitespace_sources = any(
+            not str(getattr(layout, "text", "") or "").isspace()
+            for layout in layouts
+        )
+        if self.delivered == "geometry":
+            self.mesh_factory = getattr(
+                getattr(bpy.data, "meshes", None), "new_from_object", None
+            )
+            if not callable(self.mesh_factory):
+                return AttemptOutcome.impossible(
+                    "evaluated_font_to_mesh_capability_absent_for_item",
+                    evidence=_host_capability_evidence(
+                        self.item_id,
+                        self.page_number,
+                        int(self.text_item.id),
+                        "meshes.new_from_object",
+                    ),
                 )
-            except Exception as exc:
-                failure = AttemptOutcome.failed(
-                    "exact_font_glyph_visibility_unverified",
-                    evidence={
-                        "item_id": item_id,
-                        "failed_character_index": index,
-                        "glyph_id": glyph_id,
-                        "exception_type": type(exc).__name__,
-                        "detail": str(exc),
-                    },
-                )
-                return aggregate_failure(failure, index)
-            if not source_glyph_visible_ink:
-                zero_ink = True
-                zero_ink_reason = "exact_font_glyph_has_no_visible_bounds"
-        if zero_ink_reason == "source_whitespace" and omit_whitespace_sources:
-            candidates.append({
+
+        shared_material = None
+        for index, layout in enumerate(layouts):
+            child = _character_text_item(self.text_item, layout)
+            glyph_id = getattr(layout, "glyph_id", None)
+            zero_ink = str(getattr(layout, "text", "") or "").isspace()
+            zero_ink_reason = "source_whitespace" if zero_ink else ""
+            source_glyph_visible_ink = None
+            if (
+                not zero_ink
+                and glyph_id is not None
+                and getattr(child, "font_asset", None) is not None
+            ):
+                try:
+                    source_glyph_visible_ink = _exact_font_glyph_has_visible_ink(
+                        child.font_asset,
+                        int(glyph_id),
+                    )
+                except Exception as exc:
+                    failure = AttemptOutcome.failed(
+                        "exact_font_glyph_visibility_unverified",
+                        evidence={
+                            "item_id": self.item_id,
+                            "failed_character_index": index,
+                            "glyph_id": glyph_id,
+                            "exception_type": type(exc).__name__,
+                            "detail": str(exc),
+                        },
+                    )
+                    return self.aggregate_failure(failure, index)
+                if not source_glyph_visible_ink:
+                    zero_ink = True
+                    zero_ink_reason = "exact_font_glyph_has_no_visible_bounds"
+            if zero_ink_reason == "source_whitespace" and omit_whitespace_sources:
+                self.candidates.append({
+                    "index": index,
+                    "layout": layout,
+                    "child": child,
+                    "zero_ink": True,
+                    "zero_ink_reason": zero_ink_reason,
+                    "source_glyph_visible_ink": source_glyph_visible_ink,
+                    "source": None,
+                    "source_data": None,
+                    "final": None,
+                    "final_data": None,
+                })
+                continue
+            suffix = f"_c{index:04d}_g{glyph_id if glyph_id is not None else 'na'}"
+            source, source_data, failure = _create_font_candidate(
+                child,
+                self.collection,
+                page_number=self.page_number,
+                requested=self.requested,
+                delivered=self.delivered,
+                item_id=self.item_id,
+                visual_style=self.visual_style,
+                z_offset_m=self.z_offset_m,
+                entity_suffix=suffix,
+                defer_host_update=True,
+                shared_material=shared_material,
+            )
+            if failure is not None:
+                return self.aggregate_failure(failure, index)
+            if shared_material is None:
+                shared_material = source_data.materials[0]
+            self.candidates.append({
                 "index": index,
                 "layout": layout,
                 "child": child,
-                "zero_ink": True,
+                "zero_ink": zero_ink,
                 "zero_ink_reason": zero_ink_reason,
                 "source_glyph_visible_ink": source_glyph_visible_ink,
-                "source": None,
-                "source_data": None,
+                "source": source,
+                "source_data": source_data,
                 "final": None,
                 "final_data": None,
             })
-            continue
-        suffix = f"_c{index:04d}_g{glyph_id if glyph_id is not None else 'na'}"
-        source, source_data, failure = _create_font_candidate(
-            child,
-            collection,
-            page_number=page_number,
-            requested=requested,
-            delivered=delivered,
-            item_id=item_id,
-            visual_style=visual_style,
-            z_offset_m=z_offset_m,
-            entity_suffix=suffix,
-            defer_host_update=True,
-            shared_material=shared_material,
-        )
-        if failure is not None:
-            return aggregate_failure(failure, index)
-        if shared_material is None:
-            shared_material = source_data.materials[0]
-        candidates.append({
-            "index": index,
-            "layout": layout,
-            "child": child,
-            "zero_ink": zero_ink,
-            "zero_ink_reason": zero_ink_reason,
-            "source_glyph_visible_ink": source_glyph_visible_ink,
-            "source": source,
-            "source_data": source_data,
-            "final": None,
-            "final_data": None,
-        })
+        return None
 
-    try:
-        bpy.context.view_layer.update()
-    except Exception as exc:
-        failure = AttemptOutcome.failed(
-            "positioned_conversion_source_batch_update_failed_not_impossibility_proof",
-            evidence={
-                "item_id": item_id,
-                "exception_type": type(exc).__name__,
-                "detail": str(exc),
-            },
-        )
-        return aggregate_failure(failure)
-
-    source_records = []
-    for candidate in candidates:
-        if candidate["source"] is None and candidate["zero_ink"]:
-            source_outcome = AttemptOutcome.delivered(
-                None,
-                evidence={
-                    "item_id": item_id,
-                    "zero_ink_identity": True,
-                    "zero_ink_reason": candidate["zero_ink_reason"],
-                    "visible_geometry_omitted": True,
-                    "advance_preserved": True,
-                },
-            )
-            source_records.append(character_record(candidate, source_outcome))
-            continue
-        source_outcome = _verify_font_candidate(
-            candidate["source"],
-            candidate["child"],
-            delivered="text",
-            item_id=item_id,
-        )
-        if source_outcome.status != "delivered":
-            source_records.append(character_record(candidate, source_outcome))
-            return aggregate_failure(
-                source_outcome,
-                candidate["index"],
-                source_records,
-            )
-        source_records.append(character_record(candidate, source_outcome))
-
-    all_zero_ink = not any(not candidate["zero_ink"] for candidate in candidates)
-    zero_ink_carrier_index = candidates[0]["index"] if all_zero_ink else None
-
-    try:
-        depsgraph = bpy.context.evaluated_depsgraph_get()
-    except Exception as exc:
-        failure = AttemptOutcome.failed(
-            "positioned_conversion_dependency_graph_unavailable",
-            evidence={
-                "item_id": item_id,
-                "exception_type": type(exc).__name__,
-                "detail": str(exc),
-            },
-        )
-        return aggregate_failure(failure, records=source_records)
-
-    for candidate in candidates:
-        is_zero_ink_carrier = candidate["index"] == zero_ink_carrier_index
-        if candidate["zero_ink"] and not is_zero_ink_carrier:
-            continue
-        final, final_data, failure = _prepare_positioned_converted_candidate(
-            candidate["source"],
-            candidate["source_data"],
-            candidate["child"],
-            collection,
-            page_number=page_number,
-            requested=requested,
-            delivered=delivered,
-            item_id=item_id,
-            depsgraph=depsgraph,
-            mesh_factory=mesh_factory,
-            allow_empty=is_zero_ink_carrier,
-        )
-        candidate["final"] = final
-        candidate["final_data"] = final_data
-        if failure is not None:
-            records = list(source_records)
-            records[candidate["index"]] = character_record(candidate, failure)
-            return aggregate_failure(failure, candidate["index"], records)
-
-    for candidate in candidates:
-        if candidate["source"] is None:
-            continue
-        cleanup, remaining_objects, remaining_data = _remove_object_and_data(
-            candidate["source"], candidate["source_data"], collection
-        )
-        candidate["source"] = remaining_objects[0] if remaining_objects else None
-        candidate["source_data"] = remaining_data[0] if remaining_data else None
-        if cleanup.get("status") != "complete":
-            failure = AttemptOutcome.failed(
-                "superseded_font_candidate_cleanup_failed",
-                evidence={"item_id": item_id, "cleanup": cleanup},
-            )
-            return aggregate_failure(
-                failure,
-                candidate["index"],
-                source_records,
-            )
-
-    try:
-        bpy.context.view_layer.update()
-    except Exception as exc:
-        failure = AttemptOutcome.failed(
-            "positioned_conversion_final_batch_update_failed_not_impossibility_proof",
-            evidence={
-                "item_id": item_id,
-                "exception_type": type(exc).__name__,
-                "detail": str(exc),
-            },
-        )
-        return aggregate_failure(failure, records=source_records)
-
-    expected_type = "CURVE" if delivered == "glyphs" else "MESH"
-    outcomes = []
-    character_evidence = []
-    for candidate in candidates:
-        is_zero_ink_carrier = candidate["index"] == zero_ink_carrier_index
-        if candidate["zero_ink"] and not is_zero_ink_carrier:
-            source_verification = dict(
-                source_records[candidate["index"]].get("verification") or {}
-            )
-            outcome = AttemptOutcome.delivered(
-                None,
-                evidence={
-                    **source_verification,
-                    "item_id": item_id,
-                    "zero_ink_identity": True,
-                    "zero_ink_reason": candidate["zero_ink_reason"],
-                    "source_glyph_visible_ink": candidate[
-                        "source_glyph_visible_ink"
-                    ],
-                    "visible_geometry_omitted": True,
-                    "advance_preserved": True,
-                },
-            )
-            outcomes.append(outcome)
-            character_evidence.append(character_record(candidate, outcome))
-            continue
-        verification_failure, verification_evidence = _verify_converted_candidate(
-            candidate["final"],
-            candidate["final_data"],
-            candidate["child"],
-            expected_type=expected_type,
-            item_id=item_id,
-        )
-        if verification_failure is not None:
-            character_evidence.append(
-                character_record(candidate, verification_failure)
-            )
-            return aggregate_failure(
-                verification_failure,
-                candidate["index"],
-                character_evidence,
-            )
-        detail_key = "spline_count" if delivered == "glyphs" else "vertex_count"
-        detail_values = (
-            candidate["final_data"].splines
-            if delivered == "glyphs"
-            else candidate["final_data"].vertices
-        )
-        outcome = AttemptOutcome.delivered(
-            candidate["final"],
-            entity_ids=(candidate["final"].name,),
-            evidence={
-                "item_id": item_id,
-                **verification_evidence,
-                detail_key: len(detail_values),
-                **(
-                    {
+    def convert_with_depsgraph(self, depsgraph):
+        source_records = []
+        for candidate in self.candidates:
+            if candidate["source"] is None and candidate["zero_ink"]:
+                source_outcome = AttemptOutcome.delivered(
+                    None,
+                    evidence={
+                        "item_id": self.item_id,
                         "zero_ink_identity": True,
                         "zero_ink_reason": candidate["zero_ink_reason"],
                         "visible_geometry_omitted": True,
                         "advance_preserved": True,
-                    }
-                    if is_zero_ink_carrier
-                    else {}
-                ),
-            },
-            owned_artifacts=_owned_artifacts_for_text_entity(
-                candidate["final"], candidate["final_data"]
-            ),
-            owned_objects=_owned_objects_for_text_entity(candidate["final"]),
-            owned_datablocks=(candidate["final_data"],),
-        )
-        outcomes.append(outcome)
-        character_evidence.append(character_record(candidate, outcome))
-        try:
-            outcome.entity["pdf_source_char_index"] = candidate["index"]
-            glyph_id = getattr(candidate["layout"], "glyph_id", None)
-            outcome.entity["pdf_source_glyph_id"] = (
-                int(glyph_id) if glyph_id is not None else -1
+                    },
+                )
+                source_records.append(self.character_record(candidate, source_outcome))
+                continue
+            source_outcome = _verify_font_candidate(
+                candidate["source"],
+                candidate["child"],
+                delivered="text",
+                item_id=self.item_id,
             )
-        except (AttributeError, ReferenceError, TypeError, ValueError):
-            pass
+            if source_outcome.status != "delivered":
+                source_records.append(self.character_record(candidate, source_outcome))
+                return self.aggregate_failure(
+                    source_outcome,
+                    candidate["index"],
+                    source_records,
+                )
+            source_records.append(self.character_record(candidate, source_outcome))
+        self.source_records = source_records
 
-    first = next((outcome for outcome in outcomes if outcome.entity is not None), None)
-    if first is None:  # pragma: no cover - rejected before dependency-graph access
-        failure = AttemptOutcome.failed(
-            "positioned_conversion_contains_no_visible_glyphs",
-            evidence={
-                "item_id": item_id,
-                "character_count": len(candidates),
-                "character_entities": character_evidence,
-            },
+        all_zero_ink = not any(not candidate["zero_ink"] for candidate in self.candidates)
+        self.zero_ink_carrier_index = (
+            self.candidates[0]["index"] if all_zero_ink and self.candidates else None
         )
-        return aggregate_failure(failure, records=character_evidence)
-    evidence = {
-        **_font_asset_evidence(text_item),
-        **dict(first.evidence or {}),
-        "item_id": item_id,
-        "character_positioning_preserved": True,
-        "character_count": len(candidates),
-        "character_entities": character_evidence,
-        "dependency_graph_updates": 2,
-    }
-    return AttemptOutcome.delivered(
-        first.entity,
-        entity_ids=tuple(
-            entity_id for outcome in outcomes for entity_id in outcome.entity_ids
-        ),
-        evidence=evidence,
-        owned_artifacts=tuple(
-            artifact for outcome in outcomes for artifact in outcome.owned_artifacts
-        ),
-        owned_objects=tuple(
-            obj for outcome in outcomes for obj in outcome.owned_objects
-        ),
-        owned_datablocks=tuple(
-            data for outcome in outcomes for data in outcome.owned_datablocks
-        ),
+
+        for candidate in self.candidates:
+            is_zero_ink_carrier = candidate["index"] == self.zero_ink_carrier_index
+            if candidate["zero_ink"] and not is_zero_ink_carrier:
+                continue
+            final, final_data, failure = _prepare_positioned_converted_candidate(
+                candidate["source"],
+                candidate["source_data"],
+                candidate["child"],
+                self.collection,
+                page_number=self.page_number,
+                requested=self.requested,
+                delivered=self.delivered,
+                item_id=self.item_id,
+                depsgraph=depsgraph,
+                mesh_factory=self.mesh_factory,
+                allow_empty=is_zero_ink_carrier,
+            )
+            candidate["final"] = final
+            candidate["final_data"] = final_data
+            if failure is not None:
+                records = list(source_records)
+                records[candidate["index"]] = self.character_record(candidate, failure)
+                return self.aggregate_failure(failure, candidate["index"], records)
+
+        for candidate in self.candidates:
+            if candidate["source"] is None:
+                continue
+            cleanup, remaining_objects, remaining_data = _remove_object_and_data(
+                candidate["source"], candidate["source_data"], self.collection
+            )
+            candidate["source"] = remaining_objects[0] if remaining_objects else None
+            candidate["source_data"] = remaining_data[0] if remaining_data else None
+            if cleanup.get("status") != "complete":
+                failure = AttemptOutcome.failed(
+                    "superseded_font_candidate_cleanup_failed",
+                    evidence={"item_id": self.item_id, "cleanup": cleanup},
+                )
+                return self.aggregate_failure(
+                    failure,
+                    candidate["index"],
+                    source_records,
+                )
+        return None
+
+    def verify(self, *, dependency_graph_updates=2, page_shared=False):
+        expected_type = "CURVE" if self.delivered == "glyphs" else "MESH"
+        outcomes = []
+        character_evidence = []
+        for candidate in self.candidates:
+            is_zero_ink_carrier = candidate["index"] == self.zero_ink_carrier_index
+            if candidate["zero_ink"] and not is_zero_ink_carrier:
+                source_verification = dict(
+                    self.source_records[candidate["index"]].get("verification") or {}
+                )
+                outcome = AttemptOutcome.delivered(
+                    None,
+                    evidence={
+                        **source_verification,
+                        "item_id": self.item_id,
+                        "zero_ink_identity": True,
+                        "zero_ink_reason": candidate["zero_ink_reason"],
+                        "source_glyph_visible_ink": candidate[
+                            "source_glyph_visible_ink"
+                        ],
+                        "visible_geometry_omitted": True,
+                        "advance_preserved": True,
+                    },
+                )
+                outcomes.append(outcome)
+                character_evidence.append(self.character_record(candidate, outcome))
+                continue
+            verification_failure, verification_evidence = _verify_converted_candidate(
+                candidate["final"],
+                candidate["final_data"],
+                candidate["child"],
+                expected_type=expected_type,
+                item_id=self.item_id,
+            )
+            if verification_failure is not None:
+                character_evidence.append(
+                    self.character_record(candidate, verification_failure)
+                )
+                return self.aggregate_failure(
+                    verification_failure,
+                    candidate["index"],
+                    character_evidence,
+                )
+            detail_key = "spline_count" if self.delivered == "glyphs" else "vertex_count"
+            detail_values = (
+                candidate["final_data"].splines
+                if self.delivered == "glyphs"
+                else candidate["final_data"].vertices
+            )
+            outcome = AttemptOutcome.delivered(
+                candidate["final"],
+                entity_ids=(candidate["final"].name,),
+                evidence={
+                    "item_id": self.item_id,
+                    **verification_evidence,
+                    detail_key: len(detail_values),
+                    **(
+                        {
+                            "zero_ink_identity": True,
+                            "zero_ink_reason": candidate["zero_ink_reason"],
+                            "visible_geometry_omitted": True,
+                            "advance_preserved": True,
+                        }
+                        if is_zero_ink_carrier
+                        else {}
+                    ),
+                },
+                owned_artifacts=_owned_artifacts_for_text_entity(
+                    candidate["final"], candidate["final_data"]
+                ),
+                owned_objects=_owned_objects_for_text_entity(candidate["final"]),
+                owned_datablocks=(candidate["final_data"],),
+            )
+            outcomes.append(outcome)
+            character_evidence.append(self.character_record(candidate, outcome))
+            try:
+                outcome.entity["pdf_source_char_index"] = candidate["index"]
+                glyph_id = getattr(candidate["layout"], "glyph_id", None)
+                outcome.entity["pdf_source_glyph_id"] = (
+                    int(glyph_id) if glyph_id is not None else -1
+                )
+            except (AttributeError, ReferenceError, TypeError, ValueError):
+                pass
+
+        first = next((outcome for outcome in outcomes if outcome.entity is not None), None)
+        if first is None:  # pragma: no cover - rejected before dependency-graph access
+            failure = AttemptOutcome.failed(
+                "positioned_conversion_contains_no_visible_glyphs",
+                evidence={
+                    "item_id": self.item_id,
+                    "character_count": len(self.candidates),
+                    "character_entities": character_evidence,
+                },
+            )
+            return self.aggregate_failure(failure, records=character_evidence)
+        evidence = {
+            **_font_asset_evidence(self.text_item),
+            **dict(first.evidence or {}),
+            "item_id": self.item_id,
+            "character_positioning_preserved": True,
+            "character_count": len(self.candidates),
+            "character_entities": character_evidence,
+            "dependency_graph_updates": int(dependency_graph_updates),
+        }
+        if page_shared:
+            evidence["page_shared_dependency_graph"] = True
+        return AttemptOutcome.delivered(
+            first.entity,
+            entity_ids=tuple(
+                entity_id for outcome in outcomes for entity_id in outcome.entity_ids
+            ),
+            evidence=evidence,
+            owned_artifacts=tuple(
+                artifact for outcome in outcomes for artifact in outcome.owned_artifacts
+            ),
+            owned_objects=tuple(
+                obj for outcome in outcomes for obj in outcome.owned_objects
+            ),
+            owned_datablocks=tuple(
+                data for outcome in outcomes for data in outcome.owned_datablocks
+            ),
+        )
+
+    def run_item_scoped(self):
+        failure = self.create_sources()
+        if failure is not None:
+            return failure
+        failure = _sync_view_layer(
+            "positioned_conversion_source_batch_update_failed_not_impossibility_proof",
+            item_id=self.item_id,
+        )
+        if failure is not None:
+            return self.aggregate_failure(failure)
+        try:
+            depsgraph = bpy.context.evaluated_depsgraph_get()
+        except Exception as exc:
+            failure = AttemptOutcome.failed(
+                "positioned_conversion_dependency_graph_unavailable",
+                evidence={
+                    "item_id": self.item_id,
+                    "exception_type": type(exc).__name__,
+                    "detail": str(exc),
+                },
+            )
+            return self.aggregate_failure(failure, records=self.source_records)
+        failure = self.convert_with_depsgraph(depsgraph)
+        if failure is not None:
+            return failure
+        failure = _sync_view_layer(
+            "positioned_conversion_final_batch_update_failed_not_impossibility_proof",
+            item_id=self.item_id,
+        )
+        if failure is not None:
+            return self.aggregate_failure(failure, records=self.source_records)
+        return self.verify(dependency_graph_updates=2)
+
+
+def _attempt_positioned_converted_characters(
+    text_item,
+    collection,
+    *,
+    page_number,
+    requested,
+    delivered,
+    item_id,
+    visual_style,
+    z_offset_m,
+):
+    """Batch positioned FONT evaluation and CURVE/MESH verification by item."""
+    work = _PositionedConvertedWork(
+        text_item,
+        collection,
+        page_number=page_number,
+        requested=requested,
+        delivered=delivered,
+        item_id=item_id,
+        visual_style=visual_style,
+        z_offset_m=z_offset_m,
     )
+    return work.run_item_scoped()
 
 
 def _attempt_positioned_characters(
@@ -3579,6 +3641,162 @@ def _attempt_positioned_characters(
     raise ValueError(f"unsupported positioned representation: {delivered}")
 
 
+def _attempt_one_representation(
+    representation,
+    text_item,
+    collection,
+    *,
+    effective_page,
+    requested,
+    item_id,
+    visual_style,
+    z_offset_m,
+    terminal_raster_callback,
+):
+    if representation == "labels":
+        return _attempt_labels(item_id, effective_page, int(text_item.id))
+    if (
+        representation in {"text", "3d_text", "glyphs", "geometry"}
+        and bool(getattr(text_item, "requires_individual_positioning", False))
+    ):
+        return _attempt_positioned_characters(
+            text_item,
+            collection,
+            page_number=effective_page,
+            requested=requested,
+            delivered=representation,
+            item_id=item_id,
+            visual_style=visual_style,
+            z_offset_m=z_offset_m,
+        )
+    if representation in {"text", "3d_text"}:
+        return _attempt_native_font(
+            text_item,
+            collection,
+            page_number=effective_page,
+            requested=requested,
+            delivered=representation,
+            item_id=item_id,
+            visual_style=visual_style,
+            z_offset_m=z_offset_m,
+        )
+    if representation == "glyphs":
+        return _attempt_glyphs(
+            text_item,
+            collection,
+            page_number=effective_page,
+            requested=requested,
+            item_id=item_id,
+            visual_style=visual_style,
+            z_offset_m=z_offset_m,
+        )
+    if representation == "geometry":
+        return _attempt_geometry(
+            text_item,
+            collection,
+            page_number=effective_page,
+            requested=requested,
+            item_id=item_id,
+            visual_style=visual_style,
+            z_offset_m=z_offset_m,
+        )
+    return _attempt_raster(
+        text_item,
+        collection,
+        page_number=effective_page,
+        requested=requested,
+        item_id=item_id,
+        terminal_raster_callback=terminal_raster_callback,
+    )
+
+
+def _finish_text_item_delivery(
+    text_item,
+    collection,
+    *,
+    provenance_opts,
+    requested,
+    item_id,
+    effective_page,
+    obj,
+    record,
+):
+    delivered_outcome = record.pop("_delivered_outcome", None)
+    _append_delivery_record(provenance_opts, record)
+    if obj is None:
+        LOGGER.error(
+            "Blender text delivery failed for %s requested=%s attempts=%s",
+            item_id,
+            requested,
+            [
+                attempt_record.get("attempted_representation")
+                for attempt_record in record["attempts"]
+            ],
+        )
+        return None
+
+    if provenance_opts is not None and isinstance(delivered_outcome, AttemptOutcome):
+        outcomes = getattr(provenance_opts, "_text_delivery_outcomes", None)
+        if not isinstance(outcomes, dict):
+            outcomes = {}
+            provenance_opts._text_delivery_outcomes = outcomes  # noqa: B010
+        outcomes[item_id] = delivered_outcome
+
+    delivered = str(record["final_representation"])
+    if delivered != requested:
+        reason = str(record["attempts"][0].get("reason") or "item_specific_impossibility")
+        _record_text_mode_fallback(
+            provenance_opts,
+            requested=requested,
+            delivered=delivered,
+            reason=reason,
+        )
+        try:
+            obj["pdf_text_fallback_reason"] = reason
+        except Exception:
+            pass
+    _record_delivered_text_entity(provenance_opts, delivered)
+    _record_text_provenance(
+        provenance_opts,
+        page_number=effective_page,
+        text_item=text_item,
+        requested_text_mode=requested,
+        delivered_text_mode=delivered,
+        parent_handle=str(getattr(obj, "name", "") or ""),
+    )
+    return obj
+
+
+def _deliver_text_item(
+    text_item,
+    collection,
+    *,
+    provenance_opts,
+    requested,
+    item_id,
+    effective_page,
+    attempt,
+):
+    obj, record = deliver_item(
+        item_id=item_id,
+        page_number=effective_page,
+        source_span_id=int(text_item.id),
+        requested=requested,
+        attempt=attempt,
+        cleanup=lambda outcome: _cleanup_attempt(outcome, collection),
+    )
+    return _finish_text_item_delivery(
+        text_item,
+        collection,
+        provenance_opts=provenance_opts,
+        requested=requested,
+        item_id=item_id,
+        effective_page=effective_page,
+        obj=obj,
+        record=record,
+    )
+
+
 def build_text(
     text_item: NormalizedText,
     collection: bpy.types.Collection,
@@ -3615,111 +3833,190 @@ def build_text(
     item_id = f"page:{effective_page}:text:{int(text_item.id)}"
 
     def attempt(representation: str) -> AttemptOutcome:
-        if representation == "labels":
-            return _attempt_labels(item_id, effective_page, int(text_item.id))
-        if (
-            representation in {"text", "3d_text", "glyphs", "geometry"}
-            and bool(getattr(text_item, "requires_individual_positioning", False))
-        ):
-            return _attempt_positioned_characters(
-                text_item,
-                collection,
-                page_number=effective_page,
-                requested=requested,
-                delivered=representation,
-                item_id=item_id,
-                visual_style=visual_style,
-                z_offset_m=z_offset_m,
-            )
-        if representation in {"text", "3d_text"}:
-            return _attempt_native_font(
-                text_item,
-                collection,
-                page_number=effective_page,
-                requested=requested,
-                delivered=representation,
-                item_id=item_id,
-                visual_style=visual_style,
-                z_offset_m=z_offset_m,
-            )
-        if representation == "glyphs":
-            return _attempt_glyphs(
-                text_item,
-                collection,
-                page_number=effective_page,
-                requested=requested,
-                item_id=item_id,
-                visual_style=visual_style,
-                z_offset_m=z_offset_m,
-            )
-        if representation == "geometry":
-            return _attempt_geometry(
-                text_item,
-                collection,
-                page_number=effective_page,
-                requested=requested,
-                item_id=item_id,
-                visual_style=visual_style,
-                z_offset_m=z_offset_m,
-            )
-        return _attempt_raster(
+        return _attempt_one_representation(
+            representation,
             text_item,
             collection,
-            page_number=effective_page,
+            effective_page=effective_page,
             requested=requested,
             item_id=item_id,
+            visual_style=visual_style,
+            z_offset_m=z_offset_m,
             terminal_raster_callback=terminal_raster_callback,
         )
 
-    obj, record = deliver_item(
-        item_id=item_id,
-        page_number=effective_page,
-        source_span_id=int(text_item.id),
+    return _deliver_text_item(
+        text_item,
+        collection,
+        provenance_opts=provenance_opts,
         requested=requested,
+        item_id=item_id,
+        effective_page=effective_page,
         attempt=attempt,
-        cleanup=lambda outcome: _cleanup_attempt(outcome, collection),
     )
-    delivered_outcome = record.pop("_delivered_outcome", None)
-    _append_delivery_record(provenance_opts, record)
-    if obj is None:
-        LOGGER.error(
-            "Blender text delivery failed for %s requested=%s attempts=%s",
-            item_id,
-            requested,
-            [attempt_record.get("attempted_representation") for attempt_record in record["attempts"]],
-        )
-        return None
 
-    if provenance_opts is not None and isinstance(delivered_outcome, AttemptOutcome):
-        outcomes = getattr(provenance_opts, "_text_delivery_outcomes", None)
-        if not isinstance(outcomes, dict):
-            outcomes = {}
-            provenance_opts._text_delivery_outcomes = outcomes  # noqa: B010
-        outcomes[item_id] = delivered_outcome
 
-    delivered = str(record["final_representation"])
-    if delivered != requested:
-        reason = str(record["attempts"][0].get("reason") or "item_specific_impossibility")
-        _record_text_mode_fallback(
-            provenance_opts,
-            requested=requested,
-            delivered=delivered,
-            reason=reason,
-        )
+def _progress_or_cancel(progress_callback, fraction, *, during):
+    if not progress_callback:
+        return
+    progress_result = None
+    try:
+        progress_result = progress_callback(fraction)
+    except Exception:
+        pass
+    if progress_result is False:
+        from .import_session import ImportCancelledError
+
+        raise ImportCancelledError(f"PDF import cancelled {during}")
+    if not bool(getattr(bpy.app, "background", False)):
         try:
-            obj["pdf_text_fallback_reason"] = reason
+            bpy.ops.wm.redraw_timer(type="DRAW_WIN_SWAP", iterations=1)
         except Exception:
             pass
-    _record_delivered_text_entity(provenance_opts, delivered)
-    _record_text_provenance(
-        provenance_opts,
-        page_number=effective_page,
-        text_item=text_item,
-        requested_text_mode=requested,
-        delivered_text_mode=delivered,
-        parent_handle=str(getattr(obj, "name", "") or ""),
+
+
+def _flush_converted_page_jobs(
+    pending,
+    collection,
+    *,
+    requested,
+    visual_style,
+    z_offset_m,
+    provenance_opts,
+    terminal_raster_callback,
+    progress_callback,
+    total,
+):
+    count = 0
+    if not pending:
+        return count
+    failure = _sync_view_layer(
+        "positioned_conversion_source_batch_update_failed_not_impossibility_proof"
     )
-    return obj
+    if failure is not None:
+        for work in pending:
+            page_fail = work.aggregate_failure(failure)
+
+            def attempt(representation, _work=work, _fail=page_fail):
+                if representation == requested:
+                    return _fail
+                return _attempt_one_representation(
+                    representation,
+                    _work.text_item,
+                    collection,
+                    effective_page=_work.page_number,
+                    requested=requested,
+                    item_id=_work.item_id,
+                    visual_style=visual_style,
+                    z_offset_m=z_offset_m,
+                    terminal_raster_callback=terminal_raster_callback,
+                )
+
+            obj = _deliver_text_item(
+                work.text_item,
+                collection,
+                provenance_opts=provenance_opts,
+                requested=requested,
+                item_id=work.item_id,
+                effective_page=work.page_number,
+                attempt=attempt,
+            )
+            if obj is not None:
+                count += 1
+        return count
+
+    try:
+        depsgraph = bpy.context.evaluated_depsgraph_get()
+    except Exception as exc:
+        graph_fail = AttemptOutcome.failed(
+            "positioned_conversion_dependency_graph_unavailable",
+            evidence={
+                "exception_type": type(exc).__name__,
+                "detail": str(exc),
+            },
+        )
+        for work in pending:
+            page_fail = work.aggregate_failure(graph_fail)
+
+            def attempt(representation, _work=work, _fail=page_fail):
+                if representation == requested:
+                    return _fail
+                return _attempt_one_representation(
+                    representation,
+                    _work.text_item,
+                    collection,
+                    effective_page=_work.page_number,
+                    requested=requested,
+                    item_id=_work.item_id,
+                    visual_style=visual_style,
+                    z_offset_m=z_offset_m,
+                    terminal_raster_callback=terminal_raster_callback,
+                )
+
+            obj = _deliver_text_item(
+                work.text_item,
+                collection,
+                provenance_opts=provenance_opts,
+                requested=requested,
+                item_id=work.item_id,
+                effective_page=work.page_number,
+                attempt=attempt,
+            )
+            if obj is not None:
+                count += 1
+        return count
+
+    convert_failures = []
+    for index, work in enumerate(pending):
+        if progress_callback and index % max(1, total // 20 or 1) == 0:
+            _progress_or_cancel(
+                progress_callback,
+                min(1.0, (index + 1) / float(total)),
+                during="during converted text building",
+            )
+        convert_failures.append(work.convert_with_depsgraph(depsgraph))
+
+    failure = _sync_view_layer(
+        "positioned_conversion_final_batch_update_failed_not_impossibility_proof"
+    )
+    for work, convert_failure in zip(pending, convert_failures):
+        if failure is not None and convert_failure is None:
+            outcome = work.aggregate_failure(failure, records=work.source_records)
+        elif convert_failure is not None:
+            outcome = convert_failure
+        else:
+            outcome = work.verify(
+                dependency_graph_updates=2,
+                page_shared=True,
+            )
+
+        def attempt(representation, _work=work, _outcome=outcome):
+            if representation == requested:
+                return _outcome
+            return _attempt_one_representation(
+                representation,
+                _work.text_item,
+                collection,
+                effective_page=_work.page_number,
+                requested=requested,
+                item_id=_work.item_id,
+                visual_style=visual_style,
+                z_offset_m=z_offset_m,
+                terminal_raster_callback=terminal_raster_callback,
+            )
+
+        obj = _deliver_text_item(
+            work.text_item,
+            collection,
+            provenance_opts=provenance_opts,
+            requested=requested,
+            item_id=work.item_id,
+            effective_page=work.page_number,
+            attempt=attempt,
+        )
+        if obj is not None:
+            count += 1
+    return count
 
 
 def build_all_text(
@@ -3744,24 +4041,68 @@ def build_all_text(
     total = max(1, len(text_items or []))
     from .import_session import cancel_heartbeat_interval
 
+    if strict_text_fidelity is not True:
+        raise ValueError("strict_text_fidelity cannot be disabled")
+    requested = normalize_representation(text_mode)
+    converted_page = requested in {"glyphs", "geometry"}
+    pending = []
     heartbeat_every = cancel_heartbeat_interval(total)
     for idx, item in enumerate(text_items or []):
         if progress_callback and idx % heartbeat_every == 0:
-            progress_result = None
-            try:
-                progress_result = progress_callback((idx + 1) / float(total))
-            except Exception:
-                pass
-            if progress_result is False:
-                from .import_session import ImportCancelledError
+            _progress_or_cancel(
+                progress_callback,
+                (idx + 1) / float(total),
+                during="during text building",
+            )
+        queue_converted = (
+            converted_page
+            and str(getattr(item, "text", "") or "") != ""
+            and bool(getattr(item, "requires_individual_positioning", False))
+        )
+        if queue_converted:
+            effective_page = int(page_number or getattr(item, "page_number", 0) or 0)
+            item_id = f"page:{effective_page}:text:{int(item.id)}"
+            work = _PositionedConvertedWork(
+                item,
+                collection,
+                page_number=effective_page,
+                requested=requested,
+                delivered=requested,
+                item_id=item_id,
+                visual_style=visual_style,
+                z_offset_m=z_offset_m,
+            )
+            early = work.create_sources()
+            if early is not None:
+                def attempt(representation, _work=work, _early=early):
+                    if representation == requested:
+                        return _early
+                    return _attempt_one_representation(
+                        representation,
+                        _work.text_item,
+                        collection,
+                        effective_page=_work.page_number,
+                        requested=requested,
+                        item_id=_work.item_id,
+                        visual_style=visual_style,
+                        z_offset_m=z_offset_m,
+                        terminal_raster_callback=terminal_raster_callback,
+                    )
 
-                raise ImportCancelledError("PDF import cancelled during text building")
-            # redraw_timer is UI-only and poll-fails (or worse) in --background.
-            if not bool(getattr(bpy.app, "background", False)):
-                try:
-                    bpy.ops.wm.redraw_timer(type="DRAW_WIN_SWAP", iterations=1)
-                except Exception:
-                    pass
+                obj = _deliver_text_item(
+                    work.text_item,
+                    collection,
+                    provenance_opts=provenance_opts,
+                    requested=requested,
+                    item_id=work.item_id,
+                    effective_page=work.page_number,
+                    attempt=attempt,
+                )
+                if obj is not None:
+                    count += 1
+                continue
+            pending.append(work)
+            continue
         obj = build_text(
             item,
             collection,
@@ -3775,14 +4116,21 @@ def build_all_text(
         )
         if obj is not None:
             count += 1
+    count += _flush_converted_page_jobs(
+        pending,
+        collection,
+        requested=requested,
+        visual_style=visual_style,
+        z_offset_m=z_offset_m,
+        provenance_opts=provenance_opts,
+        terminal_raster_callback=terminal_raster_callback,
+        progress_callback=progress_callback,
+        total=total,
+    )
     if progress_callback:
-        progress_result = None
-        try:
-            progress_result = progress_callback(1.0)
-        except Exception:
-            pass
-        if progress_result is False:
-            from .import_session import ImportCancelledError
-
-            raise ImportCancelledError("PDF import cancelled after text building")
+        _progress_or_cancel(
+            progress_callback,
+            1.0,
+            during="after text building",
+        )
     return count
