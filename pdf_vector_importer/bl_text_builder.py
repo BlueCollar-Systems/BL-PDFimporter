@@ -175,18 +175,15 @@ def _exact_font_glyph_has_visible_ink(asset, glyph_id: int) -> bool:
 
     glyph_index = int(glyph_id)
     digest = str(getattr(asset, "usable_sha256", "") or "")
-    font_bytes = bytes(getattr(asset, "usable_bytes", b"") or b"")
-    if (
-        glyph_index < 0
-        or not digest
-        or not font_bytes
-        or sha256(font_bytes).hexdigest() != digest
-    ):
+    if glyph_index < 0 or not digest:
         raise RuntimeError("exact font glyph visibility bytes are unavailable")
     cache_key = (digest, glyph_index)
     cached = _FONT_GLYPH_INK_CACHE.get(cache_key)
     if cached is not None:
         return cached
+    font_bytes = bytes(getattr(asset, "usable_bytes", b"") or b"")
+    if not font_bytes or sha256(font_bytes).hexdigest() != digest:
+        raise RuntimeError("exact font glyph visibility bytes are unavailable")
 
     from fontTools.pens.boundsPen import BoundsPen
     from fontTools.ttLib import TTFont
@@ -669,6 +666,14 @@ class _ConvertedGlyphTemplates:
             return
         self._payloads[key] = payload
 
+    def store_fields(self, key, **fields) -> None:
+        if key is None:
+            return
+        payload = self._payloads.get(key)
+        if payload is None:
+            return
+        payload.update(fields)
+
     def get(self, key):
         if key is None:
             return None
@@ -737,6 +742,11 @@ def _positioned_font_axis_metrics(obj, text_item) -> Dict[str, Any]:
             size = float(obj.get("pdf_font_data_size", 0.0) or 0.0)
         except (AttributeError, TypeError, ValueError):
             size = 0.0
+    if not math.isfinite(size) or size <= 0.0:
+        try:
+            size = float(_positioned_font_data_size_m(text_item))
+        except (RuntimeError, TypeError, ValueError):
+            size = 0.0
     line_height_units = ascender - descender
     if (
         glyph_id < 0
@@ -794,6 +804,49 @@ def _positioned_font_axis_metrics(obj, text_item) -> Dict[str, Any]:
         "metric_source": "embedded_font_glyph_metrics",
         "zero_ink_identity": False,
     }
+
+
+def _write_metric_placement_properties(
+    obj,
+    *,
+    matrix_values,
+    metric_evidence,
+    positioned_character: bool,
+    target_quad,
+    origin,
+) -> None:
+    """Record the host affine used for later certificate readback.
+
+    Font-table dumps (glyph id, ascender, units-per-em, ...) are not placement
+    proof and are omitted: dense instance pages paid RNA ID-property writes for
+    values already held on the exact font asset.
+    """
+    obj["pdf_full_affine_applied"] = True
+    obj["pdf_metric_affine_applied"] = bool(positioned_character)
+    obj["pdf_affine_matrix"] = [
+        float(value) for row in matrix_values for value in row
+    ]
+    if not positioned_character:
+        return
+    for key in ("local_advance", "local_line_height", "local_baseline_y"):
+        if key in metric_evidence:
+            obj[f"pdf_metric_{key}"] = metric_evidence[key]
+    ul, ur, _lr, ll = tuple(
+        (float(point[0]) * MM_TO_M, float(point[1]) * MM_TO_M)
+        for point in target_quad
+    )
+    obj["pdf_metric_target_origin_m"] = [
+        float(origin[0]) * MM_TO_M,
+        float(origin[1]) * MM_TO_M,
+    ]
+    obj["pdf_metric_target_horizontal_axis_m"] = [
+        ur[0] - ul[0],
+        ur[1] - ul[1],
+    ]
+    obj["pdf_metric_target_vertical_axis_m"] = [
+        ul[0] - ll[0],
+        ul[1] - ll[1],
+    ]
 
 
 def _apply_target_quad_affine(
@@ -857,40 +910,18 @@ def _apply_target_quad_affine(
             obj.parent = carrier
             obj.matrix_parent_inverse = Matrix.Identity(4)
             obj.matrix_basis = Matrix(child_values)
-            carrier["pdf_affine_carrier_for"] = str(obj.name)
-            carrier["pdf_source_item_id"] = str(obj.get("pdf_source_item_id", "") or "")
             obj["pdf_affine_carrier"] = str(carrier.name)
             obj["pdf_affine_carrier_owned"] = True
         else:
             obj.matrix_world = Matrix(matrix_values)
-        obj["pdf_full_affine_applied"] = True
-        obj["pdf_metric_affine_applied"] = positioned_character
-        obj["pdf_target_quad_model"] = [
-            float(value) for point in target_quad for value in point
-        ]
-        obj["pdf_affine_matrix"] = [
-            float(value) for row in matrix_values for value in row
-        ]
-        for key, value in metric_evidence.items():
-            obj[f"pdf_metric_{key}"] = value
-        if positioned_character:
-            ul, ur, _lr, ll = tuple(
-                (float(point[0]) * MM_TO_M, float(point[1]) * MM_TO_M)
-                for point in target_quad
-            )
-            origin = getattr(text_item, "insertion", (0.0, 0.0))
-            obj["pdf_metric_target_origin_m"] = [
-                float(origin[0]) * MM_TO_M,
-                float(origin[1]) * MM_TO_M,
-            ]
-            obj["pdf_metric_target_horizontal_axis_m"] = [
-                ur[0] - ul[0],
-                ur[1] - ul[1],
-            ]
-            obj["pdf_metric_target_vertical_axis_m"] = [
-                ul[0] - ll[0],
-                ul[1] - ll[1],
-            ]
+        _write_metric_placement_properties(
+            obj,
+            matrix_values=matrix_values,
+            metric_evidence=metric_evidence,
+            positioned_character=positioned_character,
+            target_quad=target_quad,
+            origin=getattr(text_item, "insertion", (0.0, 0.0)),
+        )
         return carrier
     except Exception as exc:
         if carrier is not None:
@@ -1427,6 +1458,7 @@ def _create_font_candidate(
     entity_suffix: str = "",
     defer_host_update: bool = False,
     shared_material=None,
+    apply_affine: bool = True,
 ):
     font, font_outcome = _load_exact_font(text_item, item_id, page_number)
     if font_outcome is not None:
@@ -1438,6 +1470,8 @@ def _create_font_candidate(
     positioned_character = bool(getattr(text_item, "positioned_character", False))
     try:
         name = f"P{page_number}_text_{delivered}_{int(text_item.id)}{entity_suffix}"
+        if not apply_affine:
+            name = f"{name}_fontsrc"
         data = bpy.data.curves.new(name=name, type="FONT")
         data.body = str(text_item.text)
         if positioned_character:
@@ -1516,12 +1550,13 @@ def _create_font_candidate(
                 bpy.context.view_layer.update()
             except Exception:
                 pass
-        affine_carrier = _apply_target_quad_affine(
-            obj,
-            text_item,
-            z_offset_m,
-            collection=collection,
-        )
+        if apply_affine:
+            affine_carrier = _apply_target_quad_affine(
+                obj,
+                text_item,
+                z_offset_m,
+                collection=collection,
+            )
         if not defer_host_update:
             try:
                 bpy.context.view_layer.update()
@@ -1885,7 +1920,14 @@ def _verify_transform_and_dimensions(obj, text_item) -> tuple[list[str], Dict[st
     return failures, evidence
 
 
-def _verify_font_candidate(obj, text_item, *, delivered: str, item_id: str):
+def _verify_font_candidate(
+    obj,
+    text_item,
+    *,
+    delivered: str,
+    item_id: str,
+    skip_transform: bool = False,
+):
     failures = []
     verification_evidence: Dict[str, Any] = {"item_id": item_id}
     if str(getattr(obj, "type", "")) != "FONT":
@@ -1911,9 +1953,12 @@ def _verify_font_candidate(obj, text_item, *, delivered: str, item_id: str):
     material_failures, material_evidence = _verify_text_material(obj)
     failures.extend(material_failures)
     verification_evidence.update(material_evidence)
-    transform_failures, transform_evidence = _verify_transform_and_dimensions(obj, text_item)
-    failures.extend(transform_failures)
-    verification_evidence.update(transform_evidence)
+    if not skip_transform:
+        transform_failures, transform_evidence = _verify_transform_and_dimensions(
+            obj, text_item
+        )
+        failures.extend(transform_failures)
+        verification_evidence.update(transform_evidence)
     if failures:
         return AttemptOutcome.failed(
             "requested_font_representation_visual_verification_failed",
@@ -1944,7 +1989,16 @@ def _verify_font_candidate(obj, text_item, *, delivered: str, item_id: str):
     )
 
 
-def _verify_converted_candidate(final, data, text_item, *, expected_type: str, item_id: str):
+def _verify_converted_candidate(
+    final,
+    data,
+    text_item,
+    *,
+    expected_type: str,
+    item_id: str,
+    skip_material: bool = False,
+    material_evidence=None,
+):
     failures = []
     evidence: Dict[str, Any] = {
         "item_id": item_id,
@@ -1959,10 +2013,18 @@ def _verify_converted_candidate(final, data, text_item, *, expected_type: str, i
     evidence["source_text_preserved"] = source_text
     if source_text != str(text_item.text):
         failures.append("source_text_metadata_mismatch")
-    material_failures, material_evidence = _verify_text_material(final)
-    failures.extend(material_failures)
-    evidence.update(material_evidence)
-    transform_failures, transform_evidence = _verify_transform_and_dimensions(final, text_item)
+    if skip_material:
+        cached = dict(material_evidence or {})
+        if not cached.get("text_material_owned"):
+            failures.append("text_material_assignment_unverified")
+        evidence.update(cached)
+    else:
+        material_failures, verified_material = _verify_text_material(final)
+        failures.extend(material_failures)
+        evidence.update(verified_material)
+    transform_failures, transform_evidence = _verify_transform_and_dimensions(
+        final, text_item
+    )
     failures.extend(transform_failures)
     evidence.update(transform_evidence)
     if failures:
@@ -2056,12 +2118,6 @@ def _copy_object_transform(source, target) -> None:
         "pdf_affine_matrix",
         "pdf_affine_carrier",
         "pdf_affine_carrier_owned",
-        "pdf_metric_glyph_id",
-        "pdf_metric_units_per_em",
-        "pdf_metric_ascender",
-        "pdf_metric_descender",
-        "pdf_metric_advance_units",
-        "pdf_metric_line_height_units",
         "pdf_metric_local_advance",
         "pdf_metric_local_line_height",
         "pdf_metric_local_baseline_y",
@@ -3127,6 +3183,7 @@ def _prepare_positioned_converted_candidate(
     depsgraph,
     mesh_factory=None,
     allow_empty: bool = False,
+    z_offset_m: float = 0.0,
 ):
     """Convert one evaluated FONT without forcing a dependency-graph update."""
     final_data = None
@@ -3157,38 +3214,45 @@ def _prepare_positioned_converted_candidate(
                 clear = getattr(evaluated, "to_curve_clear", None)
                 if callable(clear):
                     clear()
-            if not allow_empty and not list(getattr(final_data, "splines", []) or []):
-                return None, final_data, AttemptOutcome.failed(
-                    "glyph_curve_has_no_verified_splines",
-                    evidence={"item_id": item_id},
-                    owned_artifacts=(
-                        *_owned_artifacts_for_text_entity(source, source_data),
-                        _artifact(None, final_data),
-                    ),
-                    owned_objects=_owned_objects_for_text_entity(source),
-                    owned_datablocks=(source_data, final_data),
-                )
+            if not allow_empty:
+                splines = getattr(final_data, "splines", None)
+                if splines is None or len(splines) == 0:
+                    return None, final_data, AttemptOutcome.failed(
+                        "glyph_curve_has_no_verified_splines",
+                        evidence={"item_id": item_id},
+                        owned_artifacts=(
+                            *_owned_artifacts_for_text_entity(source, source_data),
+                            _artifact(None, final_data),
+                        ),
+                        owned_objects=_owned_objects_for_text_entity(source),
+                        owned_datablocks=(source_data, final_data),
+                    )
             final_data.name = f"{source.name}_glyph_curve"
         elif delivered == "geometry":
             if not callable(mesh_factory):  # pragma: no cover - checked by caller
                 raise RuntimeError("positioned mesh conversion capability disappeared")
             final_data = mesh_factory(evaluated, depsgraph=depsgraph)
-            if not allow_empty and not list(getattr(final_data, "vertices", []) or []):
-                return None, final_data, AttemptOutcome.failed(
-                    "geometry_mesh_has_no_verified_vertices",
-                    evidence={"item_id": item_id},
-                    owned_artifacts=(
-                        *_owned_artifacts_for_text_entity(source, source_data),
-                        _artifact(None, final_data),
-                    ),
-                    owned_objects=_owned_objects_for_text_entity(source),
-                    owned_datablocks=(source_data, final_data),
-                )
+            if not allow_empty:
+                vertices = getattr(final_data, "vertices", None)
+                if vertices is None or len(vertices) == 0:
+                    return None, final_data, AttemptOutcome.failed(
+                        "geometry_mesh_has_no_verified_vertices",
+                        evidence={"item_id": item_id},
+                        owned_artifacts=(
+                            *_owned_artifacts_for_text_entity(source, source_data),
+                            _artifact(None, final_data),
+                        ),
+                        owned_objects=_owned_objects_for_text_entity(source),
+                        owned_datablocks=(source_data, final_data),
+                    )
             final_data.name = f"{source.name}_mesh"
         else:  # pragma: no cover - caller constrains the rung
             raise ValueError(f"unsupported positioned representation: {delivered}")
 
-        final = bpy.data.objects.new(source.name, final_data)
+        final_name = str(getattr(source, "name", "") or "")
+        if final_name.endswith("_fontsrc"):
+            final_name = final_name[: -len("_fontsrc")]
+        final = bpy.data.objects.new(final_name, final_data)
         _copy_object_transform(source, final)
         _set_object_metadata(
             final,
@@ -3199,11 +3263,23 @@ def _prepare_positioned_converted_candidate(
         )
         _copy_text_material_metadata(source, final)
         final["pdf_text_source"] = str(text_item.text)
+        try:
+            final["pdf_font_data_size"] = float(
+                getattr(source_data, "size", 0.0) or 0.0
+            )
+        except (AttributeError, TypeError, ValueError):
+            pass
         if allow_empty:
             final["pdf_zero_ink_identity"] = True
             final["pdf_visible_geometry_omitted"] = True
             final["pdf_advance_preserved"] = True
         collection.objects.link(final)
+        _apply_target_quad_affine(
+            final,
+            text_item,
+            z_offset_m,
+            collection=collection,
+        )
         return final, final_data, None
     except Exception as exc:
         reason = (
@@ -3275,12 +3351,6 @@ def _instance_converted_template(
             template.get("baseline_compensation_m", 0.0) or 0.0
         )
         final["pdf_converted_template_reused"] = True
-        assigned = list(getattr(final_data, "materials", []) or [])
-        if assigned:
-            try:
-                final.color = assigned[0].diffuse_color
-            except Exception:
-                pass
         collection.objects.link(final)
         _apply_target_quad_affine(
             final,
@@ -3539,6 +3609,7 @@ class _PositionedConvertedWork:
                 entity_suffix=suffix,
                 defer_host_update=True,
                 shared_material=shared_material,
+                apply_affine=False,
             )
             if failure is not None:
                 return self.aggregate_failure(failure, index)
@@ -3592,6 +3663,7 @@ class _PositionedConvertedWork:
                 candidate["child"],
                 delivered="text",
                 item_id=self.item_id,
+                skip_transform=True,
             )
             if source_outcome.status != "delivered":
                 source_records.append(self.character_record(candidate, source_outcome))
@@ -3653,6 +3725,7 @@ class _PositionedConvertedWork:
                     depsgraph=depsgraph,
                     mesh_factory=self.mesh_factory,
                     allow_empty=is_zero_ink_carrier,
+                    z_offset_m=self.z_offset_m,
                 )
             candidate["final"] = final
             candidate["final_data"] = final_data
@@ -3669,10 +3742,15 @@ class _PositionedConvertedWork:
             ):
                 source = candidate["source"]
                 source_data = candidate["source_data"]
+                if self.delivered == "glyphs":
+                    outline_count = len(getattr(final_data, "splines", ()) or ())
+                else:
+                    outline_count = len(getattr(final_data, "vertices", ()) or ())
                 self.templates.store(
                     candidate["template_key"],
                     {
                         "data": final_data,
+                        "outline_count": outline_count,
                         "font_data_size": float(
                             getattr(source_data, "size", 0.0) or 0.0
                         ),
@@ -3741,12 +3819,18 @@ class _PositionedConvertedWork:
                 outcomes.append(outcome)
                 character_evidence.append(self.character_record(candidate, outcome))
                 continue
+            reuse = bool(candidate.get("reuse_template"))
+            payload = (
+                self.templates.get(candidate.get("template_key")) if reuse else None
+            )
             verification_failure, verification_evidence = _verify_converted_candidate(
                 candidate["final"],
                 candidate["final_data"],
                 candidate["child"],
                 expected_type=expected_type,
                 item_id=self.item_id,
+                skip_material=reuse,
+                material_evidence=(payload or {}).get("material_evidence"),
             )
             if verification_failure is not None:
                 character_evidence.append(
@@ -3757,19 +3841,39 @@ class _PositionedConvertedWork:
                     candidate["index"],
                     character_evidence,
                 )
+            if not reuse:
+                self.templates.store_fields(
+                    candidate.get("template_key"),
+                    material_evidence={
+                        key: verification_evidence[key]
+                        for key in (
+                            "text_material",
+                            "text_material_owned",
+                            "expected_text_rgba",
+                            "actual_text_rgba",
+                            "actual_text_node_rgba",
+                            "text_shader_to_output_linked",
+                        )
+                        if key in verification_evidence
+                    },
+                )
             detail_key = "spline_count" if self.delivered == "glyphs" else "vertex_count"
-            detail_values = (
-                candidate["final_data"].splines
-                if self.delivered == "glyphs"
-                else candidate["final_data"].vertices
-            )
+            if reuse and payload is not None and "outline_count" in payload:
+                outline_count = payload["outline_count"]
+            else:
+                detail_values = (
+                    candidate["final_data"].splines
+                    if self.delivered == "glyphs"
+                    else candidate["final_data"].vertices
+                )
+                outline_count = len(detail_values)
             outcome = AttemptOutcome.delivered(
                 candidate["final"],
                 entity_ids=(candidate["final"].name,),
                 evidence={
                     "item_id": self.item_id,
                     **verification_evidence,
-                    detail_key: len(detail_values),
+                    detail_key: outline_count,
                     **(
                         {
                             "zero_ink_identity": True,
