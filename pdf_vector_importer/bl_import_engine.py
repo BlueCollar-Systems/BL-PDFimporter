@@ -337,6 +337,29 @@ def _text_fallback_from_provenance(provenance_opts: Any) -> Optional[Dict[str, A
     return None
 
 
+def _delivered_item_raster_count(provenance_opts: Any) -> int:
+    """Count text items whose FINAL delivered representation is a raster patch.
+
+    Item raster patches are image-textured planes (HASHED node material, no
+    viewport display colour). They need the same material/texture viewport
+    handoff as whole raster pages or the default Solid shading paints each
+    patch as a flat grey box (1011 visual oracle, raster text mode).
+    """
+    try:
+        records = list(getattr(provenance_opts, "_text_delivery_records", []) or [])
+    except (AttributeError, TypeError):
+        return 0
+    count = 0
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        status = str(record.get("status") or "").strip().lower()
+        final = str(record.get("final_representation") or "").strip().lower()
+        if status == "delivered" and final == "raster":
+            count += 1
+    return count
+
+
 def _text_delivery_from_provenance(provenance_opts: Any) -> Dict[str, Any]:
     """Build the complete, item-scoped text delivery report payload."""
     try:
@@ -3590,6 +3613,10 @@ def import_pdf(
         # Merge extended stats into return dict
         total_stats["pages"] = len(requested_page_indices)
         total_stats["collections"] = collections_created
+        # Item-scoped raster text patches are textured planes exactly like
+        # raster pages; both need the material/texture viewport handoff.
+        item_raster_patches = _delivered_item_raster_count(import_cfg)
+        total_stats["text_raster_patches_delivered"] = int(item_raster_patches)
         try:
             total_stats["focused"] = (
                 1
@@ -3599,7 +3626,9 @@ def import_pdf(
                     and _focus_view_on_import(
                         root_col,
                         keep_selected=keep_selection_after_focus,
-                        prefer_material_preview=(raster_pages_imported > 0),
+                        prefer_material_preview=(
+                            raster_pages_imported > 0 or item_raster_patches > 0
+                        ),
                     )
                 )
                 else 0
