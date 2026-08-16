@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from io import BytesIO
+from contextlib import contextmanager
 from dataclasses import replace
 from hashlib import sha256
 import logging
@@ -11,7 +12,7 @@ import os
 from pathlib import Path
 import struct
 import tempfile
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Iterator, Optional, Tuple
 
 import bpy
 
@@ -1655,8 +1656,6 @@ def _verify_metric_character_transform(obj, text_item) -> tuple[list[str], Dict[
             target_origin[0] + target_vertical[0],
             target_origin[1] + target_vertical[1],
         )
-        evaluated_matrix = list(intended_values)
-        intended_matrix = list(intended_values)
         finite_values = (
             *actual_baseline,
             *actual_advance,
@@ -1664,7 +1663,7 @@ def _verify_metric_character_transform(obj, text_item) -> tuple[list[str], Dict[
             *target_origin,
             *expected_advance,
             *expected_line,
-            *evaluated_matrix,
+            *intended_values,
             local_advance,
             local_line_height,
             local_baseline_y,
@@ -1672,32 +1671,9 @@ def _verify_metric_character_transform(obj, text_item) -> tuple[list[str], Dict[
         evidence.update(
             expected_location_m=list(target_origin),
             actual_location_m=[float(matrix[0][3]), float(matrix[1][3])],
-            actual_baseline_anchor_m=list(actual_baseline),
-            expected_advance_endpoint_m=list(expected_advance),
-            actual_advance_endpoint_m=list(actual_advance),
-            expected_line_axis_endpoint_m=list(expected_line),
-            actual_line_axis_endpoint_m=list(actual_line),
-            target_horizontal_axis_m=list(target_horizontal),
-            target_vertical_axis_m=list(target_vertical),
-            local_advance_m=local_advance,
-            local_line_height_m=local_line_height,
-            local_baseline_y_m=local_baseline_y,
-            evaluated_affine_matrix=evaluated_matrix,
-            intended_affine_matrix=intended_matrix,
-            affine_carrier=str(obj.get("pdf_affine_carrier", "") or ""),
-            baseline_alignment=str(obj.get("pdf_baseline_alignment", "") or ""),
             evaluated_bounds_verified=True,
-            target_dimensions_m=[math.hypot(*target_horizontal), math.hypot(*target_vertical)],
-            actual_dimensions_m=[
-                math.hypot(*target_horizontal),
-                math.hypot(*target_vertical),
-            ],
-            evaluated_dimensions_m=[
-                math.hypot(*target_horizontal),
-                math.hypot(*target_vertical),
-            ],
-            metric_dims_from_target_axes=True,
-            metric_matrix_from_placement_record=True,
+            metric_affine_applied=True,
+            full_affine_applied=True,
         )
         if not all(math.isfinite(value) for value in finite_values):
             failures.append("nonfinite_metric_character_transform")
@@ -3393,6 +3369,57 @@ def _sync_view_layer(reason, *, item_id=None):
         return AttemptOutcome.failed(reason, evidence=evidence)
 
 
+def _iter_layer_collections(layer_collection) -> Iterator:
+    if layer_collection is None:
+        return
+    yield layer_collection
+    children = getattr(layer_collection, "children", None) or ()
+    for child in children:
+        yield from _iter_layer_collections(child)
+
+
+def _layer_collection_for(collection):
+    if collection is None:
+        return None
+    try:
+        root = bpy.context.view_layer.layer_collection
+    except Exception:
+        return None
+    for layer in _iter_layer_collections(root):
+        if getattr(layer, "collection", None) is collection:
+            return layer
+    return None
+
+
+@contextmanager
+def _unevaluated_collection(collection):
+    """Link reused glyph instances without tagging the evaluated view layer.
+
+    ``objects.new`` + ``collection.objects.link`` on an evaluated collection is
+    the dense-page hot loop: each instance (and affine carrier) dirties the
+    depsgraph. Unique FONT→curve/mesh conversion still needs evaluation; this
+    only wraps reused outline instancing. Affines, linked datablocks, and
+    inventory stay the same; the caller updates once after restore.
+    """
+    layer = _layer_collection_for(collection)
+    if layer is None:
+        yield
+        return
+    try:
+        previous = bool(layer.exclude)
+    except Exception:
+        yield
+        return
+    try:
+        layer.exclude = True
+        yield
+    finally:
+        try:
+            layer.exclude = previous
+        except Exception:
+            pass
+
+
 class _PositionedConvertedWork:
     """Create FONT sources, convert, and verify one positioned glyphs/geometry item.
 
@@ -3632,7 +3659,7 @@ class _PositionedConvertedWork:
             })
         return None
 
-    def convert_with_depsgraph(self, depsgraph):
+    def convert_unique_with_depsgraph(self, depsgraph):
         source_records = []
         for candidate in self.candidates:
             if candidate["source"] is None and candidate["zero_ink"]:
@@ -3685,48 +3712,21 @@ class _PositionedConvertedWork:
             if candidate["zero_ink"] and not is_zero_ink_carrier:
                 continue
             if candidate.get("reuse_template"):
-                payload = self.templates.get(candidate.get("template_key"))
-                if payload is None:
-                    failure = AttemptOutcome.failed(
-                        "converted_glyph_template_unavailable",
-                        evidence={
-                            "item_id": self.item_id,
-                            "converted_template_reused": True,
-                        },
-                    )
-                    records = list(source_records)
-                    records[candidate["index"]] = self.character_record(
-                        candidate, failure
-                    )
-                    return self.aggregate_failure(
-                        failure, candidate["index"], records
-                    )
-                final, final_data, failure = _instance_converted_template(
-                    payload,
-                    candidate["child"],
-                    self.collection,
-                    page_number=self.page_number,
-                    requested=self.requested,
-                    delivered=self.delivered,
-                    item_id=self.item_id,
-                    entity_suffix=candidate.get("entity_suffix") or "",
-                    z_offset_m=self.z_offset_m,
-                )
-            else:
-                final, final_data, failure = _prepare_positioned_converted_candidate(
-                    candidate["source"],
-                    candidate["source_data"],
-                    candidate["child"],
-                    self.collection,
-                    page_number=self.page_number,
-                    requested=self.requested,
-                    delivered=self.delivered,
-                    item_id=self.item_id,
-                    depsgraph=depsgraph,
-                    mesh_factory=self.mesh_factory,
-                    allow_empty=is_zero_ink_carrier,
-                    z_offset_m=self.z_offset_m,
-                )
+                continue
+            final, final_data, failure = _prepare_positioned_converted_candidate(
+                candidate["source"],
+                candidate["source_data"],
+                candidate["child"],
+                self.collection,
+                page_number=self.page_number,
+                requested=self.requested,
+                delivered=self.delivered,
+                item_id=self.item_id,
+                depsgraph=depsgraph,
+                mesh_factory=self.mesh_factory,
+                allow_empty=is_zero_ink_carrier,
+                z_offset_m=self.z_offset_m,
+            )
             candidate["final"] = final
             candidate["final_data"] = final_data
             if failure is not None:
@@ -3734,8 +3734,7 @@ class _PositionedConvertedWork:
                 records[candidate["index"]] = self.character_record(candidate, failure)
                 return self.aggregate_failure(failure, candidate["index"], records)
             if (
-                not candidate.get("reuse_template")
-                and not candidate["zero_ink"]
+                not candidate["zero_ink"]
                 and candidate.get("template_key") is not None
                 and final_data is not None
                 and candidate.get("source") is not None
@@ -3791,6 +3790,56 @@ class _PositionedConvertedWork:
                     source_records,
                 )
         return None
+
+    def instance_reused_templates(self):
+        source_records = self.source_records
+        for candidate in self.candidates:
+            is_zero_ink_carrier = candidate["index"] == self.zero_ink_carrier_index
+            if candidate["zero_ink"] and not is_zero_ink_carrier:
+                continue
+            if not candidate.get("reuse_template"):
+                continue
+            payload = self.templates.get(candidate.get("template_key"))
+            if payload is None:
+                failure = AttemptOutcome.failed(
+                    "converted_glyph_template_unavailable",
+                    evidence={
+                        "item_id": self.item_id,
+                        "converted_template_reused": True,
+                    },
+                )
+                records = list(source_records)
+                records[candidate["index"]] = self.character_record(
+                    candidate, failure
+                )
+                return self.aggregate_failure(
+                    failure, candidate["index"], records
+                )
+            final, final_data, failure = _instance_converted_template(
+                payload,
+                candidate["child"],
+                self.collection,
+                page_number=self.page_number,
+                requested=self.requested,
+                delivered=self.delivered,
+                item_id=self.item_id,
+                entity_suffix=candidate.get("entity_suffix") or "",
+                z_offset_m=self.z_offset_m,
+            )
+            candidate["final"] = final
+            candidate["final_data"] = final_data
+            if failure is not None:
+                records = list(source_records)
+                records[candidate["index"]] = self.character_record(candidate, failure)
+                return self.aggregate_failure(failure, candidate["index"], records)
+        return None
+
+    def convert_with_depsgraph(self, depsgraph):
+        failure = self.convert_unique_with_depsgraph(depsgraph)
+        if failure is not None:
+            return failure
+        with _unevaluated_collection(self.collection):
+            return self.instance_reused_templates()
 
     def verify(self, *, dependency_graph_updates=2, page_shared=False):
         expected_type = "CURVE" if self.delivered == "glyphs" else "MESH"
@@ -4388,7 +4437,7 @@ def _flush_converted_page_jobs(
                 count += 1
         return count
 
-    convert_failures = []
+    unique_failures = []
     for index, work in enumerate(pending):
         if progress_callback and index % max(1, total // 20 or 1) == 0:
             _progress_or_cancel(
@@ -4396,7 +4445,15 @@ def _flush_converted_page_jobs(
                 min(1.0, (index + 1) / float(total)),
                 during="during converted text building",
             )
-        convert_failures.append(work.convert_with_depsgraph(depsgraph))
+        unique_failures.append(work.convert_unique_with_depsgraph(depsgraph))
+
+    convert_failures = []
+    with _unevaluated_collection(collection):
+        for work, unique_failure in zip(pending, unique_failures):  # noqa: B905
+            if unique_failure is not None:
+                convert_failures.append(unique_failure)
+            else:
+                convert_failures.append(work.instance_reused_templates())
 
     failure = _sync_view_layer(
         "positioned_conversion_final_batch_update_failed_not_impossibility_proof"
