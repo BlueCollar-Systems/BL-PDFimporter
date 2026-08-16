@@ -86,6 +86,13 @@ class _MeshData:
         self.polygons = [object()]
         self.base_dimensions = base_dimensions
 
+    def copy(self):
+        copied = _MeshData(f"{self.name}_copy", self.base_dimensions)
+        copied.vertices = list(self.vertices)
+        copied.polygons = list(self.polygons)
+        copied.materials.extend(self.materials)
+        return copied
+
 
 class _UVLayer:
     def __init__(self):
@@ -188,7 +195,14 @@ class _Materials:
 
 
 class _Object(dict):
-    def __init__(self, name: str, data, *, allow_to_curve: bool = True):
+    def __init__(
+        self,
+        name: str,
+        data,
+        *,
+        allow_to_curve: bool = True,
+        call_counter=None,
+    ):
         super().__init__()
         self.name = name
         self.data = data
@@ -199,6 +213,7 @@ class _Object(dict):
         self.matrix_world = types.SimpleNamespace(copy=lambda: "matrix")
         self._base_dimensions = getattr(data, "base_dimensions", None) or (0.020, 0.005, 0.0)
         self._allow_to_curve = allow_to_curve
+        self._call_counter = call_counter
 
     @property
     def type(self):
@@ -216,6 +231,8 @@ class _Object(dict):
 
     def to_curve(self, _depsgraph, apply_modifiers=False):
         assert apply_modifiers is False
+        if self._call_counter is not None:
+            self._call_counter.to_curve_calls += 1
         if not self._allow_to_curve:
             raise RuntimeError("curve conversion crashed")
         curve = _CurveData(f"{self.name}_outline", self.dimensions)
@@ -274,9 +291,15 @@ class _Objects:
     def __init__(self, *, allow_to_curve=True):
         self.removed = []
         self.allow_to_curve = allow_to_curve
+        self.to_curve_calls = 0
 
     def new(self, name: str, data):
-        return _Object(name, data, allow_to_curve=self.allow_to_curve)
+        return _Object(
+            name,
+            data,
+            allow_to_curve=self.allow_to_curve,
+            call_counter=self,
+        )
 
     def remove(self, obj, do_unlink=True):
         assert do_unlink is True
@@ -288,11 +311,13 @@ class _Meshes:
         self.fail = fail
         self.available = available
         self.removed = []
+        self.new_from_object_calls = 0
         if not available:
             self.new_from_object = None
 
     def new_from_object(self, evaluated, depsgraph=None):
         del depsgraph
+        self.new_from_object_calls += 1
         if not self.available:
             raise AttributeError("new_from_object unavailable")
         if self.fail:
@@ -497,6 +522,24 @@ def _character_layout():
             target_quad=((20.0, 30.0), (26.0, 30.0), (26.0, 24.0), (20.0, 24.0)),
             advance_width=6.0,
             glyph_height=6.0,
+        ),
+    )
+
+
+def _character_layout_repeated_a():
+    first, second = _character_layout()
+    return (
+        first,
+        TextCharLayout(
+            text="A",
+            glyph_id=37,
+            source_origin_pdf=second.source_origin_pdf,
+            source_bbox_pdf=second.source_bbox_pdf,
+            source_quad_pdf=second.source_quad_pdf,
+            target_origin=second.target_origin,
+            target_quad=second.target_quad,
+            advance_width=second.advance_width,
+            glyph_height=second.glyph_height,
         ),
     )
 
@@ -898,6 +941,117 @@ def test_page_positioned_conversion_shares_two_dependency_graph_updates(
         record["attempts"][-1]["evidence"].get("dependency_graph_updates") == 2
         for record in records
     )
+
+
+def _patch_positioned_conversion_fakes(monkeypatch):
+    monkeypatch.setattr(
+        bl_text_builder,
+        "_apply_target_quad_affine",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        bl_text_builder,
+        "_verify_transform_and_dimensions",
+        lambda *_args, **_kwargs: (
+            [],
+            {"evaluated_bounds_verified": True},
+        ),
+    )
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_type"),
+    [("glyphs", "CURVE"), ("geometry", "MESH")],
+)
+def test_repeated_glyph_converts_once_and_instances_each_span(
+    monkeypatch,
+    mode,
+    expected_type,
+):
+    fake, collection = _install(monkeypatch)
+    _patch_positioned_conversion_fakes(monkeypatch)
+    item = _item()
+    item.text = "AA"
+    item.normalized = "AA"
+    item.source_char_layout = _character_layout_repeated_a()
+    item.requires_individual_positioning = True
+
+    opts = types.SimpleNamespace(import_mode="vector", text_mode=mode)
+    obj = bl_text_builder.build_text(
+        item,
+        collection,
+        page_number=2,
+        text_mode=mode,
+        provenance_opts=opts,
+    )
+
+    assert obj is not None and obj.type == expected_type
+    assert len(collection.objects.items) == 2
+    assert {candidate.type for candidate in collection.objects.items} == {
+        expected_type
+    }
+    assert [candidate["pdf_text_source"] for candidate in collection.objects.items] == [
+        "A",
+        "A",
+    ]
+    if mode == "glyphs":
+        assert fake.data.objects.to_curve_calls == 1
+    else:
+        assert fake.data.meshes.new_from_object_calls == 1
+    entities = opts._text_delivery_records[-1]["attempts"][-1]["evidence"][
+        "character_entities"
+    ]
+    assert not bool(entities[0].get("verification", {}).get("converted_template_reused"))
+    assert entities[1].get("verification", {}).get("converted_template_reused") is True
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_type"),
+    [("glyphs", "CURVE"), ("geometry", "MESH")],
+)
+def test_page_repeated_glyphs_convert_once_per_unique_outline(
+    monkeypatch,
+    mode,
+    expected_type,
+):
+    fake, collection = _install(monkeypatch)
+    _patch_positioned_conversion_fakes(monkeypatch)
+    opts = types.SimpleNamespace(import_mode="vector", text_mode=mode)
+    items = []
+    for span_id in (41, 42):
+        item = _item(span_id)
+        item.text = "AB"
+        item.normalized = "AB"
+        item.source_char_layout = _character_layout()
+        item.requires_individual_positioning = True
+        items.append(item)
+
+    count = bl_text_builder.build_all_text(
+        items,
+        collection,
+        page_number=2,
+        text_mode=mode,
+        provenance_opts=opts,
+    )
+
+    assert count == 2
+    assert len(collection.objects.items) == 4
+    assert {candidate.type for candidate in collection.objects.items} == {
+        expected_type
+    }
+    assert fake.view_update_count == 2
+    assert all(record["fallback_used"] is False for record in opts._text_delivery_records)
+    if mode == "glyphs":
+        assert fake.data.objects.to_curve_calls == 2
+    else:
+        assert fake.data.meshes.new_from_object_calls == 2
+    reused_flags = [
+        bool(entry.get("verification", {}).get("converted_template_reused"))
+        for record in opts._text_delivery_records
+        for entry in record["attempts"][-1]["evidence"]["character_entities"]
+    ]
+    assert reused_flags.count(True) == 2
+    assert reused_flags.count(False) == 2
 
 
 @pytest.mark.parametrize("mode", ["text", "3d_text", "glyphs", "geometry"])

@@ -564,6 +564,86 @@ def _blender_font_normalization_extent(asset) -> int:
     return int(extent)
 
 
+def _positioned_font_data_size_m(text_item) -> float:
+    """Return the FONT data.size Blender should use for a positioned character."""
+    asset = getattr(text_item, "font_asset", None)
+    units_per_em = int(getattr(asset, "units_per_em", 0) or 0)
+    if units_per_em <= 0:
+        raise RuntimeError(
+            "exact embedded font em size is unavailable for positioned character"
+        )
+    host_calibration = (
+        float(_blender_font_normalization_extent(asset)) / float(units_per_em)
+    )
+    requested_size_mm = (
+        float(getattr(text_item, "font_size", 0.0) or 0.0) * host_calibration
+    )
+    return max(requested_size_mm * MM_TO_M, 0.0001)
+
+
+def _converted_template_key(text_item, delivered):
+    """Identity of local glyph geometry that can be instanced with a new affine."""
+    asset = getattr(text_item, "font_asset", None)
+    sha = str(getattr(asset, "usable_sha256", "") or "")
+    if not sha:
+        return None
+    glyph_id = getattr(text_item, "source_glyph_id", None)
+    try:
+        glyph_key = int(glyph_id) if glyph_id is not None else None
+    except (TypeError, ValueError):
+        return None
+    try:
+        size_m = _positioned_font_data_size_m(text_item)
+    except (RuntimeError, TypeError, ValueError):
+        return None
+    color = getattr(text_item, "color", None)
+    if isinstance(color, (tuple, list)) and len(color) >= 3:
+        try:
+            color_key = (
+                round(float(color[0]), 4),
+                round(float(color[1]), 4),
+                round(float(color[2]), 4),
+            )
+        except (TypeError, ValueError):
+            color_key = None
+    else:
+        color_key = None
+    return (
+        str(delivered),
+        sha,
+        glyph_key,
+        str(getattr(text_item, "text", "") or ""),
+        round(float(size_m), 9),
+        color_key,
+    )
+
+
+class _ConvertedGlyphTemplates:
+    """Page-scoped unique FONT→curve/mesh outlines for positioned glyphs/geometry."""
+
+    def __init__(self):
+        self._reserved = set()
+        self._payloads = {}
+
+    def reserve_source(self, key) -> bool:
+        if key is None:
+            return True
+        if key in self._reserved:
+            return False
+        self._reserved.add(key)
+        return True
+
+    def store(self, key, payload) -> None:
+        if key is None:
+            return
+        self._payloads[key] = payload
+
+    def get(self, key):
+        if key is None:
+            return None
+        return self._payloads.get(key)
+
+
 def _positioned_font_axis_metrics(obj, text_item) -> Dict[str, Any]:
     asset = getattr(text_item, "font_asset", None)
     glyph_id = getattr(text_item, "source_glyph_id", None)
@@ -612,11 +692,20 @@ def _positioned_font_axis_metrics(obj, text_item) -> Dict[str, Any]:
         units_per_em = int(asset.units_per_em)
         advances = tuple(asset.glyph_advances)
         advance_units = int(advances[glyph_id])
-        size = float(obj.data.size)
     except (AttributeError, IndexError, TypeError, ValueError) as exc:
         raise RuntimeError(
             "exact embedded font metrics are unavailable for positioned character"
         ) from exc
+    size = 0.0
+    try:
+        size = float(getattr(getattr(obj, "data", None), "size", 0.0) or 0.0)
+    except (AttributeError, TypeError, ValueError):
+        size = 0.0
+    if not math.isfinite(size) or size <= 0.0:
+        try:
+            size = float(obj.get("pdf_font_data_size", 0.0) or 0.0)
+        except (AttributeError, TypeError, ValueError):
+            size = 0.0
     line_height_units = ascender - descender
     if (
         glyph_id < 0
@@ -1314,21 +1403,10 @@ def _create_font_candidate(
             # Blender normalizes a vector font by its global bbox height, not
             # its em size; scale data.size so the rendered em equals the
             # source em (see _blender_font_normalization_extent).
-            asset = getattr(text_item, "font_asset", None)
-            units_per_em = int(getattr(asset, "units_per_em", 0) or 0)
-            if units_per_em <= 0:
-                raise RuntimeError(
-                    "exact embedded font em size is unavailable for positioned character"
-                )
-            host_calibration = (
-                float(_blender_font_normalization_extent(asset)) / float(units_per_em)
-            )
-            requested_size_mm = (
-                float(getattr(text_item, "font_size", 0.0) or 0.0) * host_calibration
-            )
+            data.size = _positioned_font_data_size_m(text_item)
         else:
             requested_size_mm = float(_calibrated_text_size_mm(text_item))
-        data.size = max(requested_size_mm * MM_TO_M, 0.0001)
+            data.size = max(requested_size_mm * MM_TO_M, 0.0001)
         data.font = font
         data.align_x = "LEFT"
         baseline_alignment = "BOTTOM_BASELINE"
@@ -3106,6 +3184,87 @@ def _prepare_positioned_converted_candidate(
         )
 
 
+def _instance_converted_template(
+    template,
+    text_item,
+    collection,
+    *,
+    page_number,
+    requested,
+    delivered,
+    item_id,
+    entity_suffix,
+    z_offset_m,
+):
+    """Place a copied unique glyph outline at this character's affine."""
+    final_data = None
+    final = None
+    try:
+        prototype = template.get("data")
+        copy = getattr(prototype, "copy", None)
+        if not callable(copy):
+            raise RuntimeError("converted glyph template cannot be copied")
+        final_data = copy()
+        name = f"P{page_number}_text_{delivered}_{int(text_item.id)}{entity_suffix}"
+        if delivered == "glyphs":
+            final_data.name = f"{name}_glyph_curve"
+        else:
+            final_data.name = f"{name}_mesh"
+        final = bpy.data.objects.new(name, final_data)
+        _set_object_metadata(
+            final,
+            item_id=item_id,
+            requested=requested,
+            delivered=delivered,
+            text_item=text_item,
+        )
+        for key, value in (template.get("material_props") or {}).items():
+            final[key] = value
+        final["pdf_text_source"] = str(text_item.text)
+        final["pdf_font_data_size"] = float(template.get("font_data_size", 0.0) or 0.0)
+        final["pdf_baseline_alignment"] = str(
+            template.get("baseline_alignment", "") or ""
+        )
+        final["pdf_baseline_compensation_m"] = float(
+            template.get("baseline_compensation_m", 0.0) or 0.0
+        )
+        final["pdf_converted_template_reused"] = True
+        assigned = list(getattr(final_data, "materials", []) or [])
+        if assigned:
+            try:
+                final.color = assigned[0].diffuse_color
+            except Exception:
+                pass
+        collection.objects.link(final)
+        _apply_target_quad_affine(
+            final,
+            text_item,
+            z_offset_m,
+            collection=collection,
+        )
+        return final, final_data, None
+    except Exception as exc:
+        reason = (
+            "glyph_curve_conversion_failed_not_impossibility_proof"
+            if delivered == "glyphs"
+            else "geometry_mesh_conversion_failed_not_impossibility_proof"
+        )
+        return final, final_data, AttemptOutcome.failed(
+            reason,
+            evidence={
+                "item_id": item_id,
+                "converted_template_reused": True,
+                "exception_type": type(exc).__name__,
+                "detail": str(exc),
+            },
+            owned_artifacts=_owned_artifacts_for_text_entity(final, final_data),
+            owned_objects=_owned_objects_for_text_entity(final),
+            owned_datablocks=tuple(
+                value for value in (final_data,) if _valid_owned_ref(value)
+            ),
+        )
+
+
 def _sync_view_layer(reason, *, item_id=None):
     try:
         bpy.context.view_layer.update()
@@ -3139,6 +3298,7 @@ class _PositionedConvertedWork:
         item_id,
         visual_style,
         z_offset_m,
+        templates=None,
     ):
         self.text_item = text_item
         self.collection = collection
@@ -3148,6 +3308,9 @@ class _PositionedConvertedWork:
         self.item_id = item_id
         self.visual_style = visual_style
         self.z_offset_m = z_offset_m
+        self.templates = (
+            templates if templates is not None else _ConvertedGlyphTemplates()
+        )
         self.candidates = []
         self.source_records = []
         self.mesh_factory = None
@@ -3291,9 +3454,33 @@ class _PositionedConvertedWork:
                     "source_data": None,
                     "final": None,
                     "final_data": None,
+                    "template_key": None,
+                    "reuse_template": False,
                 })
                 continue
+            template_key = None
+            reuse_template = False
+            if not zero_ink:
+                template_key = _converted_template_key(child, self.delivered)
+                reuse_template = not self.templates.reserve_source(template_key)
             suffix = f"_c{index:04d}_g{glyph_id if glyph_id is not None else 'na'}"
+            if reuse_template:
+                self.candidates.append({
+                    "index": index,
+                    "layout": layout,
+                    "child": child,
+                    "zero_ink": False,
+                    "zero_ink_reason": zero_ink_reason,
+                    "source_glyph_visible_ink": source_glyph_visible_ink,
+                    "source": None,
+                    "source_data": None,
+                    "final": None,
+                    "final_data": None,
+                    "template_key": template_key,
+                    "reuse_template": True,
+                    "entity_suffix": suffix,
+                })
+                continue
             source, source_data, failure = _create_font_candidate(
                 child,
                 self.collection,
@@ -3322,6 +3509,9 @@ class _PositionedConvertedWork:
                 "source_data": source_data,
                 "final": None,
                 "final_data": None,
+                "template_key": template_key,
+                "reuse_template": False,
+                "entity_suffix": suffix,
             })
         return None
 
@@ -3337,6 +3527,16 @@ class _PositionedConvertedWork:
                         "zero_ink_reason": candidate["zero_ink_reason"],
                         "visible_geometry_omitted": True,
                         "advance_preserved": True,
+                    },
+                )
+                source_records.append(self.character_record(candidate, source_outcome))
+                continue
+            if candidate.get("reuse_template"):
+                source_outcome = AttemptOutcome.delivered(
+                    None,
+                    evidence={
+                        "item_id": self.item_id,
+                        "converted_template_reused": True,
                     },
                 )
                 source_records.append(self.character_record(candidate, source_outcome))
@@ -3366,25 +3566,87 @@ class _PositionedConvertedWork:
             is_zero_ink_carrier = candidate["index"] == self.zero_ink_carrier_index
             if candidate["zero_ink"] and not is_zero_ink_carrier:
                 continue
-            final, final_data, failure = _prepare_positioned_converted_candidate(
-                candidate["source"],
-                candidate["source_data"],
-                candidate["child"],
-                self.collection,
-                page_number=self.page_number,
-                requested=self.requested,
-                delivered=self.delivered,
-                item_id=self.item_id,
-                depsgraph=depsgraph,
-                mesh_factory=self.mesh_factory,
-                allow_empty=is_zero_ink_carrier,
-            )
+            if candidate.get("reuse_template"):
+                payload = self.templates.get(candidate.get("template_key"))
+                if payload is None:
+                    failure = AttemptOutcome.failed(
+                        "converted_glyph_template_unavailable",
+                        evidence={
+                            "item_id": self.item_id,
+                            "converted_template_reused": True,
+                        },
+                    )
+                    records = list(source_records)
+                    records[candidate["index"]] = self.character_record(
+                        candidate, failure
+                    )
+                    return self.aggregate_failure(
+                        failure, candidate["index"], records
+                    )
+                final, final_data, failure = _instance_converted_template(
+                    payload,
+                    candidate["child"],
+                    self.collection,
+                    page_number=self.page_number,
+                    requested=self.requested,
+                    delivered=self.delivered,
+                    item_id=self.item_id,
+                    entity_suffix=candidate.get("entity_suffix") or "",
+                    z_offset_m=self.z_offset_m,
+                )
+            else:
+                final, final_data, failure = _prepare_positioned_converted_candidate(
+                    candidate["source"],
+                    candidate["source_data"],
+                    candidate["child"],
+                    self.collection,
+                    page_number=self.page_number,
+                    requested=self.requested,
+                    delivered=self.delivered,
+                    item_id=self.item_id,
+                    depsgraph=depsgraph,
+                    mesh_factory=self.mesh_factory,
+                    allow_empty=is_zero_ink_carrier,
+                )
             candidate["final"] = final
             candidate["final_data"] = final_data
             if failure is not None:
                 records = list(source_records)
                 records[candidate["index"]] = self.character_record(candidate, failure)
                 return self.aggregate_failure(failure, candidate["index"], records)
+            if (
+                not candidate.get("reuse_template")
+                and not candidate["zero_ink"]
+                and candidate.get("template_key") is not None
+                and final_data is not None
+                and candidate.get("source") is not None
+            ):
+                source = candidate["source"]
+                source_data = candidate["source_data"]
+                self.templates.store(
+                    candidate["template_key"],
+                    {
+                        "data": final_data,
+                        "font_data_size": float(
+                            getattr(source_data, "size", 0.0) or 0.0
+                        ),
+                        "baseline_alignment": str(
+                            source.get("pdf_baseline_alignment", "") or ""
+                        ),
+                        "baseline_compensation_m": float(
+                            source.get("pdf_baseline_compensation_m", 0.0) or 0.0
+                        ),
+                        "material_props": {
+                            "pdf_text_material": source.get("pdf_text_material"),
+                            "pdf_text_material_owned": source.get(
+                                "pdf_text_material_owned"
+                            ),
+                            "pdf_text_expected_rgba": list(
+                                source.get("pdf_text_expected_rgba") or []
+                            ),
+                        },
+                    },
+                )
 
         for candidate in self.candidates:
             if candidate["source"] is None:
@@ -3470,6 +3732,11 @@ class _PositionedConvertedWork:
                             "advance_preserved": True,
                         }
                         if is_zero_ink_carrier
+                        else {}
+                    ),
+                    **(
+                        {"converted_template_reused": True}
+                        if candidate.get("reuse_template")
                         else {}
                     ),
                 },
@@ -4046,6 +4313,7 @@ def build_all_text(
     requested = normalize_representation(text_mode)
     converted_page = requested in {"glyphs", "geometry"}
     pending = []
+    page_templates = _ConvertedGlyphTemplates()
     heartbeat_every = cancel_heartbeat_interval(total)
     for idx, item in enumerate(text_items or []):
         if progress_callback and idx % heartbeat_every == 0:
@@ -4071,6 +4339,7 @@ def build_all_text(
                 item_id=item_id,
                 visual_style=visual_style,
                 z_offset_m=z_offset_m,
+                templates=page_templates,
             )
             early = work.create_sources()
             if early is not None:
