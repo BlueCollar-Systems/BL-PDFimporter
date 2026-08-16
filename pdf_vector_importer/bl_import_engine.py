@@ -30,7 +30,7 @@ from .pdfcadcore import (
     classify_page_content, tag_hatch_primitives, cleanup_primitives,
 )
 from .bl_geometry_builder import build_page
-from .bl_text_builder import build_all_text, cleanup_delivery_outcome
+from .bl_text_builder import build_all_text, cleanup_delivery_outcome, text_stage_timings
 from .pdfcadcore.primitive_extractor import (
     _page_rotation_transform,
     _transform_pdf_point,
@@ -559,6 +559,7 @@ def write_import_report(
     phases = dict(stats.get("performance_phases") or {})
     if elapsed > 0 and "total_ms" not in phases:
         phases["total_ms"] = elapsed * 1000.0
+    helpers_ms = dict(stats.get("helper_timings_ms") or {})
     text_source_spans = int(stats.get("text_source_spans", stats.get("text_items", 0)) or 0)
     text_glyph_estimate = int(stats.get("text_glyph_estimate", 0) or 0)
     bootstrap_text_items = list(stats.get("parts_bootstrap_text_items") or [])
@@ -693,6 +694,7 @@ def write_import_report(
         layer_count=int(stats.get("collections", 0) or 0),
         elapsed_ms=elapsed * 1000.0,
         performance_phases=phases or None,
+        helper_timings_ms=helpers_ms or None,
         peak_mb=sample_process_mb(),
         warnings=(
             max(
@@ -2859,6 +2861,7 @@ def import_pdf(
 
     t_start = time.perf_counter()
     phase_timings_ms: Dict[str, float] = {}
+    helper_timings_ms: Dict[str, float] = {}
     doc = None
     image_dir = ""
     image_dir_owned = False
@@ -3355,6 +3358,12 @@ def import_pdf(
                     _discard_page_collection(page_col)
                     break
                 _add_phase_ms("text_ms", t_phase)
+                # Sub-stages of text_ms, accumulated across pages, reported under
+                # performance.helpers_ms so nothing sums them as phases.
+                for helper_name, helper_ms in text_stage_timings().items():
+                    helper_timings_ms[helper_name] = float(
+                        helper_timings_ms.get(helper_name, 0.0) or 0.0
+                    ) + float(helper_ms)
 
             # 9i. Build image/raster planes
             image_count = 0
@@ -3598,6 +3607,8 @@ def import_pdf(
         phase_timings_ms["total_ms"] = elapsed * 1000.0
         total_stats["elapsed"] = elapsed
         total_stats["performance_phases"] = phase_timings_ms
+        if helper_timings_ms:
+            total_stats["helper_timings_ms"] = dict(helper_timings_ms)
         if image_dir_owned and image_dir and os.path.isdir(image_dir):
             try:
                 shutil.rmtree(image_dir)

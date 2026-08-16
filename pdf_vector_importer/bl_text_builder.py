@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import struct
 import tempfile
+import time
 from typing import Any, Callable, Dict, Iterator, Optional, Tuple
 
 import bpy
@@ -26,6 +27,51 @@ from .text_delivery import (
     normalize_representation,
 )
 from .transparent_assets import BLENDER_SAFE_TRANSPARENT_PNG_SHA256
+
+
+# ---------------------------------------------------------------------------
+# Text-stage sub-timers.
+#
+# `text_ms` is 88-90% of the importer clock on dense drawings (1011: 57 s of 63 s)
+# and had no sub-stages, so nobody could say whether the time went to font
+# loading, object creation, the per-item `view_layer.update()` calls, bbox fitting,
+# the affine carrier, or verification. These accumulators split it. They are
+# report-only: no scene mutation, no ordering change, and they land in
+# `performance.helpers_ms` (never in `phases`, so nothing sums them as siblings of
+# `text_ms`). Reset at the start of every `build_all_text` page build; the engine
+# accumulates across pages.
+# ---------------------------------------------------------------------------
+_TEXT_STAGE_MS: Dict[str, float] = {}
+_TEXT_STAGE_COUNTS: Dict[str, int] = {}
+
+
+@contextmanager
+def _text_stage(name: str) -> Iterator[None]:
+    started = time.perf_counter()
+    try:
+        yield
+    finally:
+        _TEXT_STAGE_MS[name] = _TEXT_STAGE_MS.get(name, 0.0) + (
+            (time.perf_counter() - started) * 1000.0
+        )
+        _TEXT_STAGE_COUNTS[name] = _TEXT_STAGE_COUNTS.get(name, 0) + 1
+
+
+def reset_text_stage_timings() -> None:
+    _TEXT_STAGE_MS.clear()
+    _TEXT_STAGE_COUNTS.clear()
+
+
+def text_stage_timings() -> Dict[str, float]:
+    """Sub-stage timings of the last text build as `text_<stage>_ms`, plus
+    `text_<stage>_count` for every stage (a per-item `view_layer.update()` is a
+    full depsgraph pass over a growing scene, so the count is itself a finding)."""
+    out: Dict[str, float] = {}
+    for name, ms in _TEXT_STAGE_MS.items():
+        out[f"text_{name}_ms"] = float(ms)
+    for name, count in _TEXT_STAGE_COUNTS.items():
+        out[f"text_{name}_count"] = float(count)
+    return out
 
 
 MM_TO_M = 0.001
@@ -1449,12 +1495,14 @@ def _create_font_candidate(
     shared_material=None,
     apply_affine: bool = True,
 ):
-    font, font_outcome = _load_exact_font(text_item, item_id, page_number)
+    with _text_stage("font_load"):
+        font, font_outcome = _load_exact_font(text_item, item_id, page_number)
     if font_outcome is not None:
         return None, None, font_outcome
     data = None
     obj = None
     material = shared_material
+    _create_started = time.perf_counter()
     affine_carrier = None
     positioned_character = bool(getattr(text_item, "positioned_character", False))
     try:
@@ -1523,34 +1571,43 @@ def _create_font_candidate(
             data.materials[0] = material
         obj.color = material.diffuse_color
         collection.objects.link(obj)
+        _TEXT_STAGE_MS["object_create"] = _TEXT_STAGE_MS.get("object_create", 0.0) + (
+            (time.perf_counter() - _create_started) * 1000.0
+        )
+        _TEXT_STAGE_COUNTS["object_create"] = _TEXT_STAGE_COUNTS.get("object_create", 0) + 1
         if not positioned_character:
-            try:
-                bpy.context.view_layer.update()
-            except Exception:
-                pass
-            _fit_text_to_bbox(obj, text_item)
+            with _text_stage("view_layer_update"):
+                try:
+                    bpy.context.view_layer.update()
+                except Exception:
+                    pass
+            with _text_stage("fit_bbox"):
+                _fit_text_to_bbox(obj, text_item)
         obj.rotation_euler = (
             0.0,
             0.0,
             angle_rad,
         )
         if not positioned_character:
-            try:
-                bpy.context.view_layer.update()
-            except Exception:
-                pass
+            with _text_stage("view_layer_update"):
+                try:
+                    bpy.context.view_layer.update()
+                except Exception:
+                    pass
         if apply_affine:
-            affine_carrier = _apply_target_quad_affine(
-                obj,
-                text_item,
-                z_offset_m,
-                collection=collection,
-            )
+            with _text_stage("affine"):
+                affine_carrier = _apply_target_quad_affine(
+                    obj,
+                    text_item,
+                    z_offset_m,
+                    collection=collection,
+                )
         if not defer_host_update:
-            try:
-                bpy.context.view_layer.update()
-            except Exception:
-                pass
+            with _text_stage("view_layer_update"):
+                try:
+                    bpy.context.view_layer.update()
+                except Exception:
+                    pass
         return obj, data, None
     except Exception as exc:
         construction_objects = tuple(getattr(exc, "owned_objects", ()) or ())
@@ -2159,7 +2216,8 @@ def _attempt_native_font(
     )
     if failure is not None:
         return failure
-    return _verify_font_candidate(obj, text_item, delivered=delivered, item_id=item_id)
+    with _text_stage("verify"):
+        return _verify_font_candidate(obj, text_item, delivered=delivered, item_id=item_id)
 
 
 def _attempt_glyphs(
@@ -4248,24 +4306,29 @@ def _deliver_text_item(
     effective_page,
     attempt,
 ):
+    def _timed_cleanup(outcome):
+        with _text_stage("cleanup"):
+            return _cleanup_attempt(outcome, collection)
+
     obj, record = deliver_item(
         item_id=item_id,
         page_number=effective_page,
         source_span_id=int(text_item.id),
         requested=requested,
         attempt=attempt,
-        cleanup=lambda outcome: _cleanup_attempt(outcome, collection),
+        cleanup=_timed_cleanup,
     )
-    return _finish_text_item_delivery(
-        text_item,
-        collection,
-        provenance_opts=provenance_opts,
-        requested=requested,
-        item_id=item_id,
-        effective_page=effective_page,
-        obj=obj,
-        record=record,
-    )
+    with _text_stage("delivery_record"):
+        return _finish_text_item_delivery(
+            text_item,
+            collection,
+            provenance_opts=provenance_opts,
+            requested=requested,
+            item_id=item_id,
+            effective_page=effective_page,
+            obj=obj,
+            record=record,
+        )
 
 
 def build_text(
@@ -4525,6 +4588,7 @@ def build_all_text(
     _VERIFIED_PACKED_FONTS.clear()
     _DISK_FONT_SHA_MEMO.clear()
     _VERIFIED_TEXT_MATERIALS.clear()
+    reset_text_stage_timings()
     count = 0
     total = max(1, len(text_items or []))
     from .import_session import cancel_heartbeat_interval
@@ -4567,7 +4631,8 @@ def build_all_text(
                     z_offset_m=z_offset_m,
                     templates=page_templates,
                 )
-                early = work.create_sources()
+                with _text_stage("converted_create_sources"):
+                    early = work.create_sources()
                 if early is not None:
                     def attempt(representation, _work=work, _early=early):
                         if representation == requested:
@@ -4628,17 +4693,18 @@ def build_all_text(
         )
         if obj is not None:
             count += 1
-    count += _flush_converted_page_jobs(
-        pending,
-        collection,
-        requested=requested,
-        visual_style=visual_style,
-        z_offset_m=z_offset_m,
-        provenance_opts=provenance_opts,
-        terminal_raster_callback=terminal_raster_callback,
-        progress_callback=progress_callback,
-        total=total,
-    )
+    with _text_stage("converted_flush"):
+        count += _flush_converted_page_jobs(
+            pending,
+            collection,
+            requested=requested,
+            visual_style=visual_style,
+            z_offset_m=z_offset_m,
+            provenance_opts=provenance_opts,
+            terminal_raster_callback=terminal_raster_callback,
+            progress_callback=progress_callback,
+            total=total,
+        )
     if progress_callback:
         _progress_or_cancel(
             progress_callback,
