@@ -1670,6 +1670,138 @@ def test_positioned_glyph_metrics_vertical_axis_is_neutral_quad_edge():
     assert math.hypot(matrix[0][1], matrix[1][1]) == pytest.approx(1.0)
 
 
+def _large_a_layout():
+    return TextCharLayout(
+        text="A",
+        glyph_id=37,
+        source_origin_pdf=(10.0, 20.0),
+        source_bbox_pdf=(10.0, 10.0, 22.0, 34.0),
+        source_quad_pdf=((10.0, 10.0), (22.0, 10.0), (22.0, 34.0), (10.0, 34.0)),
+        target_origin=(12.0, 24.0),
+        target_quad=((12.0, 36.0), (24.0, 36.0), (24.0, 24.0), (12.0, 24.0)),
+        advance_width=12.0,
+        glyph_height=12.0,
+    )
+
+
+def _metric_vertical_scale(obj, child) -> float:
+    metrics = bl_text_builder._positioned_font_axis_metrics(obj, child)
+    matrix = bl_text_builder._metric_character_matrix_values(
+        local_advance=metrics["local_advance"],
+        local_line_height=metrics["local_line_height"],
+        local_baseline_y=metrics["local_baseline_y"],
+        target_origin=child.insertion,
+        target_quad=child.target_quad_model,
+        z=0.0,
+    )
+    return math.hypot(matrix[0][1], matrix[1][1])
+
+
+def test_reused_glyph_template_scales_vertical_axis_by_size_ratio():
+    # 1011 visual-oracle regression (v1.0.89, #30 'share glyph outlines across
+    # size and color'): a template converted for a 6 mm span is instanced for
+    # a 12 mm span. Its local outline is still at the 6 mm em, so the metric
+    # matrix must scale the vertical axis by 12/6 = 2.0 (the advance axis is
+    # already scaled through local_advance/target width). Leaving the vertical
+    # column a unit vector renders every reused glyph at the FIRST size seen
+    # (mixed tall/tiny letters in 'TOWER', '531-25', 'SHOP BOLTS').
+    parent = _item()
+    parent.font_size = 12.0
+    child = bl_text_builder._character_text_item(parent, _large_a_layout())
+    reused = _Object("ReusedTemplate", _CurveData("Template_outline"))
+    # template converted from a 6 mm source: host size 6 mm * (1250 / 1000)
+    reused["pdf_font_data_size"] = 0.0075
+    reused["pdf_converted_template_reused"] = True
+
+    metrics = bl_text_builder._positioned_font_axis_metrics(reused, child)
+
+    # advance is measured in the TEMPLATE outline's local units (6 mm em)
+    assert metrics["local_advance"] == pytest.approx(500 * 0.0075 / 1250)
+    assert _metric_vertical_scale(reused, child) == pytest.approx(2.0)
+
+    # the same object at the template's own size keeps the neutral unit column
+    same_size_parent = _item()
+    same_size_parent.font_size = 6.0
+    same_size_child = bl_text_builder._character_text_item(
+        same_size_parent, _character_layout()[0]
+    )
+    assert _metric_vertical_scale(reused, same_size_child) == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize("mode", ["glyphs", "geometry"])
+def test_two_sizes_sharing_a_glyph_get_proportional_vertical_extents(
+    monkeypatch, mode
+):
+    """Both axes of a reused outline follow the item size, not the template's."""
+    fake, collection = _install(monkeypatch)
+    monkeypatch.setattr(
+        bl_text_builder,
+        "_verify_transform_and_dimensions",
+        lambda *_args, **_kwargs: ([], {"evaluated_bounds_verified": True}),
+    )
+    placements = []
+
+    def record_affine(obj, text_item, *_args, **_kwargs):
+        metrics = bl_text_builder._positioned_font_axis_metrics(obj, text_item)
+        matrix = bl_text_builder._metric_character_matrix_values(
+            local_advance=metrics["local_advance"],
+            local_line_height=metrics["local_line_height"],
+            local_baseline_y=metrics["local_baseline_y"],
+            target_origin=text_item.insertion,
+            target_quad=text_item.target_quad_model,
+            z=0.0,
+        )
+        # local outline em height (m) x rendered vertical scale = world height
+        outline_em_m = float(obj.get("pdf_font_data_size", 0.0) or 0.0)
+        vertical_scale = math.hypot(matrix[0][1], matrix[1][1])
+        horizontal_scale = math.hypot(matrix[0][0], matrix[1][0])
+        placements.append(
+            {
+                "font_size": float(text_item.font_size),
+                "reused": bool(obj.get("pdf_converted_template_reused")),
+                "world_em_height_m": outline_em_m * vertical_scale,
+                "world_em_width_m": outline_em_m * horizontal_scale,
+            }
+        )
+        return None
+
+    monkeypatch.setattr(bl_text_builder, "_apply_target_quad_affine", record_affine)
+    items = []
+    for span_id, layout, size in (
+        (41, _character_layout()[0], 6.0),
+        (42, _large_a_layout(), 12.0),
+    ):
+        item = _item(span_id)
+        item.text = "A"
+        item.normalized = "A"
+        item.font_size = size
+        item.source_char_layout = (layout,)
+        item.requires_individual_positioning = True
+        items.append(item)
+
+    count = bl_text_builder.build_all_text(
+        items,
+        collection,
+        page_number=2,
+        text_mode=mode,
+        provenance_opts=types.SimpleNamespace(import_mode="vector", text_mode=mode),
+    )
+
+    assert count == 2
+    if mode == "glyphs":
+        assert fake.data.objects.to_curve_calls == 1
+    else:
+        assert fake.data.meshes.new_from_object_calls == 1
+    by_size = {entry["font_size"]: entry for entry in placements}
+    assert set(by_size) == {6.0, 12.0}
+    assert by_size[6.0]["reused"] is False
+    assert by_size[12.0]["reused"] is True
+    ratio_h = by_size[12.0]["world_em_height_m"] / by_size[6.0]["world_em_height_m"]
+    ratio_w = by_size[12.0]["world_em_width_m"] / by_size[6.0]["world_em_width_m"]
+    assert ratio_h == pytest.approx(2.0)
+    assert ratio_w == pytest.approx(2.0)
+
+
 def test_positioned_font_candidate_calibrates_host_size_to_font_bbox(monkeypatch):
     # data.size must be source_em_size * (bbox_extent / units_per_em) so the
     # rendered em equals the source em after Blender's bbox normalization.

@@ -2386,3 +2386,114 @@ def test_hybrid_sparse_shell_raster_success_is_reported_as_fallback(monkeypatch,
         "used": True,
         "reason": "raster_fallback_1_page",
     }
+
+
+def _run_text_import_and_capture_focus(monkeypatch, tmp_path, *, final_representation):
+    """Import one vector page whose single text item ends at ``final_representation``.
+
+    Returns the ``prefer_material_preview`` value handed to the view handoff.
+    """
+    input_pdf = tmp_path / "input.pdf"
+    input_pdf.write_bytes(b"%PDF-1.7\n")
+    focus_calls = []
+    entity_name = f"P1_text_{final_representation}_41"
+    host_type = "MESH" if final_representation == "raster" else "FONT"
+    delivered_entity = types.SimpleNamespace(
+        name=entity_name,
+        type=host_type,
+        location=(0.01, 0.02, 0.0),
+    )
+
+    fake_bpy = _FakeBpy()
+    # The post-stack re-verification looks the delivered entity up by name;
+    # a real host double keeps the record 'delivered'.
+    fake_bpy.data.objects = types.SimpleNamespace(
+        get=lambda name: delivered_entity if name == entity_name else None,
+    )
+    monkeypatch.setattr(bl_import_engine, "bpy", fake_bpy)
+    monkeypatch.setattr(bl_import_engine, "check_pymupdf", lambda: True)
+    monkeypatch.setattr(bl_import_engine, "ensure_lib_path", lambda: None)
+    monkeypatch.setattr(fitz_loader, "import_fitz", lambda **_kwargs: object())
+    monkeypatch.setattr(fitz_loader, "safe_open", lambda _path: _Document())
+    monkeypatch.setattr(bl_import_engine, "extract_page", lambda *_args, **_kwargs: _page_data())
+    monkeypatch.setattr(bl_import_engine, "build_page", lambda *_args, **_kwargs: {
+        "curves": 0,
+        "meshes": 0,
+        "circles": 0,
+        "arcs": 0,
+        "skipped_fill_only": 0,
+        "model3d_solids": 0,
+    })
+    monkeypatch.setattr(bl_import_engine.tempfile, "mkdtemp", lambda **_kwargs: str(tmp_path))
+    monkeypatch.setattr(bl_import_engine, "_pymupdf_version", lambda: "")
+    monkeypatch.setattr(
+        bl_import_engine,
+        "write_import_report",
+        lambda *_args, **_kwargs: str(tmp_path / "import_report.json"),
+    )
+
+    def fake_build_all_text(_items, _collection, page_num, **kwargs):
+        opts = kwargs["provenance_opts"]
+        records = list(getattr(opts, "_text_delivery_records", []) or [])
+        records.append({
+            "item_id": "41",
+            "page": int(page_num),
+            "source_span_id": 41,
+            "requested_representation": "raster",
+            "attempts": [{
+                "representation": final_representation,
+                "status": "delivered",
+                "evidence": {"actual_location_m": [0.01, 0.02]},
+            }],
+            "final_representation": final_representation,
+            "status": "delivered",
+            "fallback_attempted": False,
+            "fallback_used": False,
+            "entity_ids": [entity_name],
+        })
+        opts._text_delivery_records = records
+        return 1
+
+    monkeypatch.setattr(bl_import_engine, "build_all_text", fake_build_all_text)
+
+    def fake_focus(_root, **kwargs):
+        focus_calls.append(dict(kwargs))
+        return True
+
+    monkeypatch.setattr(bl_import_engine, "_focus_view_on_import", fake_focus)
+
+    stats = bl_import_engine.import_pdf(
+        str(input_pdf),
+        config={
+            "mode": "vector",
+            "pages": "1",
+            "import_text": True,
+            "text_mode": "raster",
+            "ignore_images": True,
+            "auto_focus_view": True,
+            "auto_hide_default_cube": False,
+        },
+    )
+    assert stats["raster_pages_imported"] == 0
+    assert stats["text_final_state_failures"] == []
+    assert stats["text_delivery_delivered_items"] == 1
+    assert stats["focused"] == 1
+    assert len(focus_calls) == 1
+    return focus_calls[0]["prefer_material_preview"]
+
+
+def test_item_raster_patches_switch_the_viewport_like_raster_pages(monkeypatch, tmp_path):
+    # 1011 visual oracle, Blender raster text mode: item-scoped raster patches
+    # are image-textured planes (HASHED node material, no viewport display
+    # colour), so in the default Solid shading they paint as flat grey boxes.
+    # The view handoff only asked for material/texture shading when whole
+    # raster PAGES were imported; delivered item patches must ask for it too.
+    assert _run_text_import_and_capture_focus(
+        monkeypatch, tmp_path, final_representation="raster"
+    ) is True
+
+
+def test_vector_text_delivery_keeps_the_solid_viewport(monkeypatch, tmp_path):
+    assert _run_text_import_and_capture_focus(
+        monkeypatch, tmp_path, final_representation="text"
+    ) is False

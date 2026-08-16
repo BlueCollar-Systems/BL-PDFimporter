@@ -804,6 +804,25 @@ def _positioned_font_axis_metrics(obj, text_item) -> Dict[str, Any]:
     # under-delivers the requested size. With local_line_height equal to the
     # quad edge length, the matrix's vertical column is a unit vector and the
     # rendered vertical scale stays exactly the calibrated source em scale.
+    #
+    # A REUSED converted template is the exception: its local outline was
+    # converted at the FIRST span's host size (``pdf_font_data_size``), which
+    # ``size`` now holds, while this character wants its own calibrated em.
+    # The advance axis already follows the item because ``local_advance`` is
+    # measured in template units and mapped onto this quad's width; the
+    # vertical column must carry the same item/template ratio or every reused
+    # glyph keeps the first size seen (1011: mixed tall/tiny 'TOWER').
+    vertical_scale = 1.0
+    vertical_axis_scale = "neutral_source_em"
+    template_reused = bool(obj.get("pdf_converted_template_reused", False))
+    if template_reused:
+        item_size_m = float(_positioned_font_data_size_m(text_item))
+        if not math.isfinite(item_size_m) or item_size_m <= 0.0:
+            raise RuntimeError(
+                "calibrated host size is unavailable for reused glyph template"
+            )
+        vertical_scale = item_size_m / size
+        vertical_axis_scale = "template_size_ratio"
     target_quad = getattr(text_item, "target_quad_model", None)
     if target_quad is None or len(target_quad) != 4:
         raise RuntimeError(
@@ -833,9 +852,14 @@ def _positioned_font_axis_metrics(obj, text_item) -> Dict[str, Any]:
         "font_normalization_units": font_normalization_units,
         "rendered_unit_m": rendered_unit_m,
         "local_advance": float(advance_units) * rendered_unit_m,
-        "local_line_height": quad_vertical_m,
+        # ``local_line_height`` is the local length that maps onto the quad's
+        # vertical edge: quad_vertical_m / vertical_scale makes the matrix's
+        # vertical column a unit vector times vertical_scale.
+        "local_line_height": quad_vertical_m / vertical_scale,
         "local_baseline_y": local_baseline_y,
-        "vertical_axis_scale": "neutral_source_em",
+        "vertical_axis_scale": vertical_axis_scale,
+        "vertical_scale": vertical_scale,
+        "converted_template_reused": template_reused,
         "metric_source": "embedded_font_glyph_metrics",
         "zero_ink_identity": False,
     }

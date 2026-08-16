@@ -23,6 +23,11 @@ from .pdfcadcore.primitives import PageData, Primitive
 
 # mm -> m conversion (Blender world units are meters by default)
 MM_TO_M = 0.001
+# PDF user-space points -> mm at page scale 1.0. pdfcadcore already converts
+# coordinates and line_width with ``MM_PER_PT * scale`` but hands
+# ``Primitive.dash_pattern`` / ``dash_phase`` through in raw PDF points (the
+# shared core is byte-identical across hosts); this adapter converts them once.
+MM_PER_PT = 25.4 / 72.0
 
 # PDF/normalized line width (mm) -> Blender bevel depth (m).
 # bevel_depth is a *radius*, so 1 mm line width -> 0.5 mm radius -> correct
@@ -243,6 +248,42 @@ def _create_multi_poly_curve(
     obj = bpy.data.objects.new(name, curve_data)
     collection.objects.link(obj)
     return obj
+
+
+def _dash_pattern_to_model_mm(
+    dash_pattern,
+    dash_phase,
+    pt_to_model_mm: float,
+) -> Tuple[Optional[list], float]:
+    """Convert a pdfcadcore dash array + phase (PDF points) to model mm.
+
+    ``pt_to_model_mm`` is ``MM_PER_PT * page_scale``: the same factor the
+    extractor applied to coordinates and ``line_width``. Consuming the raw
+    point values as mm drew every pattern 72/25.4 = 2.83x too long (1011:
+    31.2 mm centerline pitch for a 31.2 pt pattern; 15 mm bolt centerlines
+    solid because the first 'dash' alone was 19.2 mm).
+    """
+    if not dash_pattern:
+        return None, 0.0
+    try:
+        factor = float(pt_to_model_mm)
+    except (TypeError, ValueError):
+        factor = MM_PER_PT
+    if not math.isfinite(factor) or factor <= 0.0:
+        factor = MM_PER_PT
+    try:
+        pattern = [float(value) * factor for value in dash_pattern]
+    except (TypeError, ValueError):
+        return None, 0.0
+    if not pattern:
+        return None, 0.0
+    try:
+        phase = float(dash_phase or 0.0) * factor
+    except (TypeError, ValueError):
+        phase = 0.0
+    if not math.isfinite(phase) or phase < 0.0:
+        phase = 0.0
+    return pattern, phase
 
 
 def _sanitize_dash_pattern(dash_pattern) -> Optional[list]:
@@ -723,6 +764,17 @@ def build_page(
     map_dashes = config.get("map_dashes", True)
     visual_style = _normalize_style(config.get("visual_style", "source"))
     line_z_offset_m = float(config.get("line_z_offset_m", 0.0) or 0.0)
+    # Points -> model mm for dash arrays; the engine passes MM_PER_PT *
+    # user_scale (what the extractor used for coordinates and line_width).
+    pt_to_model_mm = config.get("pt_to_model_mm", MM_PER_PT)
+
+    def _prim_dashes(prim: Primitive) -> Tuple[Optional[list], float]:
+        """Dash array/phase for a primitive in model mm (None when unmapped)."""
+        if not map_dashes:
+            return None, 0.0
+        return _dash_pattern_to_model_mm(
+            prim.dash_pattern, prim.dash_phase, pt_to_model_mm
+        )
 
     material_cache: Dict[str, bpy.types.Material] = {}
     collection_cache: Dict[Tuple[int, str], bpy.types.Collection] = {}
@@ -858,24 +910,27 @@ def build_page(
         obj_name = f"P{page_data.page_number}_{prim.type}_{prim.id}"
 
         if prim.type == "line":
+            dash_pattern_mm, dash_phase_mm = _prim_dashes(prim)
             created = _queue_open_curve(
                 obj_name, prim.points, target_col,
                 prim.line_width, mat,
-                dash_pattern=prim.dash_pattern if map_dashes else None,
-                dash_phase=prim.dash_phase if map_dashes else 0.0,
+                dash_pattern=dash_pattern_mm,
+                dash_phase=dash_phase_mm,
             )
             stats["curves"] += created
 
         elif prim.type == "polyline":
+            dash_pattern_mm, dash_phase_mm = _prim_dashes(prim)
             created = _queue_open_curve(
                 obj_name, prim.points, target_col,
                 prim.line_width, mat,
-                dash_pattern=prim.dash_pattern if map_dashes else None,
-                dash_phase=prim.dash_phase if map_dashes else 0.0,
+                dash_pattern=dash_pattern_mm,
+                dash_phase=dash_phase_mm,
             )
             stats["curves"] += created
 
         elif prim.type == "arc":
+            dash_pattern_mm, _dash_phase_mm = _prim_dashes(prim)
             if prim.center and prim.radius and prim.start_angle is not None and prim.end_angle is not None:
                 arc_pts = _sample_arc_points(
                     prim.center, prim.radius,
@@ -885,7 +940,7 @@ def build_page(
                 created = _queue_open_curve(
                     obj_name, arc_pts, target_col,
                     prim.line_width, mat,
-                    dash_pattern=prim.dash_pattern if map_dashes else None,
+                    dash_pattern=dash_pattern_mm,
                 )
                 stats["curves"] += created
                 stats["arcs"] += 1
@@ -894,7 +949,7 @@ def build_page(
                 created = _queue_open_curve(
                     obj_name, prim.points, target_col,
                     prim.line_width, mat,
-                    dash_pattern=prim.dash_pattern if map_dashes else None,
+                    dash_pattern=dash_pattern_mm,
                 )
                 stats["curves"] += created
 
@@ -1068,11 +1123,12 @@ def build_page(
                 "verification": "not_created",
             }
             if prim.points and len(prim.points) >= 2:
+                dash_pattern_mm, dash_phase_mm = _prim_dashes(prim)
                 created = _draw_stroked_polyline(
                     obj_name, prim.points, bool(prim.closed), target_col,
                     prim.line_width, mat,
-                    dash_pattern=prim.dash_pattern if map_dashes else None,
-                    dash_phase=prim.dash_phase if map_dashes else 0.0,
+                    dash_pattern=dash_pattern_mm,
+                    dash_phase=dash_phase_mm,
                     z_offset_m=line_z_offset_m,
                 )
                 stats["curves"] += created
