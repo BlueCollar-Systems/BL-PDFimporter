@@ -1003,6 +1003,9 @@ def test_repeated_glyph_converts_once_and_instances_each_span(
     ]
     assert not bool(entities[0].get("verification", {}).get("converted_template_reused"))
     assert entities[1].get("verification", {}).get("converted_template_reused") is True
+    assert collection.objects.items[0].data is collection.objects.items[1].data
+    assert "evaluated_affine_matrix" not in entities[1]["verification"]
+    assert "intended_affine_matrix" not in entities[1]["verification"]
 
 
 @pytest.mark.parametrize(
@@ -1052,6 +1055,10 @@ def test_page_repeated_glyphs_convert_once_per_unique_outline(
     ]
     assert reused_flags.count(True) == 2
     assert reused_flags.count(False) == 2
+    objects = collection.objects.items
+    assert objects[0].data is objects[2].data
+    assert objects[1].data is objects[3].data
+    assert objects[0].data is not objects[1].data
 
 
 @pytest.mark.parametrize("mode", ["text", "3d_text", "glyphs", "geometry"])

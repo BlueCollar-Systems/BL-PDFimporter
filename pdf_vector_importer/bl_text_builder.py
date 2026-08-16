@@ -34,10 +34,41 @@ _FONT_GLYPH_INK_CACHE: Dict[Tuple[str, int], bool] = {}
 _FONT_GLYPH_INK_PREFETCH_LIMIT = 4096
 _VERIFIED_FONT_ASSET_BYTES: Dict[int, Tuple[Any, str, bytes]] = {}
 _VERIFIED_PACKED_FONTS: Dict[str, Any] = {}
+_VERIFIED_TEXT_MATERIALS: Dict[Tuple[Any, ...], Tuple[Tuple[str, ...], Dict[str, Any]]] = {}
+_CHARACTER_VERIFICATION_KEEP = {
+    "item_id",
+    "actual_object_type",
+    "source_text_preserved",
+    "converted_template_reused",
+    "zero_ink_identity",
+    "zero_ink_reason",
+    "source_glyph_visible_ink",
+    "visible_geometry_omitted",
+    "advance_preserved",
+    "actual_location_m",
+    "expected_location_m",
+    "evaluated_bounds_verified",
+    "metric_affine_applied",
+    "full_affine_applied",
+    "spline_count",
+    "vertex_count",
+    "failures",
+    "text_material",
+    "text_material_owned",
+}
 # Import-session memo: resolved path → ((size, mtime_ns), sha256 hex)
 _DISK_FONT_SHA_MEMO: Dict[str, Tuple[Tuple[int, int], str]] = {}
 _TEXT_MODES = {"labels", "text", "3d_text", "glyphs", "geometry", "raster"}
 LOGGER = logging.getLogger(__name__)
+
+
+def _character_verification_record(evidence: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep certified identity/placement fields without per-glyph affine dumps."""
+    payload = {}
+    for key in _CHARACTER_VERIFICATION_KEEP:
+        if key in evidence:
+            payload[key] = evidence[key]
+    return payload
 
 
 class _OwnedConstructionError(RuntimeError):
@@ -1288,6 +1319,15 @@ def _verify_text_material(obj) -> tuple[list[str], Dict[str, Any]]:
         ),
         None,
     )
+    cache_key = (
+        id(material),
+        expected,
+        material_name,
+        bool(material_owned),
+    )
+    cached = _VERIFIED_TEXT_MATERIALS.get(cache_key)
+    if cached is not None:
+        return list(cached[0]), dict(cached[1])
     try:
         actual = tuple(float(value) for value in material.diffuse_color)
     except (AttributeError, ReferenceError, TypeError, ValueError):
@@ -1346,6 +1386,7 @@ def _verify_text_material(obj) -> tuple[list[str], Dict[str, Any]]:
         or not shader_linked
     ):
         failures.append("text_material_node_mode_unverified")
+    _VERIFIED_TEXT_MATERIALS[cache_key] = (tuple(failures), dict(evidence))
     return failures, evidence
 
 
@@ -2773,6 +2814,12 @@ def _cleanup_attempt(outcome: AttemptOutcome, collection) -> Dict[str, Any]:
         except ReferenceError:
             removed.append("<already_removed_datablock>")
             continue
+        try:
+            users = int(getattr(data, "users", 0) or 0)
+        except (AttributeError, ReferenceError, TypeError, ValueError):
+            users = 0
+        if users > 1:
+            continue
         registry = (
             getattr(bpy.data, "meshes", None)
             if data_type == "MESH"
@@ -3196,20 +3243,19 @@ def _instance_converted_template(
     entity_suffix,
     z_offset_m,
 ):
-    """Place a copied unique glyph outline at this character's affine."""
+    """Place a unique glyph outline at this character's affine.
+
+    Repeated outlines share the converted curve/mesh datablock. Placement is
+    the object affine, so instances keep the same local paths.
+    """
     final_data = None
     final = None
     try:
         prototype = template.get("data")
-        copy = getattr(prototype, "copy", None)
-        if not callable(copy):
-            raise RuntimeError("converted glyph template cannot be copied")
-        final_data = copy()
+        if prototype is None:
+            raise RuntimeError("converted glyph template is unavailable")
+        final_data = prototype
         name = f"P{page_number}_text_{delivered}_{int(text_item.id)}{entity_suffix}"
-        if delivered == "glyphs":
-            final_data.name = f"{name}_glyph_curve"
-        else:
-            final_data.name = f"{name}_mesh"
         final = bpy.data.objects.new(name, final_data)
         _set_object_metadata(
             final,
@@ -3257,11 +3303,9 @@ def _instance_converted_template(
                 "exception_type": type(exc).__name__,
                 "detail": str(exc),
             },
-            owned_artifacts=_owned_artifacts_for_text_entity(final, final_data),
+            owned_artifacts=_owned_artifacts_for_text_entity(final, None),
             owned_objects=_owned_objects_for_text_entity(final),
-            owned_datablocks=tuple(
-                value for value in (final_data,) if _valid_owned_ref(value)
-            ),
+            owned_datablocks=(),
         )
 
 
@@ -3331,7 +3375,9 @@ class _PositionedConvertedWork:
                 getattr(child, "positioned_character", False)
             ),
             "entity_ids": [str(value) for value in outcome.entity_ids],
-            "verification": dict(outcome.evidence or {}),
+            "verification": _character_verification_record(
+                dict(outcome.evidence or {})
+            ),
         }
 
     def ownership(self, extra_outcomes=()):
@@ -3744,7 +3790,11 @@ class _PositionedConvertedWork:
                     candidate["final"], candidate["final_data"]
                 ),
                 owned_objects=_owned_objects_for_text_entity(candidate["final"]),
-                owned_datablocks=(candidate["final_data"],),
+                owned_datablocks=(
+                    ()
+                    if candidate.get("reuse_template")
+                    else (candidate["final_data"],)
+                ),
             )
             outcomes.append(outcome)
             character_evidence.append(self.character_record(candidate, outcome))
@@ -4075,6 +4125,7 @@ def build_text(
     provenance_opts: Any = None,
     terminal_raster_callback: Optional[Callable] = None,
 ) -> Optional[bpy.types.Object]:
+    _VERIFIED_TEXT_MATERIALS.clear()
     if strict_text_fidelity is not True:
         raise ValueError("strict_text_fidelity cannot be disabled")
     requested = normalize_representation(text_mode)
@@ -4304,6 +4355,7 @@ def build_all_text(
     _VERIFIED_FONT_ASSET_BYTES.clear()
     _VERIFIED_PACKED_FONTS.clear()
     _DISK_FONT_SHA_MEMO.clear()
+    _VERIFIED_TEXT_MATERIALS.clear()
     count = 0
     total = max(1, len(text_items or []))
     from .import_session import cancel_heartbeat_interval
