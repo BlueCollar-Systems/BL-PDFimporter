@@ -410,6 +410,71 @@ def test_exact_inventory_name_outranks_weaker_internal_family_aliases(monkeypatc
     assert asset.base_font_name == "Arial"
 
 
+def test_family_name_aliases_do_not_merge_sibling_pdf_font_traces(monkeypatch):
+    """Exact inventory traces win. Family names like 'Arial' are other fonts."""
+
+    class Document:
+        @staticmethod
+        def extract_font(xref):
+            names = {11: "Arial-BoldMT", 12: "ArialMT"}
+            return names[xref], "ttf", "TrueType", f"font-{xref}".encode("ascii")
+
+    class Page:
+        parent = Document()
+
+        @staticmethod
+        def get_texttrace():
+            return []
+
+        @staticmethod
+        def get_fonts(*, full=False):
+            assert full is True
+            return [
+                (12, "ttf", "TrueType", "Arial", "F0", "WinAnsiEncoding"),
+                (11, "ttf", "TrueType", "Arial,Bold", "F1", "WinAnsiEncoding"),
+            ]
+
+    def aliases(data, _format):
+        if data == b"font-11":
+            return {"Arial", "Arial Bold", "Arial-BoldMT"}
+        return {"Arial", "ArialMT"}
+
+    monkeypatch.setattr(embedded_fonts, "_font_program_name_aliases", aliases)
+    monkeypatch.setattr(
+        embedded_fonts,
+        "_page_unicode_glyph_maps",
+        lambda _page: (
+            {"Arial": {65: 36}, "Arial,Bold": {65: 68}},
+            set(),
+            None,
+        ),
+    )
+    monkeypatch.setattr(
+        embedded_fonts,
+        "_usable_font",
+        lambda source, source_format, _name, _mapping: (
+            source_format,
+            source,
+            True,
+        ),
+    )
+    monkeypatch.setattr(
+        embedded_fonts,
+        "_font_delivery_metrics",
+        lambda _data: (1000, 800, -200, (500, 500)),
+    )
+
+    catalog = EmbeddedFontCatalog.from_page(Page(), page_number=1)
+    regular = catalog.for_span("Arial")
+    bold = catalog.for_span("Arial,Bold")
+
+    assert regular is not None
+    assert bold is not None
+    assert regular.source_xref == 12
+    assert bold.source_xref == 11
+    assert regular.asset_id != bold.asset_id
+
+
 def test_cmap_repair_classifies_fonttools_assertion_as_malformed_source(monkeypatch):
     monkeypatch.setattr(
         embedded_fonts,

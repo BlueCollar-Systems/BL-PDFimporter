@@ -3583,6 +3583,7 @@ def import_pdf(
                 1
                 if (
                     auto_focus_view
+                    and not bool(getattr(getattr(bpy, "app", None), "background", False))
                     and _focus_view_on_import(
                         root_col,
                         keep_selected=keep_selection_after_focus,
