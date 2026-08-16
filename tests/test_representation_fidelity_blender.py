@@ -874,9 +874,9 @@ def test_positioned_conversion_batches_source_and_final_dependency_graph_updates
     assert record["fallback_used"] is False
     assert len(record["entity_ids"]) == 2
     assert fake.view_update_count == 2
+    # Placement is certified on the delivered curve/mesh after the final
+    # page update. Temporary FONT vehicles are identity-checked only.
     assert verification_updates == [
-        ("FONT", 1),
-        ("FONT", 1),
         (expected_type, 2),
         (expected_type, 2),
     ]
@@ -1006,6 +1006,46 @@ def test_repeated_glyph_converts_once_and_instances_each_span(
     assert collection.objects.items[0].data is collection.objects.items[1].data
     assert "evaluated_affine_matrix" not in entities[1]["verification"]
     assert "intended_affine_matrix" not in entities[1]["verification"]
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_type"),
+    [("glyphs", "CURVE"), ("geometry", "MESH")],
+)
+def test_converted_affine_applies_only_to_final_curve_or_mesh(
+    monkeypatch,
+    mode,
+    expected_type,
+):
+    """Temporary FONT vehicles are not placement-transformed; instances still are."""
+    _fake, collection = _install(monkeypatch)
+    affine_types = []
+
+    def record_affine(obj, *_args, **_kwargs):
+        affine_types.append(str(getattr(obj, "type", "")))
+
+    monkeypatch.setattr(bl_text_builder, "_apply_target_quad_affine", record_affine)
+    monkeypatch.setattr(
+        bl_text_builder,
+        "_verify_transform_and_dimensions",
+        lambda *_args, **_kwargs: ([], {"evaluated_bounds_verified": True}),
+    )
+    item = _item()
+    item.text = "AA"
+    item.normalized = "AA"
+    item.source_char_layout = _character_layout_repeated_a()
+    item.requires_individual_positioning = True
+
+    obj = bl_text_builder.build_text(
+        item,
+        collection,
+        page_number=2,
+        text_mode=mode,
+        provenance_opts=types.SimpleNamespace(import_mode="vector", text_mode=mode),
+    )
+
+    assert obj is not None
+    assert affine_types == [expected_type, expected_type]
 
 
 @pytest.mark.parametrize(
@@ -1569,6 +1609,41 @@ def test_metric_character_matrix_pins_baseline_and_maps_font_axes() -> None:
     assert mapped(2.0, 0.0) == pytest.approx((17.0, 19.0))
     assert mapped(0.0, 5.0) == pytest.approx((9.0, 31.0))
     assert matrix[2][3] == pytest.approx(0.25)
+
+
+def test_metric_placement_properties_exclude_font_table_dumps() -> None:
+    obj = {}
+    bl_text_builder._write_metric_placement_properties(
+        obj,
+        matrix_values=(
+            (1.0, 0.0, 0.0, 0.2),
+            (0.0, 1.0, 0.0, 0.3),
+            (0.0, 0.0, 1.0, 0.4),
+            (0.0, 0.0, 0.0, 1.0),
+        ),
+        metric_evidence={
+            "local_advance": 0.01,
+            "local_line_height": 0.02,
+            "local_baseline_y": 0.0,
+            "glyph_id": 37,
+            "ascender": 800,
+            "descender": -200,
+            "units_per_em": 1000,
+            "advance_units": 500,
+            "metric_source": "embedded_font_glyph_metrics",
+        },
+        positioned_character=True,
+        target_quad=((0.0, 20.0), (10.0, 20.0), (10.0, 0.0), (0.0, 0.0)),
+        origin=(0.0, 0.0),
+    )
+
+    assert obj["pdf_metric_affine_applied"] is True
+    assert obj["pdf_metric_local_advance"] == 0.01
+    assert "pdf_metric_glyph_id" not in obj
+    assert "pdf_metric_ascender" not in obj
+    assert "pdf_metric_units_per_em" not in obj
+    assert "pdf_target_quad_model" not in obj
+    assert "pdf_metric_metric_source" not in obj
 
 
 def test_two_object_affine_factor_retains_shear_without_shear_in_either_factor() -> None:
