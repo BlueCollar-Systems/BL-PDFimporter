@@ -3010,6 +3010,9 @@ def import_pdf(
             "ignore_fill_only_shapes": bool(config.get("ignore_fill_only_shapes", True)),
             "group_by_color": import_cfg.group_by_color,
             "map_dashes": import_cfg.map_dashes,
+            # pdfcadcore keeps dash arrays in PDF points; the builder converts
+            # them with the same pt->mm factor the extractor used for geometry.
+            "pt_to_model_mm": _MM_PER_PT * import_cfg.user_scale,
             "visual_style": visual_style,
             "line_z_offset_m": line_z_offset_m,
             "model3d_mode": getattr(import_cfg, "model3d_mode", "off"),
