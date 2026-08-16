@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from io import BytesIO
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from hashlib import sha256
 import logging
@@ -611,7 +611,11 @@ def _positioned_font_data_size_m(text_item) -> float:
 
 
 def _converted_template_key(text_item, delivered):
-    """Identity of local glyph geometry that can be instanced with a new affine."""
+    """Identity of local glyph outlines shared across size and color.
+
+    TrueType/CFF outlines scale linearly. Source size lives in the target
+    quad and the existing metric affine; object materials carry color.
+    """
     asset = getattr(text_item, "font_asset", None)
     sha = str(getattr(asset, "usable_sha256", "") or "")
     if not sha:
@@ -621,29 +625,13 @@ def _converted_template_key(text_item, delivered):
         glyph_key = int(glyph_id) if glyph_id is not None else None
     except (TypeError, ValueError):
         return None
-    try:
-        size_m = _positioned_font_data_size_m(text_item)
-    except (RuntimeError, TypeError, ValueError):
+    if glyph_key is None:
         return None
-    color = getattr(text_item, "color", None)
-    if isinstance(color, (tuple, list)) and len(color) >= 3:
-        try:
-            color_key = (
-                round(float(color[0]), 4),
-                round(float(color[1]), 4),
-                round(float(color[2]), 4),
-            )
-        except (TypeError, ValueError):
-            color_key = None
-    else:
-        color_key = None
     return (
         str(delivered),
         sha,
         glyph_key,
         str(getattr(text_item, "text", "") or ""),
-        round(float(size_m), 9),
-        color_key,
     )
 
 
@@ -3393,13 +3381,14 @@ def _layer_collection_for(collection):
 
 @contextmanager
 def _unevaluated_collection(collection):
-    """Link reused glyph instances without tagging the evaluated view layer.
+    """Link unique FONT sources and reused glyph instances off the evaluated view layer.
 
     ``objects.new`` + ``collection.objects.link`` on an evaluated collection is
-    the dense-page hot loop: each instance (and affine carrier) dirties the
-    depsgraph. Unique FONT→curve/mesh conversion still needs evaluation; this
-    only wraps reused outline instancing. Affines, linked datablocks, and
-    inventory stay the same; the caller updates once after restore.
+    the dense-page hot loop: each FONT source, instance, and affine carrier
+    dirties the depsgraph. Unique FONT→curve/mesh conversion still evaluates
+    after one page update; reused outlines stay linked with the collection
+    excluded. Affines, linked datablocks, and inventory stay the same; the
+    caller updates once after restore.
     """
     layer = _layer_collection_for(collection)
     if layer is None:
@@ -3770,7 +3759,16 @@ class _PositionedConvertedWork:
                         },
                     },
                 )
+        return None
 
+    def cleanup_font_sources(self):
+        """Remove disposable FONT sources after every unique outline is converted.
+
+        Deleting during the unique-convert loop dirties the shared page
+        depsgraph between ``to_curve`` calls. Keep sources until the page
+        batch finishes converting, then drop them together.
+        """
+        source_records = self.source_records
         for candidate in self.candidates:
             if candidate["source"] is None:
                 continue
@@ -3836,8 +3834,11 @@ class _PositionedConvertedWork:
 
     def convert_with_depsgraph(self, depsgraph):
         failure = self.convert_unique_with_depsgraph(depsgraph)
+        cleanup_failure = self.cleanup_font_sources()
         if failure is not None:
             return failure
+        if cleanup_failure is not None:
+            return cleanup_failure
         with _unevaluated_collection(self.collection):
             return self.instance_reused_templates()
 
@@ -4448,12 +4449,19 @@ def _flush_converted_page_jobs(
         unique_failures.append(work.convert_unique_with_depsgraph(depsgraph))
 
     convert_failures = []
+    for work, unique_failure in zip(pending, unique_failures):  # noqa: B905
+        cleanup_failure = work.cleanup_font_sources()
+        if unique_failure is not None:
+            convert_failures.append(unique_failure)
+        elif cleanup_failure is not None:
+            convert_failures.append(cleanup_failure)
+        else:
+            convert_failures.append(None)
+
     with _unevaluated_collection(collection):
-        for work, unique_failure in zip(pending, unique_failures):  # noqa: B905
-            if unique_failure is not None:
-                convert_failures.append(unique_failure)
-            else:
-                convert_failures.append(work.instance_reused_templates())
+        for index, work in enumerate(pending):
+            if convert_failures[index] is None:
+                convert_failures[index] = work.instance_reused_templates()
 
     failure = _sync_view_layer(
         "positioned_conversion_final_batch_update_failed_not_impossibility_proof"
@@ -4528,63 +4536,85 @@ def build_all_text(
     pending = []
     page_templates = _ConvertedGlyphTemplates()
     heartbeat_every = cancel_heartbeat_interval(total)
-    for idx, item in enumerate(text_items or []):
-        if progress_callback and idx % heartbeat_every == 0:
-            _progress_or_cancel(
-                progress_callback,
-                (idx + 1) / float(total),
-                during="during text building",
+    deferred_plain = []
+    create_scope = (
+        _unevaluated_collection(collection) if converted_page else nullcontext()
+    )
+    with create_scope:
+        for idx, item in enumerate(text_items or []):
+            if progress_callback and idx % heartbeat_every == 0:
+                _progress_or_cancel(
+                    progress_callback,
+                    (idx + 1) / float(total),
+                    during="during text building",
+                )
+            queue_converted = (
+                converted_page
+                and str(getattr(item, "text", "") or "") != ""
+                and bool(getattr(item, "requires_individual_positioning", False))
             )
-        queue_converted = (
-            converted_page
-            and str(getattr(item, "text", "") or "") != ""
-            and bool(getattr(item, "requires_individual_positioning", False))
-        )
-        if queue_converted:
-            effective_page = int(page_number or getattr(item, "page_number", 0) or 0)
-            item_id = f"page:{effective_page}:text:{int(item.id)}"
-            work = _PositionedConvertedWork(
+            if queue_converted:
+                effective_page = int(page_number or getattr(item, "page_number", 0) or 0)
+                item_id = f"page:{effective_page}:text:{int(item.id)}"
+                work = _PositionedConvertedWork(
+                    item,
+                    collection,
+                    page_number=effective_page,
+                    requested=requested,
+                    delivered=requested,
+                    item_id=item_id,
+                    visual_style=visual_style,
+                    z_offset_m=z_offset_m,
+                    templates=page_templates,
+                )
+                early = work.create_sources()
+                if early is not None:
+                    def attempt(representation, _work=work, _early=early):
+                        if representation == requested:
+                            return _early
+                        return _attempt_one_representation(
+                            representation,
+                            _work.text_item,
+                            collection,
+                            effective_page=_work.page_number,
+                            requested=requested,
+                            item_id=_work.item_id,
+                            visual_style=visual_style,
+                            z_offset_m=z_offset_m,
+                            terminal_raster_callback=terminal_raster_callback,
+                        )
+
+                    obj = _deliver_text_item(
+                        work.text_item,
+                        collection,
+                        provenance_opts=provenance_opts,
+                        requested=requested,
+                        item_id=work.item_id,
+                        effective_page=work.page_number,
+                        attempt=attempt,
+                    )
+                    if obj is not None:
+                        count += 1
+                    continue
+                pending.append(work)
+                continue
+            if converted_page:
+                deferred_plain.append(item)
+                continue
+            obj = build_text(
                 item,
                 collection,
-                page_number=effective_page,
-                requested=requested,
-                delivered=requested,
-                item_id=item_id,
+                page_number,
                 visual_style=visual_style,
                 z_offset_m=z_offset_m,
-                templates=page_templates,
+                strict_text_fidelity=strict_text_fidelity,
+                text_mode=text_mode,
+                provenance_opts=provenance_opts,
+                terminal_raster_callback=terminal_raster_callback,
             )
-            early = work.create_sources()
-            if early is not None:
-                def attempt(representation, _work=work, _early=early):
-                    if representation == requested:
-                        return _early
-                    return _attempt_one_representation(
-                        representation,
-                        _work.text_item,
-                        collection,
-                        effective_page=_work.page_number,
-                        requested=requested,
-                        item_id=_work.item_id,
-                        visual_style=visual_style,
-                        z_offset_m=z_offset_m,
-                        terminal_raster_callback=terminal_raster_callback,
-                    )
-
-                obj = _deliver_text_item(
-                    work.text_item,
-                    collection,
-                    provenance_opts=provenance_opts,
-                    requested=requested,
-                    item_id=work.item_id,
-                    effective_page=work.page_number,
-                    attempt=attempt,
-                )
-                if obj is not None:
-                    count += 1
-                continue
-            pending.append(work)
-            continue
+            if obj is not None:
+                count += 1
+    for item in deferred_plain:
         obj = build_text(
             item,
             collection,

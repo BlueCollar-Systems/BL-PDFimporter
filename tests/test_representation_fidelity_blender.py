@@ -296,15 +296,19 @@ class _Objects:
         self.allow_to_curve = allow_to_curve
         self.to_curve_calls = 0
         self.to_curve_excluded = []
+        self.font_new_excluded = []
         self.exclude_reader = lambda: False
 
     def new(self, name: str, data):
-        return _Object(
+        obj = _Object(
             name,
             data,
             allow_to_curve=self.allow_to_curve,
             call_counter=self,
         )
+        if str(getattr(data, "type", "") or "") == "FONT":
+            self.font_new_excluded.append(bool(self.exclude_reader()))
+        return obj
 
     def remove(self, obj, do_unlink=True):
         assert do_unlink is True
@@ -1144,12 +1148,74 @@ def test_page_repeated_glyphs_convert_once_per_unique_outline(
     ("mode", "expected_type"),
     [("glyphs", "CURVE"), ("geometry", "MESH")],
 )
+def test_same_glyph_at_two_source_sizes_converts_once(
+    monkeypatch,
+    mode,
+    expected_type,
+):
+    """Source size lives in the target quad affine, not a second FONT conversion."""
+    fake, collection = _install(monkeypatch)
+    _patch_positioned_conversion_fakes(monkeypatch)
+    small = _character_layout()[0]
+    large = TextCharLayout(
+        text="A",
+        glyph_id=37,
+        source_origin_pdf=(10.0, 20.0),
+        source_bbox_pdf=(10.0, 10.0, 22.0, 34.0),
+        source_quad_pdf=((10.0, 10.0), (22.0, 10.0), (22.0, 34.0), (10.0, 34.0)),
+        target_origin=(12.0, 24.0),
+        target_quad=((12.0, 36.0), (24.0, 36.0), (24.0, 24.0), (12.0, 24.0)),
+        advance_width=12.0,
+        glyph_height=12.0,
+    )
+    items = []
+    for span_id, layout, size in ((41, small, 6.0), (42, large, 12.0)):
+        item = _item(span_id)
+        item.text = "A"
+        item.normalized = "A"
+        item.font_size = size
+        item.source_char_layout = (layout,)
+        item.requires_individual_positioning = True
+        items.append(item)
+
+    opts = types.SimpleNamespace(import_mode="vector", text_mode=mode)
+    count = bl_text_builder.build_all_text(
+        items,
+        collection,
+        page_number=2,
+        text_mode=mode,
+        provenance_opts=opts,
+    )
+
+    assert count == 2
+    assert len(collection.objects.items) == 2
+    assert {candidate.type for candidate in collection.objects.items} == {
+        expected_type
+    }
+    if mode == "glyphs":
+        assert fake.data.objects.to_curve_calls == 1
+    else:
+        assert fake.data.meshes.new_from_object_calls == 1
+    reused_flags = [
+        bool(entry.get("verification", {}).get("converted_template_reused"))
+        for record in opts._text_delivery_records
+        for entry in record["attempts"][-1]["evidence"]["character_entities"]
+    ]
+    assert reused_flags.count(True) == 1
+    assert reused_flags.count(False) == 1
+    assert collection.objects.items[0].data is collection.objects.items[1].data
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_type"),
+    [("glyphs", "CURVE"), ("geometry", "MESH")],
+)
 def test_page_glyph_instances_are_created_off_the_evaluated_view_layer(
     monkeypatch,
     mode,
     expected_type,
 ):
-    """Mass instance linking is the dense-page hot loop; keep unique converts evaluated."""
+    """Unique FONT sources and mass instance linking stay off the evaluated view layer."""
     fake, collection = _install(monkeypatch)
     _patch_positioned_conversion_fakes(monkeypatch)
     opts = types.SimpleNamespace(import_mode="vector", text_mode=mode)
@@ -1173,6 +1239,8 @@ def test_page_glyph_instances_are_created_off_the_evaluated_view_layer(
     assert count == 2
     assert True in fake.layer_exclude_history
     assert fake.layer_exclude_history[-1] is False
+    assert fake.data.objects.font_new_excluded
+    assert all(fake.data.objects.font_new_excluded)
     if mode == "glyphs":
         assert fake.data.objects.to_curve_excluded
         assert not any(fake.data.objects.to_curve_excluded)
