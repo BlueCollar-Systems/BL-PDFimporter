@@ -233,6 +233,9 @@ class _Object(dict):
         assert apply_modifiers is False
         if self._call_counter is not None:
             self._call_counter.to_curve_calls += 1
+            self._call_counter.to_curve_excluded.append(
+                bool(self._call_counter.exclude_reader())
+            )
         if not self._allow_to_curve:
             raise RuntimeError("curve conversion crashed")
         curve = _CurveData(f"{self.name}_outline", self.dimensions)
@@ -292,6 +295,8 @@ class _Objects:
         self.removed = []
         self.allow_to_curve = allow_to_curve
         self.to_curve_calls = 0
+        self.to_curve_excluded = []
+        self.exclude_reader = lambda: False
 
     def new(self, name: str, data):
         return _Object(
@@ -312,12 +317,15 @@ class _Meshes:
         self.available = available
         self.removed = []
         self.new_from_object_calls = 0
+        self.new_from_object_excluded = []
+        self.exclude_reader = lambda: False
         if not available:
             self.new_from_object = None
 
     def new_from_object(self, evaluated, depsgraph=None):
         del depsgraph
         self.new_from_object_calls += 1
+        self.new_from_object_excluded.append(bool(self.exclude_reader()))
         if not self.available:
             raise AttributeError("new_from_object unavailable")
         if self.fail:
@@ -384,6 +392,23 @@ class _Images:
         self.items.pop(image.name, None)
 
 
+class _LayerCollection:
+    def __init__(self, collection, history):
+        self.collection = collection
+        self.children = []
+        self._exclude = False
+        self._history = history
+
+    @property
+    def exclude(self):
+        return self._exclude
+
+    @exclude.setter
+    def exclude(self, value):
+        self._exclude = bool(value)
+        self._history.append(self._exclude)
+
+
 class _FakeBpy:
     def __init__(
         self,
@@ -394,23 +419,33 @@ class _FakeBpy:
         baseline_available=True,
     ):
         self.view_update_count = 0
+        self.layer_exclude_history = []
 
         def update_view_layer():
             self.view_update_count += 1
 
+        objects = _Objects(allow_to_curve=curve_available)
+        meshes = _Meshes(fail=mesh_fail, available=mesh_available)
         self.app = types.SimpleNamespace(version=(5, 2, 0))
         self.data = types.SimpleNamespace(
             curves=_Curves(baseline_available=baseline_available),
-            objects=_Objects(allow_to_curve=curve_available),
-            meshes=_Meshes(fail=mesh_fail, available=mesh_available),
+            objects=objects,
+            meshes=meshes,
             fonts=_Fonts(),
             images=_Images(),
             materials=_Materials(),
         )
         self.context = types.SimpleNamespace(
             evaluated_depsgraph_get=lambda: object(),
-            view_layer=types.SimpleNamespace(update=update_view_layer),
+            view_layer=types.SimpleNamespace(
+                update=update_view_layer,
+                layer_collection=None,
+            ),
         )
+        objects.exclude_reader = lambda: bool(
+            getattr(self.context.view_layer.layer_collection, "exclude", False)
+        )
+        meshes.exclude_reader = objects.exclude_reader
 
 
 def _sfnt_font_bytes(*, units_per_em=1000, y_min=-250, y_max=1000):
@@ -562,6 +597,10 @@ def _character_layout_with_space():
 
 def _install(monkeypatch, **kwargs):
     fake = _FakeBpy(**kwargs)
+    collection = _Collection()
+    fake.context.view_layer.layer_collection = _LayerCollection(
+        collection, fake.layer_exclude_history
+    )
     monkeypatch.setattr(bl_text_builder, "bpy", fake)
     monkeypatch.setattr(
         bl_text_builder,
@@ -573,7 +612,7 @@ def _install(monkeypatch, **kwargs):
         bl_text_builder._VERIFIED_FONT_ASSET_BYTES.clear()
     if hasattr(bl_text_builder, "_VERIFIED_PACKED_FONTS"):
         bl_text_builder._VERIFIED_PACKED_FONTS.clear()
-    return fake, _Collection()
+    return fake, collection
 
 
 def test_fallback_ladders_are_finite_distinct_and_never_alias_glyphs_geometry():
@@ -1099,6 +1138,53 @@ def test_page_repeated_glyphs_convert_once_per_unique_outline(
     assert objects[0].data is objects[2].data
     assert objects[1].data is objects[3].data
     assert objects[0].data is not objects[1].data
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_type"),
+    [("glyphs", "CURVE"), ("geometry", "MESH")],
+)
+def test_page_glyph_instances_are_created_off_the_evaluated_view_layer(
+    monkeypatch,
+    mode,
+    expected_type,
+):
+    """Mass instance linking is the dense-page hot loop; keep unique converts evaluated."""
+    fake, collection = _install(monkeypatch)
+    _patch_positioned_conversion_fakes(monkeypatch)
+    opts = types.SimpleNamespace(import_mode="vector", text_mode=mode)
+    items = []
+    for span_id in (41, 42):
+        item = _item(span_id)
+        item.text = "AB"
+        item.normalized = "AB"
+        item.source_char_layout = _character_layout()
+        item.requires_individual_positioning = True
+        items.append(item)
+
+    count = bl_text_builder.build_all_text(
+        items,
+        collection,
+        page_number=2,
+        text_mode=mode,
+        provenance_opts=opts,
+    )
+
+    assert count == 2
+    assert True in fake.layer_exclude_history
+    assert fake.layer_exclude_history[-1] is False
+    if mode == "glyphs":
+        assert fake.data.objects.to_curve_excluded
+        assert not any(fake.data.objects.to_curve_excluded)
+    else:
+        assert fake.data.meshes.new_from_object_excluded
+        assert not any(fake.data.meshes.new_from_object_excluded)
+    objects = collection.objects.items
+    assert len(objects) == 4
+    assert {candidate.type for candidate in objects} == {expected_type}
+    assert objects[0].data is objects[2].data
+    assert objects[1].data is objects[3].data
+    assert fake.view_update_count == 2
 
 
 @pytest.mark.parametrize("mode", ["text", "3d_text", "glyphs", "geometry"])
