@@ -159,7 +159,7 @@ class TestCorePipeline(unittest.TestCase):
         self.assertAlmostEqual(rgb[1], 0xAA / 255.0, places=4)
         self.assertAlmostEqual(rgb[2], 0x33 / 255.0, places=4)
 
-    def test_stacked_fraction_text_is_merged(self) -> None:
+    def test_layout_free_stacked_fraction_is_preserved(self) -> None:
         def text_item(idx: int, text: str, y: float) -> NormalizedText:
             return NormalizedText(
                 id=idx,
@@ -171,16 +171,19 @@ class TestCorePipeline(unittest.TestCase):
                 page_number=1,
             )
 
-        merged = _merge_stacked_fractions([
+        items = [
             text_item(1, "15", 12.0),
             text_item(2, "/", 10.0),
             text_item(3, "16", 8.5),
-        ])
+        ]
+        merged = _merge_stacked_fractions(items)
 
-        self.assertEqual(len(merged), 1)
-        self.assertEqual(merged[0].text, "15/16")
+        self.assertEqual([item.text for item in merged], ["15", "/", "16"])
+        self.assertEqual(len(merged), len(items))
+        for actual, original in zip(merged, items, strict=True):
+            self.assertIs(actual, original)
 
-    def test_stacked_fraction_merge_ignores_full_size_whole_number(self) -> None:
+    def test_layout_free_fraction_near_whole_number_is_preserved(self) -> None:
         items = [
             NormalizedText(
                 id=1, text="2", normalized="2",
@@ -205,11 +208,10 @@ class TestCorePipeline(unittest.TestCase):
         ]
 
         merged = _merge_stacked_fractions(items)
-        texts = [item.text for item in merged]
-
-        self.assertIn("2", texts)
-        self.assertIn("1/4", texts)
-        self.assertNotIn("2/4", texts)
+        self.assertEqual([item.text for item in merged], ["2", "1", "4", "/"])
+        self.assertEqual(len(merged), len(items))
+        for actual, original in zip(merged, items, strict=True):
+            self.assertIs(actual, original)
 
     def test_extract_page_handles_quad_path_items(self) -> None:
         class _QuadPage:
