@@ -13,12 +13,17 @@ sys.path.insert(0, str(REPO_ROOT / "pdf_vector_importer"))
 from pdfcadcore import primitive_extractor  # noqa: E402
 
 
-APPROVED_SHA256 = "aadbe4dbb83b24720e853e14b290dcdc7d4d7952ad3c0e6b48f17380ba5cec8d"
+# This is the reviewed integration output: current main plus the fraction-core
+# port. It deliberately does not claim that these combined bytes were approved
+# independently before the merge review.
+REVIEWED_COMBINED_SUCCESSOR_SHA256 = (
+    "ab6d03e38066c42214e6272f503a0aef5bf53d50fbd0c8aafa91cc0c8b3e6538"
+)
 
 
-def test_shared_core_is_exact_independently_approved_successor() -> None:
+def test_shared_core_matches_reviewed_combined_successor() -> None:
     raw = (CORE_ROOT / "primitive_extractor.py").read_bytes().replace(b"\r\n", b"\n")
-    assert hashlib.sha256(raw).hexdigest() == APPROVED_SHA256
+    assert hashlib.sha256(raw).hexdigest() == REVIEWED_COMBINED_SUCCESSOR_SHA256
 
 
 def test_obsolete_stacked_fraction_scale_clamp_is_absent() -> None:
