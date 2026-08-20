@@ -182,6 +182,39 @@ def _resolve_collection(
 
 # ── Curve builders ───────────────────────────────────────────────────
 
+def _write_spline_points(spline, points_m, z_offset_m: float = 0.0) -> None:
+    """Store POLY/NURBS coordinates so Blender 3.2 actually keeps them.
+
+    ``spline.points[i].co = (x, y, z, w)`` is a no-op on the default first
+    point in Blender 3.2. Every stroke then starts at world origin and Top
+    Orthographic at the grid becomes a starburst instead of the sheet.
+    ``foreach_set("co", ...)`` writes the runtime array on 3.2 through 5.2.
+    """
+    count = len(points_m)
+    if count < 1:
+        return
+    existing = len(spline.points)
+    if existing < count:
+        spline.points.add(count - existing)
+    flat = []
+    z_value = float(z_offset_m)
+    for x_m, y_m in points_m:
+        flat.extend((float(x_m), float(y_m), z_value, 1.0))
+    writer = getattr(spline.points, "foreach_set", None)
+    if callable(writer):
+        writer("co", flat)
+        return
+    for index, (x_m, y_m) in enumerate(points_m):
+        co = spline.points[index].co
+        try:
+            co[0] = float(x_m)
+            co[1] = float(y_m)
+            co[2] = z_value
+            co[3] = 1.0
+        except (TypeError, AttributeError, IndexError):
+            spline.points[index].co = (float(x_m), float(y_m), z_value, 1.0)
+
+
 def _create_poly_curve(
     name: str,
     points: list,
@@ -201,9 +234,7 @@ def _create_poly_curve(
     curve_data.bevel_depth = _line_bevel_depth(line_width)
 
     spline = curve_data.splines.new("POLY")
-    spline.points.add(len(points_m) - 1)  # one point already exists
-    for i, (x, y) in enumerate(points_m):
-        spline.points[i].co = (x, y, z_offset_m, 1.0)
+    _write_spline_points(spline, points_m, z_offset_m=z_offset_m)
     spline.use_cyclic_u = closed
 
     # Material
@@ -239,9 +270,7 @@ def _create_multi_poly_curve(
     for run in valid_runs:
         pts_m = [(x * MM_TO_M, y * MM_TO_M) for x, y in run]
         spline = curve_data.splines.new("POLY")
-        spline.points.add(len(pts_m) - 1)
-        for i, (x, y) in enumerate(pts_m):
-            spline.points[i].co = (x, y, z_offset_m, 1.0)
+        _write_spline_points(spline, pts_m, z_offset_m=z_offset_m)
         spline.use_cyclic_u = False
 
     curve_data.materials.append(material)
@@ -520,14 +549,15 @@ def _create_nurbs_circle(
     # Blender NURBS circle: 8-point circle approximation
     spline = curve_data.splines.new("NURBS")
     num_pts = 8
-    spline.points.add(num_pts - 1)
     cx, cy = center[0] * MM_TO_M, center[1] * MM_TO_M
     r_m = radius * MM_TO_M
+    circle_pts = []
     for i in range(num_pts):
         angle = 2.0 * math.pi * i / num_pts
-        x = cx + r_m * math.cos(angle)
-        y = cy + r_m * math.sin(angle)
-        spline.points[i].co = (x, y, z_offset_m, 1.0)
+        circle_pts.append(
+            (cx + r_m * math.cos(angle), cy + r_m * math.sin(angle))
+        )
+    _write_spline_points(spline, circle_pts, z_offset_m=z_offset_m)
     spline.use_cyclic_u = True
     spline.order_u = 3
 

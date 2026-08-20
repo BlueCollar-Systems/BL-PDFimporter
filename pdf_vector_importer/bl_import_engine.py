@@ -906,6 +906,24 @@ def _unhide_collection_tree(root_collection: bpy.types.Collection) -> None:
                 continue
 
 
+def _curve_spline_local_points(curve_data):
+    """Yield stored POLY/NURBS/Bezier bounds without materializing all points."""
+    for spline in getattr(curve_data, "splines", None) or ():
+        for point in getattr(spline, "points", None) or ():
+            try:
+                co = point.co
+                yield (float(co[0]), float(co[1]), float(co[2]))
+            except (AttributeError, IndexError, TypeError, ValueError):
+                continue
+        for point in getattr(spline, "bezier_points", None) or ():
+            for attr in ("co", "handle_left", "handle_right"):
+                try:
+                    co = getattr(point, attr)
+                    yield (float(co[0]), float(co[1]), float(co[2]))
+                except (AttributeError, IndexError, TypeError, ValueError):
+                    continue
+
+
 def _world_bounds_for_objects(objects):
     try:
         from mathutils import Vector
@@ -914,14 +932,41 @@ def _world_bounds_for_objects(objects):
 
     min_v = None
     max_v = None
+
+    def _include(point) -> None:
+        nonlocal min_v, max_v
+        if min_v is None:
+            min_v = Vector((point.x, point.y, point.z))
+            max_v = Vector((point.x, point.y, point.z))
+            return
+        min_v.x = min(min_v.x, point.x)
+        min_v.y = min(min_v.y, point.y)
+        min_v.z = min(min_v.z, point.z)
+        max_v.x = max(max_v.x, point.x)
+        max_v.y = max(max_v.y, point.y)
+        max_v.z = max(max_v.z, point.z)
+
     for obj in objects:
         if obj is None:
             continue
         if getattr(obj, "type", "") in {"CAMERA", "LIGHT"}:
             continue
         try:
-            corners = obj.bound_box
             mw = obj.matrix_world
+        except Exception:
+            continue
+        used_curve_data = False
+        if getattr(obj, "type", "") == "CURVE":
+            for x, y, z in _curve_spline_local_points(getattr(obj, "data", None)):
+                try:
+                    _include(mw @ Vector((x, y, z)))
+                    used_curve_data = True
+                except Exception:
+                    continue
+        if used_curve_data:
+            continue
+        try:
+            corners = obj.bound_box
         except Exception:
             continue
         if not corners:
@@ -931,16 +976,7 @@ def _world_bounds_for_objects(objects):
         except Exception:
             continue
         for p in world_pts:
-            if min_v is None:
-                min_v = Vector((p.x, p.y, p.z))
-                max_v = Vector((p.x, p.y, p.z))
-            else:
-                min_v.x = min(min_v.x, p.x)
-                min_v.y = min(min_v.y, p.y)
-                min_v.z = min(min_v.z, p.z)
-                max_v.x = max(max_v.x, p.x)
-                max_v.y = max(max_v.y, p.y)
-                max_v.z = max(max_v.z, p.z)
+            _include(p)
     return min_v, max_v
 
 
