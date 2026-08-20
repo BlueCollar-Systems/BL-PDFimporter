@@ -908,6 +908,36 @@ def _write_metric_placement_properties(
     ]
 
 
+# Blender's default empty display is PLAIN_AXES at 1.0 m. An affine carrier is a pure
+# transform holder that is never meant to be looked at, and one is created PER GLYPH, so
+# the defaults put a 2 m axis-cross on every character: a 1011 text import produced 4182
+# carriers on a 0.887 x 0.591 m sheet, and the viewport showed a solid black starburst
+# with the drawing buried inside it. Empties do not render, so camera-render checks (and
+# the visual oracle, which skips EMPTY objects entirely) could never see this -- it was
+# reported from the GUI by the owner.
+#
+# Size the cross to the glyph it carries so it stays selectable for debugging without
+# obscuring anything.
+_CARRIER_DISPLAY_MIN_M = 0.0002
+_CARRIER_DISPLAY_MAX_M = 0.01
+
+
+def _carrier_display_size(target_quad) -> float:
+    """A glyph-scaled display size for an affine carrier empty."""
+    try:
+        pts = [(float(p[0]), float(p[1])) for p in (target_quad or ())]
+        if len(pts) >= 2:
+            xs = [p[0] for p in pts]
+            ys = [p[1] for p in pts]
+            extent = max(max(xs) - min(xs), max(ys) - min(ys))
+            if extent > 0.0:
+                return min(_CARRIER_DISPLAY_MAX_M,
+                           max(_CARRIER_DISPLAY_MIN_M, extent * 0.5))
+    except (TypeError, ValueError, IndexError):
+        pass
+    return _CARRIER_DISPLAY_MIN_M
+
+
 def _apply_target_quad_affine(
     obj,
     text_item,
@@ -964,6 +994,10 @@ def _apply_target_quad_affine(
             if target_collection is None:
                 raise RuntimeError("affine carrier target collection is unavailable")
             carrier = bpy.data.objects.new(f"{obj.name}_AffineCarrier", None)
+            # Without these the empty draws a 1 m axis-cross per glyph and buries the
+            # drawing in the viewport (see _carrier_display_size).
+            carrier.empty_display_type = "PLAIN_AXES"
+            carrier.empty_display_size = _carrier_display_size(target_quad)
             target_collection.objects.link(carrier)
             carrier.matrix_world = Matrix(parent_values)
             obj.parent = carrier
